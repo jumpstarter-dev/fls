@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+
+# Compiled binaries
+smallrs
+smallrs-*
+fls
+fls-*
+
+# Build scripts
+build.sh
+test
+
+# Temporary files
+*.tmp
+Dockerfile.tmp
+
+# Git
+.git/
+.gitignore
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (if you have any)
+*.md
+!README.md
+
