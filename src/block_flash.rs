@@ -31,12 +31,15 @@ struct ProgressTracker {
     bytes_received: u64,
     bytes_decompressed: u64,
     bytes_written: u64,
+    bytes_sent_to_xzcat: u64,  // Track how much compressed data has been sent to xzcat
     start_time: Instant,
     last_update: Instant,
     // Store final rates when each phase completes
     final_download_rate: Option<f64>,
     final_decompress_rate: Option<f64>,
     final_write_rate: Option<f64>,
+    // Store content length for percentage calculations
+    content_length: Option<u64>,
 }
 
 impl ProgressTracker {
@@ -46,12 +49,18 @@ impl ProgressTracker {
             bytes_received: 0,
             bytes_decompressed: 0,
             bytes_written: 0,
+            bytes_sent_to_xzcat: 0,
             start_time: now,
             last_update: now,
             final_download_rate: None,
             final_decompress_rate: None,
             final_write_rate: None,
+            content_length: None,
         }
+    }
+    
+    fn set_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length;
     }
     
     fn update_progress(&mut self, content_length: Option<u64>, update_interval: Duration) -> Result<(), Box<dyn std::error::Error>> {
@@ -85,15 +94,37 @@ impl ProgressTracker {
                 }
             });
             
-            if let Some(total) = content_length {
+            // Format each phase - show "Done" if completed, otherwise show progress
+            let download_status = if self.final_download_rate.is_some() {
+                "Done".to_string()
+            } else if let Some(total) = content_length {
                 let progress = (self.bytes_received as f64 / total as f64) * 100.0;
                 let total_mb = total as f64 / (1024.0 * 1024.0);
-                print!("\rDownload: {:.2} MB / {:.2} MB ({:.1}%) | {:.2} MB/s | Decompressed: {:.2} MB | {:.2} MB/s | Written: {:.2} MB | {:.2} MB/s", 
-                       mb_received, total_mb, progress, download_mb_per_sec, mb_decompressed, decompress_mb_per_sec, mb_written, written_mb_per_sec);
+                format!("{:.2} MB / {:.2} MB ({:.1}%) | {:.2} MB/s", mb_received, total_mb, progress, download_mb_per_sec)
             } else {
-                print!("\rDownload: {:.2} MB | {:.2} MB/s | Decompressed: {:.2} MB | {:.2} MB/s | Written: {:.2} MB | {:.2} MB/s", 
-                       mb_received, download_mb_per_sec, mb_decompressed, decompress_mb_per_sec, mb_written, written_mb_per_sec);
-            }
+                format!("{:.2} MB | {:.2} MB/s", mb_received, download_mb_per_sec)
+            };
+            
+            let decompress_status = if self.final_decompress_rate.is_some() {
+                "Done".to_string()
+            } else {
+                // Show percentage based on how much compressed data has been sent to xzcat
+                if let Some(total) = self.content_length {
+                    let decompress_progress = (self.bytes_sent_to_xzcat as f64 / total as f64) * 100.0;
+                    format!("{:.2} MB ({:.1}%) | {:.2} MB/s", mb_decompressed, decompress_progress, decompress_mb_per_sec)
+                } else {
+                    format!("{:.2} MB | {:.2} MB/s", mb_decompressed, decompress_mb_per_sec)
+                }
+            };
+            
+            let write_status = if self.final_write_rate.is_some() {
+                "Done".to_string()
+            } else {
+                format!("{:.2} MB | {:.2} MB/s", mb_written, written_mb_per_sec)
+            };
+            
+            print!("\rDownload: {} | Decompressed: {} | Written: {}", 
+                   download_status, decompress_status, write_status);
             io::stdout().flush()?;
             self.last_update = now;
         }
@@ -541,6 +572,11 @@ async fn handle_compressed_download(
             response.content_length()
         };
         
+        // Set content length in progress tracker (only on first attempt)
+        if progress.content_length.is_none() {
+            progress.set_content_length(content_length);
+        }
+        
         let mut stream = response.bytes_stream();
         
         // Download and buffer chunks for this connection
@@ -578,9 +614,10 @@ async fn handle_compressed_download(
                             progress.bytes_received += chunk_len;
                             retry_count = 0; // Reset retry count on successful download
                             
-                            // Track bytes actually written to xzcat (for debugging only)
+                            // Track bytes actually written to xzcat
                             while let Ok(written_len) = xzcat_written_rx.try_recv() {
                                 bytes_sent_to_xzcat += written_len;
+                                progress.bytes_sent_to_xzcat += written_len;
                             }
                             
                             // Debug: Show buffer lag (data downloaded but not yet written to xzcat)
@@ -668,6 +705,7 @@ async fn handle_compressed_download(
         
         while let Ok(written_len) = xzcat_written_rx.try_recv() {
             bytes_sent_to_xzcat += written_len;
+            progress.bytes_sent_to_xzcat += written_len;
             updated = true;
         }
         
