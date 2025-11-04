@@ -1,0 +1,10 @@
+# Cross-compilation configuration for Podman
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Configure cross to use Podman instead of Docker
+[env]
+CROSS_CONTAINER_ENGINE = "podman"

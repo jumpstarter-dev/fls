@@ -1,0 +1,22 @@
+[package]
+name = "smallrs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+tokio = { version = "1.0", features = ["full", "process", "rt-multi-thread"] }
+futures-util = "0.3"
+bytes = "1.0"
+# Enable vendored OpenSSL for cross-compilation to musl targets
+# This ensures OpenSSL builds from source with musl compatibility
+openssl = { version = "0.10", features = ["vendored"] }
+
+
+[profile.release]
+strip = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+lto = true

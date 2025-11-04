@@ -1,0 +1,39 @@
+name: Build ARM64 Static Binary
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: rustfmt, clippy
+        override: true
+    
+    - name: Add ARM64 target
+      run: rustup target add aarch64-unknown-linux-musl
+    
+    - name: Build ARM64 static binary
+      run: |
+        cargo build --release --target aarch64-unknown-linux-musl
+        cp target/aarch64-unknown-linux-musl/release/smallrs smallrs-arm64-static
+        file smallrs-arm64-static
+        ls -lh smallrs-arm64-static
+    
+    - name: Upload ARM64 binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: smallrs-arm64-static
+        path: smallrs-arm64-static
+        retention-days: 30
