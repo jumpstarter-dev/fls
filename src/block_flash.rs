@@ -79,13 +79,6 @@ impl ProgressTracker {
                     0.0
                 }
             });
-            let decompress_mb_per_sec = self.final_decompress_rate.unwrap_or_else(|| {
-                if elapsed.as_secs_f64() > 0.0 {
-                    mb_decompressed / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                }
-            });
             let written_mb_per_sec = self.final_write_rate.unwrap_or_else(|| {
                 if elapsed.as_secs_f64() > 0.0 {
                     mb_written / elapsed.as_secs_f64()
@@ -111,7 +104,26 @@ impl ProgressTracker {
                 // Show percentage based on how much compressed data has been sent to xzcat
                 if let Some(total) = self.content_length {
                     let decompress_progress = (self.bytes_sent_to_xzcat as f64 / total as f64) * 100.0;
-                    format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
+                    
+                    // Calculate estimated remaining time based on decompression progress
+                    if decompress_progress > 1.0 && elapsed.as_secs_f64() > 0.0 {
+                        let estimated_total_time = elapsed.as_secs_f64() / (decompress_progress / 100.0);
+                        let remaining_secs = estimated_total_time - elapsed.as_secs_f64();
+                        
+                        if remaining_secs > 0.0 {
+                            let mins = (remaining_secs / 60.0) as i32;
+                            let secs = (remaining_secs % 60.0) as i32;
+                            if mins > 0 {
+                                format!("{:.2} MB ({:.1}%) [ETA: {}m {}s]", mb_decompressed, decompress_progress, mins, secs)
+                            } else {
+                                format!("{:.2} MB ({:.1}%) [ETA: {}s]", mb_decompressed, decompress_progress, secs)
+                            }
+                        } else {
+                            format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
+                        }
+                    } else {
+                        format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
+                    }
                 } else {
                     format!("{:.2} MB", mb_decompressed)
                 }
