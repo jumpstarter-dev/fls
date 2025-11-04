@@ -1,4 +1,4 @@
-# Makefile for smallrs - ARM64 static builds
+# Makefile for fls - ARM64 static builds
 
 .PHONY: all build clean test arm64-static help
 
@@ -13,11 +13,11 @@ build:
 arm64-static:
 	rustup target add aarch64-unknown-linux-musl
 	cross build --release --target aarch64-unknown-linux-musl
-	@if [ -f "target/aarch64-unknown-linux-musl/release/smallrs" ]; then \
-		cp "target/aarch64-unknown-linux-musl/release/smallrs" "smallrs-arm64-static"; \
-		echo "✓ ARM64 static binary saved as: smallrs-arm64-static"; \
-		file smallrs-arm64-static; \
-		ls -lh smallrs-arm64-static; \
+	@if [ -f "target/aarch64-unknown-linux-musl/release/fls" ]; then \
+		cp "target/aarch64-unknown-linux-musl/release/fls" "fls-arm64-static"; \
+		echo "✓ ARM64 static binary saved as: fls-arm64-static"; \
+		file fls-arm64-static; \
+		ls -lh fls-arm64-static; \
 	fi
 
 # Build for all targets (native + ARM64 static)
@@ -31,7 +31,7 @@ test:
 # Clean build artifacts
 clean:
 	cargo clean
-	rm -f smallrs-*
+	rm -f fls-*
 
 # Install dependencies for ARM64 cross-compilation
 install-deps:

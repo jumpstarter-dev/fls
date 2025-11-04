@@ -40,8 +40,8 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
 # Remove the dummy source and build artifacts (keep dependencies cached)
-RUN rm -rf src target/aarch64-unknown-linux-gnu/release/smallrs* \
-    target/aarch64-unknown-linux-gnu/release/deps/smallrs*
+RUN rm -rf src target/aarch64-unknown-linux-gnu/release/fls* \
+    target/aarch64-unknown-linux-gnu/release/deps/fls*
 
 # Now copy the real source code and Makefile
 COPY Makefile .
@@ -54,8 +54,8 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu
 # Using --best for maximum compression, --lzma for best algorithm
 # UPX compresses in-place, so the original binary will be compressed
 RUN cd target/aarch64-unknown-linux-gnu/release && \
-    upx --best --lzma smallrs || \
+    upx --best --lzma fls || \
     echo "UPX compression failed, using uncompressed binary"
 
-# The compressed binary will be in target/aarch64-unknown-linux-gnu/release/smallrs
+# The compressed binary will be in target/aarch64-unknown-linux-gnu/release/fls
 
