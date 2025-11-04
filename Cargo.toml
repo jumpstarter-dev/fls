@@ -9,6 +9,7 @@ reqwest = { version = "0.12", features = ["stream", "rustls-tls", "http2"] }
 tokio = { version = "1.0", features = ["full", "process", "rt-multi-thread"] }
 futures-util = "0.3"
 bytes = "1.0"
+indicatif = "0.17"
 # Enable vendored OpenSSL for cross-compilation to musl targets
 # This ensures OpenSSL builds from source with musl compatibility
 openssl = { version = "0.10", features = ["vendored"] }

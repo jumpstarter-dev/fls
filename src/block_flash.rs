@@ -38,6 +38,10 @@ struct ProgressTracker {
     final_download_rate: Option<f64>,
     final_decompress_rate: Option<f64>,
     final_write_rate: Option<f64>,
+    // Store durations when each phase completes
+    download_duration: Option<Duration>,
+    decompress_duration: Option<Duration>,
+    write_duration: Option<Duration>,
     // Store content length for percentage calculations
     content_length: Option<u64>,
 }
@@ -55,6 +59,9 @@ impl ProgressTracker {
             final_download_rate: None,
             final_decompress_rate: None,
             final_write_rate: None,
+            download_duration: None,
+            decompress_duration: None,
+            write_duration: None,
             content_length: None,
         }
     }
@@ -144,27 +151,40 @@ impl ProgressTracker {
         Ok(())
     }
     
-    fn final_stats(&self) -> (f64, f64, f64, f64, f64, f64) {
-        let total_elapsed = Instant::now().duration_since(self.start_time);
+    fn final_stats(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
         let final_mb_received = self.bytes_received as f64 / (1024.0 * 1024.0);
         let final_mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
         let final_mb_written = self.bytes_written as f64 / (1024.0 * 1024.0);
-        let final_download_rate = if total_elapsed.as_secs_f64() > 0.0 {
-            final_mb_received / total_elapsed.as_secs_f64()
+        
+        // Use the stored durations for each phase
+        let download_secs = self.download_duration
+            .unwrap_or_else(|| Duration::from_secs(0))
+            .as_secs_f64();
+        let decompress_secs = self.decompress_duration
+            .unwrap_or_else(|| Duration::from_secs(0))
+            .as_secs_f64();
+        let write_secs = self.write_duration
+            .unwrap_or_else(|| Duration::from_secs(0))
+            .as_secs_f64();
+        
+        let final_download_rate = if download_secs > 0.0 {
+            final_mb_received / download_secs
         } else {
             0.0
         };
-        let final_decompress_rate = if total_elapsed.as_secs_f64() > 0.0 {
-            final_mb_decompressed / total_elapsed.as_secs_f64()
+        let final_decompress_rate = if decompress_secs > 0.0 {
+            final_mb_decompressed / decompress_secs
         } else {
             0.0
         };
-        let final_written_rate = if total_elapsed.as_secs_f64() > 0.0 {
-            final_mb_written / total_elapsed.as_secs_f64()
+        let final_written_rate = if write_secs > 0.0 {
+            final_mb_written / write_secs
         } else {
             0.0
         };
-        (final_mb_received, final_mb_decompressed, final_mb_written, final_download_rate, final_decompress_rate, final_written_rate)
+        (final_mb_received, final_mb_decompressed, final_mb_written, 
+         final_download_rate, final_decompress_rate, final_written_rate,
+         download_secs, decompress_secs, write_secs)
     }
 }
 
@@ -461,9 +481,9 @@ async fn handle_regular_download(
         }
     }
     
-            let (mb_received, _, _, download_rate, _, _) = progress.final_stats();
+            let (mb_received, _, _, download_rate, _, _, download_secs, _, _) = progress.final_stats();
             println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-                    mb_received, progress.start_time.elapsed().as_secs_f64(), download_rate);
+                    mb_received, download_secs, download_rate);
     
     Ok(())
 }
@@ -699,8 +719,9 @@ async fn handle_compressed_download(
         break;
     }
     
-    // Capture the download rate at completion
+    // Capture the download rate and duration at completion
     let elapsed = progress.start_time.elapsed();
+    progress.download_duration = Some(elapsed);
     if elapsed.as_secs_f64() > 0.0 {
         let mb_received = progress.bytes_received as f64 / (1024.0 * 1024.0);
         progress.final_download_rate = Some(mb_received / elapsed.as_secs_f64());
@@ -819,8 +840,9 @@ async fn handle_compressed_download(
         }
     }
     
-    // Capture the decompression rate at completion
+    // Capture the decompression rate and duration at completion
     let elapsed = progress.start_time.elapsed();
+    progress.decompress_duration = Some(elapsed);
     if elapsed.as_secs_f64() > 0.0 {
         let mb_decompressed = progress.bytes_decompressed as f64 / (1024.0 * 1024.0);
         progress.final_decompress_rate = Some(mb_decompressed / elapsed.as_secs_f64());
@@ -879,8 +901,9 @@ async fn handle_compressed_download(
         }
     }
     
-    // Capture the write rate at completion
+    // Capture the write rate and duration at completion
     let elapsed = progress.start_time.elapsed();
+    progress.write_duration = Some(elapsed);
     if elapsed.as_secs_f64() > 0.0 {
         let mb_written = progress.bytes_written as f64 / (1024.0 * 1024.0);
         progress.final_write_rate = Some(mb_written / elapsed.as_secs_f64());
@@ -905,13 +928,14 @@ async fn handle_compressed_download(
         }
     ).await;
     
-    let (mb_received, mb_decompressed, mb_written, download_rate, decompress_rate, written_rate) = progress.final_stats();
+    let (mb_received, mb_decompressed, mb_written, download_rate, decompress_rate, written_rate,
+         download_secs, decompress_secs, write_secs) = progress.final_stats();
     println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-            mb_received, progress.start_time.elapsed().as_secs_f64(), download_rate);
+            mb_received, download_secs, download_rate);
     println!("Decompression complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-            mb_decompressed, progress.start_time.elapsed().as_secs_f64(), decompress_rate);
+            mb_decompressed, decompress_secs, decompress_rate);
     println!("Write complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-            mb_written, progress.start_time.elapsed().as_secs_f64(), written_rate);
+            mb_written, write_secs, written_rate);
     println!("Compression ratio: {:.2}x", 
             mb_decompressed / mb_received);
     
