@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 pub struct BlockFlashOptions {
     pub ignore_certificates: bool,
     pub device: String,
+    pub buffer_size_mb: usize,
 }
 
 impl Default for BlockFlashOptions {
@@ -15,6 +16,7 @@ impl Default for BlockFlashOptions {
         Self {
             ignore_certificates: false,
             device: String::new(),
+            buffer_size_mb: 1024,
         }
     }
 }
@@ -289,18 +291,61 @@ async fn start_download(url: &str, client: &Client) -> Result<(reqwest::Response
 }
 
 async fn handle_regular_download(
-    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin + Send + 'static,
     content_length: Option<u64>,
+    buffer_size_mb: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut progress = ProgressTracker::new();
     let update_interval = Duration::from_millis(100);
     
     use futures_util::StreamExt;
     
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    // Calculate buffer capacity (assume 64KB average chunk size)
+    let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
+    let buffer_capacity = buffer_capacity.max(1); // At least 1
+    
+    println!("Using download buffer: {} MB (capacity: {} chunks)", buffer_size_mb, buffer_capacity);
+    
+    // Create bounded channel for buffering
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    
+    // Spawn download task
+    let download_task = tokio::spawn(async move {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(c) => {
+                    if buffer_tx.send(c).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Err(e) => {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send>);
+                }
+            }
+        }
+        Ok::<(), Box<dyn std::error::Error + Send>>(())
+    });
+    
+    // Process buffered chunks
+    while let Some(chunk) = buffer_rx.recv().await {
         progress.bytes_received += chunk.len() as u64;
-        progress.update_progress(content_length, update_interval)?;
+        if let Err(e) = progress.update_progress(content_length, update_interval) {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e);
+        }
+    }
+    
+    // Check if download task had an error
+    match download_task.await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e);
+        }
+        Err(e) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
     }
     
             let (mb_received, _, _, download_rate, _, _) = progress.final_stats();
@@ -311,7 +356,7 @@ async fn handle_regular_download(
 }
 
 async fn handle_compressed_download(
-    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin + Send + 'static,
     content_length: Option<u64>,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -357,18 +402,46 @@ async fn handle_compressed_download(
             let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx));
             let error_processor = tokio::spawn(process_error_messages(error_rx));
     
+    // Calculate buffer capacity (assume 64KB average chunk size)
+    let buffer_size_mb = options.buffer_size_mb;
+    let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
+    let buffer_capacity = buffer_capacity.max(1); // At least 1
+    
+    println!("Using download buffer: {} MB (capacity: {} chunks)", buffer_size_mb, buffer_capacity);
+    
+    // Create bounded channel for download buffering
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    
     // Main download loop
     let mut progress = ProgressTracker::new();
     let update_interval = Duration::from_millis(100);
     
     use futures_util::StreamExt;
     
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    // Spawn download task
+    let download_task = tokio::spawn(async move {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(c) => {
+                    if buffer_tx.send(c).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Err(e) => {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send>);
+                }
+            }
+        }
+        Ok::<(), Box<dyn std::error::Error + Send>>(())
+    });
+    
+    // Process buffered chunks and write to xzcat
+    while let Some(chunk) = buffer_rx.recv().await {
         progress.bytes_received += chunk.len() as u64;
         
         // Write compressed data to xzcat stdin
         if let Err(e) = xzcat_stdin.write_all(&chunk).await {
+            eprintln!(); // Print newline to clear progress line
             return Err(format!("Error writing to xzcat stdin: {}", e).into());
         }
         
@@ -382,19 +455,49 @@ async fn handle_compressed_download(
                     progress.bytes_written = written_bytes; // dd reports cumulative bytes written
                 }
                 
-                progress.update_progress(content_length, update_interval)?;
+                if let Err(e) = progress.update_progress(content_length, update_interval) {
+                    eprintln!(); // Print newline to clear progress line
+                    return Err(e);
+                }
+    }
+    
+    // Check if download task had an error
+    match download_task.await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e);
+        }
+        Err(e) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
     }
     
     // Close xzcat stdin and wait for processes
     drop(xzcat_stdin);
     
-    let xzcat_status = xzcat.wait().await?;
+    let xzcat_status = match xzcat.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
+    };
     if !xzcat_status.success() {
+        eprintln!(); // Print newline to clear progress line
         return Err(format!("xzcat process failed with status: {:?}", xzcat_status.code()).into());
     }
     
-    let dd_status = dd.wait().await?;
+    let dd_status = match dd.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
+    };
     if !dd_status.success() {
+        eprintln!(); // Print newline to clear progress line
         return Err(format!("dd process failed with status: {:?}", dd_status.code()).into());
     }
     
@@ -436,7 +539,7 @@ pub async fn stream_and_decompress(
     if needs_decompression {
         handle_compressed_download(stream, content_length, options).await
     } else {
-        handle_regular_download(stream, content_length).await
+        handle_regular_download(stream, content_length, options.buffer_size_mb).await
     }
 }
 
