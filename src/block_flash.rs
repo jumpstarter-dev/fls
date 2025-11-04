@@ -495,8 +495,10 @@ async fn handle_compressed_download(
     });
     
     loop {
-        let resume_from = if bytes_sent_to_xzcat > 0 {
-            Some(bytes_sent_to_xzcat)
+        // Resume from the HTTP download position, not the xzcat write position
+        // The buffer may contain data that's been downloaded but not yet written to xzcat
+        let resume_from = if progress.bytes_received > 0 {
+            Some(progress.bytes_received)
         } else {
             None
         };
@@ -561,9 +563,15 @@ async fn handle_compressed_download(
                             progress.bytes_received += chunk_len;
                             retry_count = 0; // Reset retry count on successful download
                             
-                            // Track bytes actually written to xzcat
+                            // Track bytes actually written to xzcat (for debugging only)
                             while let Ok(written_len) = xzcat_written_rx.try_recv() {
                                 bytes_sent_to_xzcat += written_len;
+                            }
+                            
+                            // Debug: Show buffer lag (data downloaded but not yet written to xzcat)
+                            if debug && (progress.bytes_received % (50 * 1024 * 1024)) < chunk_len {
+                                let buffer_lag_mb = (progress.bytes_received - bytes_sent_to_xzcat) as f64 / (1024.0 * 1024.0);
+                                eprintln!("[DEBUG] Buffer lag: {:.2} MB (downloaded but not yet sent to xzcat)", buffer_lag_mb);
                             }
                             
                             // Update progress from other channels
@@ -630,6 +638,41 @@ async fn handle_compressed_download(
     
     // Wait for xzcat writer to finish writing all buffered data
     eprintln!("Waiting for buffer to drain to xzcat...");
+    
+    // Poll for xzcat writer completion while showing progress
+    loop {
+        // Update progress from all channels
+        let mut updated = false;
+        
+        while let Ok(written_len) = xzcat_written_rx.try_recv() {
+            bytes_sent_to_xzcat += written_len;
+            updated = true;
+        }
+        
+        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+            progress.bytes_decompressed += decompressed_chunk.len() as u64;
+            updated = true;
+        }
+        
+        while let Ok(written_bytes) = written_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+            updated = true;
+        }
+        
+        if updated {
+            let _ = progress.update_progress(None, update_interval);
+        }
+        
+        // Check if xzcat writer task is done
+        if xzcat_writer_handle.is_finished() {
+            break;
+        }
+        
+        // Small sleep to avoid busy waiting
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    // Get the result from the writer task
     match xzcat_writer_handle.await {
         Ok(Ok(())) => {},
         Ok(Err(e)) => {
@@ -640,11 +683,6 @@ async fn handle_compressed_download(
             eprintln!();
             return Err(e.into());
         }
-    }
-    
-    // Update bytes_sent_to_xzcat with any remaining updates
-    while let Ok(written_len) = xzcat_written_rx.try_recv() {
-        bytes_sent_to_xzcat += written_len;
     }
     
     // Continue updating progress while waiting for xzcat to finish decompressing
