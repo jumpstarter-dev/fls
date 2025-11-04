@@ -314,7 +314,10 @@ async fn process_dd_messages(
                 }
             }
         } else if !dd_msg.trim().is_empty() {
-            eprintln!("dd: {}", dd_msg.trim());
+            // Skip "records in/out" messages from dd's final summary
+            if !dd_msg.contains("records in") && !dd_msg.contains("records out") {
+                eprintln!("dd: {}", dd_msg.trim());
+            }
         }
     }
     Ok(())
@@ -578,9 +581,9 @@ async fn handle_compressed_download(
             }
         };
         
-        let content_length = if resume_from.is_some() {
+        let content_length = if let Some(offset) = resume_from {
             // For resumed downloads, we need to add the offset to partial content length
-            response.content_length().map(|len| len + bytes_sent_to_xzcat)
+            response.content_length().map(|len| len + offset)
         } else {
             response.content_length()
         };
