@@ -463,6 +463,37 @@ async fn handle_compressed_download(
     
     use futures_util::StreamExt;
     
+    // Calculate buffer capacity (shared across all retry attempts)
+    let buffer_size_mb = options.buffer_size_mb;
+    // HTTP chunks from reqwest are typically 8-32 KB, not 64 KB
+    // To ensure we get the full buffer size, use a conservative estimate
+    let avg_chunk_size_kb = 8; // Conservative estimate (8 KB)
+    let buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
+    let buffer_capacity = buffer_capacity.max(1000); // At least 1000 chunks
+    
+    println!("Using download buffer: {} MB (capacity: {} chunks, ~{} KB per chunk)", 
+             buffer_size_mb, buffer_capacity, avg_chunk_size_kb);
+    
+    // Create persistent bounded channel for download buffering (lives across retries)
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    
+    // Channels for tracking bytes actually written to xzcat
+    let (xzcat_written_tx, mut xzcat_written_rx) = mpsc::unbounded_channel::<u64>();
+    
+    // Spawn persistent task to write buffered chunks to xzcat
+    let xzcat_writer_handle = tokio::spawn(async move {
+        while let Some(chunk) = buffer_rx.recv().await {
+            let chunk_len = chunk.len() as u64;
+            if let Err(e) = xzcat_stdin.write_all(&chunk).await {
+                return Err(format!("Error writing to xzcat stdin: {}", e));
+            }
+            // Notify that bytes were written to xzcat
+            let _ = xzcat_written_tx.send(chunk_len);
+        }
+        // Close xzcat stdin when channel is closed
+        Ok::<(), String>(())
+    });
+    
     loop {
         let resume_from = if bytes_sent_to_xzcat > 0 {
             Some(bytes_sent_to_xzcat)
@@ -495,16 +526,7 @@ async fn handle_compressed_download(
         
         let mut stream = response.bytes_stream();
         
-        // Calculate buffer capacity
-        let buffer_size_mb = options.buffer_size_mb;
-        let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
-        let buffer_capacity = buffer_capacity.max(1);
-        
-        if resume_from.is_none() {
-            println!("Using download buffer: {} MB (capacity: {} chunks)", buffer_size_mb, buffer_capacity);
-        }
-        
-        // Download and write to xzcat for this connection
+        // Download and buffer chunks for this connection
         let mut connection_broken = false;
         let mut connection_error: Option<Box<dyn std::error::Error>> = None;
         
@@ -516,18 +538,32 @@ async fn handle_compressed_download(
                         Ok(chunk) => {
                             let chunk_len = chunk.len() as u64;
                             
-                            // Write to xzcat stdin
-                            match xzcat_stdin.write_all(&chunk).await {
-                                Ok(_) => {
-                                    bytes_sent_to_xzcat += chunk_len;
-                                    progress.bytes_received += chunk_len;
-                                    retry_count = 0; // Reset retry count on successful write
-                                }
-                                Err(e) => {
-                                    connection_error = Some(format!("Error writing to xzcat stdin: {}", e).into());
-                                    connection_broken = true;
-                                    break;
-                                }
+                            // Debug: Show chunk sizes for first 10 MB to verify our buffer sizing
+                            if debug && progress.bytes_received < 10 * 1024 * 1024 {
+                                eprintln!("[DEBUG] HTTP chunk size: {} bytes ({:.1} KB)", chunk_len, chunk_len as f64 / 1024.0);
+                            }
+                            
+                            // Send to buffer - detect if it's blocking
+                            let send_start = std::time::Instant::now();
+                            if buffer_tx.send(chunk).await.is_err() {
+                                connection_error = Some("Buffer channel closed".into());
+                                connection_broken = true;
+                                break;
+                            }
+                            let send_duration = send_start.elapsed();
+                            
+                            // If send took a long time, buffer was probably full
+                            if debug && send_duration > Duration::from_millis(100) {
+                                eprintln!("\n[DEBUG] Buffer send blocked for {:.2}s (buffer full, xzcat bottleneck)", send_duration.as_secs_f64());
+                            }
+                            
+                            // Update download progress
+                            progress.bytes_received += chunk_len;
+                            retry_count = 0; // Reset retry count on successful download
+                            
+                            // Track bytes actually written to xzcat
+                            while let Ok(written_len) = xzcat_written_rx.try_recv() {
+                                bytes_sent_to_xzcat += written_len;
                             }
                             
                             // Update progress from other channels
@@ -587,10 +623,29 @@ async fn handle_compressed_download(
         break;
     }
     
-    eprintln!("\nDownload complete, closing input stream...");
+    eprintln!("\nDownload complete, closing buffer...");
     
-    // Close xzcat stdin to signal end of input
-    let _ = xzcat_stdin.shutdown().await;
+    // Close buffer channel to signal end of download
+    drop(buffer_tx);
+    
+    // Wait for xzcat writer to finish writing all buffered data
+    eprintln!("Waiting for buffer to drain to xzcat...");
+    match xzcat_writer_handle.await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => {
+            eprintln!();
+            return Err(e.into());
+        }
+        Err(e) => {
+            eprintln!();
+            return Err(e.into());
+        }
+    }
+    
+    // Update bytes_sent_to_xzcat with any remaining updates
+    while let Ok(written_len) = xzcat_written_rx.try_recv() {
+        bytes_sent_to_xzcat += written_len;
+    }
     
     // Continue updating progress while waiting for xzcat to finish decompressing
     eprintln!("Waiting for decompression to complete...");
