@@ -418,14 +418,20 @@ async fn handle_compressed_download(
     
     use futures_util::StreamExt;
     
+    // Create channel for tracking downloaded bytes
+    let (downloaded_tx, mut downloaded_rx) = mpsc::unbounded_channel::<u64>();
+    
     // Spawn download task
     let download_task = tokio::spawn(async move {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(c) => {
+                    let len = c.len() as u64;
                     if buffer_tx.send(c).await.is_err() {
                         break; // Receiver dropped
                     }
+                    // Notify progress tracker of downloaded bytes
+                    let _ = downloaded_tx.send(len);
                 }
                 Err(e) => {
                     return Err(Box::new(e) as Box<dyn std::error::Error + Send>);
@@ -435,30 +441,52 @@ async fn handle_compressed_download(
         Ok::<(), Box<dyn std::error::Error + Send>>(())
     });
     
-    // Process buffered chunks and write to xzcat
-    while let Some(chunk) = buffer_rx.recv().await {
-        progress.bytes_received += chunk.len() as u64;
+    // Spawn xzcat writer task - this runs independently and can be blocked by xzcat
+    let xzcat_writer = tokio::spawn(async move {
+        while let Some(chunk) = buffer_rx.recv().await {
+            if let Err(e) = xzcat_stdin.write_all(&chunk).await {
+                return Err(format!("Error writing to xzcat stdin: {}", e));
+            }
+        }
+        // Close xzcat stdin when done
+        let _ = xzcat_stdin.shutdown().await;
+        Ok::<(), String>(())
+    });
+    
+    // Main progress tracking loop - not blocked by xzcat writes
+    loop {
+        // Update progress from all available sources
+        let mut updated = false;
         
-        // Write compressed data to xzcat stdin
-        if let Err(e) = xzcat_stdin.write_all(&chunk).await {
-            eprintln!(); // Print newline to clear progress line
-            return Err(format!("Error writing to xzcat stdin: {}", e).into());
+        while let Ok(downloaded_bytes) = downloaded_rx.try_recv() {
+            progress.bytes_received += downloaded_bytes;
+            updated = true;
         }
         
-                // Read all available decompressed data for progress tracking
-                while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-                    progress.bytes_decompressed += decompressed_chunk.len() as u64;
-                }
-                
-                // Read all available written data for progress tracking
-                while let Ok(written_bytes) = written_rx.try_recv() {
-                    progress.bytes_written = written_bytes; // dd reports cumulative bytes written
-                }
-                
-                if let Err(e) = progress.update_progress(content_length, update_interval) {
-                    eprintln!(); // Print newline to clear progress line
-                    return Err(e);
-                }
+        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+            progress.bytes_decompressed += decompressed_chunk.len() as u64;
+            updated = true;
+        }
+        
+        while let Ok(written_bytes) = written_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+            updated = true;
+        }
+        
+        if updated {
+            if let Err(e) = progress.update_progress(content_length, update_interval) {
+                eprintln!(); // Print newline to clear progress line
+                return Err(e);
+            }
+        }
+        
+        // Check if download task is done
+        if download_task.is_finished() {
+            break;
+        }
+        
+        // Small sleep to avoid busy waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     
     // Check if download task had an error
@@ -474,9 +502,20 @@ async fn handle_compressed_download(
         }
     }
     
-    // Close xzcat stdin and wait for processes
-    drop(xzcat_stdin);
+    // Wait for xzcat writer task to finish (xzcat stdin is closed within the task)
+    match xzcat_writer.await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
+        Err(e) => {
+            eprintln!(); // Print newline to clear progress line
+            return Err(e.into());
+        }
+    }
     
+    // Wait for processes to complete
     let xzcat_status = match xzcat.wait().await {
         Ok(status) => status,
         Err(e) => {
@@ -501,6 +540,11 @@ async fn handle_compressed_download(
         return Err(format!("dd process failed with status: {:?}", dd_status.code()).into());
     }
     
+            // Read any remaining downloaded bytes for final count
+            while let Ok(downloaded_bytes) = downloaded_rx.try_recv() {
+                progress.bytes_received += downloaded_bytes;
+            }
+            
             // Read any remaining decompressed data for final count
             while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
                 progress.bytes_decompressed += decompressed_chunk.len() as u64;
