@@ -111,9 +111,9 @@ impl ProgressTracker {
                 // Show percentage based on how much compressed data has been sent to xzcat
                 if let Some(total) = self.content_length {
                     let decompress_progress = (self.bytes_sent_to_xzcat as f64 / total as f64) * 100.0;
-                    format!("{:.2} MB ({:.1}%) | {:.2} MB/s", mb_decompressed, decompress_progress, decompress_mb_per_sec)
+                    format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
                 } else {
-                    format!("{:.2} MB | {:.2} MB/s", mb_decompressed, decompress_mb_per_sec)
+                    format!("{:.2} MB", mb_decompressed)
                 }
             };
             
@@ -690,13 +690,8 @@ async fn handle_compressed_download(
         progress.final_download_rate = Some(mb_received / elapsed.as_secs_f64());
     }
     
-    eprintln!("\nDownload complete, closing buffer...");
-    
     // Close buffer channel to signal end of download
     drop(buffer_tx);
-    
-    // Wait for xzcat writer to finish writing all buffered data
-    eprintln!("Waiting for buffer to drain to xzcat...");
     
     // Poll for xzcat writer completion while showing progress
     loop {
@@ -749,9 +744,6 @@ async fn handle_compressed_download(
     while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
         progress.bytes_decompressed += decompressed_chunk.len() as u64;
     }
-    
-    // Continue updating progress while waiting for xzcat to finish decompressing
-    eprintln!("Waiting for decompression to complete...");
     
     // Check if xzcat has already finished
     let xzcat_already_done = match xzcat.try_wait() {
@@ -817,8 +809,6 @@ async fn handle_compressed_download(
         let mb_decompressed = progress.bytes_decompressed as f64 / (1024.0 * 1024.0);
         progress.final_decompress_rate = Some(mb_decompressed / elapsed.as_secs_f64());
     }
-    
-    eprintln!("\nDecompression complete, waiting for write to finish...");
     
     // Check if dd has already finished (it might have completed during decompression)
     let dd_already_done = match dd.try_wait() {
