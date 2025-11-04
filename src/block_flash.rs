@@ -11,6 +11,7 @@ pub struct BlockFlashOptions {
     pub buffer_size_mb: usize,
     pub max_retries: usize,
     pub retry_delay_secs: u64,
+    pub debug: bool,
 }
 
 impl Default for BlockFlashOptions {
@@ -21,6 +22,7 @@ impl Default for BlockFlashOptions {
             buffer_size_mb: 1024,
             max_retries: 10,
             retry_delay_secs: 2,
+            debug: false,
         }
     }
 }
@@ -202,8 +204,13 @@ async fn handle_dd_progress(
 async fn process_dd_messages(
     mut dd_error_rx: mpsc::UnboundedReceiver<String>,
     written_tx: mpsc::UnboundedSender<u64>,
+    debug: bool,
 ) -> Result<(), String> {
     while let Some(dd_msg) = dd_error_rx.recv().await {
+        if debug {
+            eprintln!("[DEBUG] dd output: {}", dd_msg.trim());
+        }
+        
         // Parse dd progress messages to extract bytes written
         if dd_msg.contains("bytes") && (dd_msg.contains("transferred") || dd_msg.contains("copied")) {
             // Parse format like: "13238272 bytes (13 MB, 13 MiB) transferred 13.725s, 965 kB/s"
@@ -221,26 +228,27 @@ async fn process_dd_messages(
                             let number_str = &second_part[..space_pos];
                             let unit = &second_part[space_pos + 1..];
                             
-                            if let Ok(value) = number_str.parse::<u64>() {
+                            // Try to parse as float first (handles both integers and decimals like "1.5")
+                            if let Ok(value) = number_str.parse::<f64>() {
                                 // Convert to bytes based on unit
                                 let bytes_written = match unit {
                                     "B" => value,
-                                    "kB" => value * 1000,
-                                    "kiB" => value * 1024,
-                                    "MB" => value * 1000 * 1000,
-                                    "MiB" => value * 1024 * 1024,
-                                    "GB" => value * 1000 * 1000 * 1000,
-                                    "GiB" => value * 1024 * 1024 * 1024,
-                                    "TB" => value * 1000 * 1000 * 1000 * 1000,
-                                    "TiB" => value * 1024 * 1024 * 1024 * 1024,
+                                    "kB" => value * 1000.0,
+                                    "kiB" => value * 1024.0,
+                                    "MB" => value * 1000.0 * 1000.0,
+                                    "MiB" => value * 1024.0 * 1024.0,
+                                    "GB" => value * 1000.0 * 1000.0 * 1000.0,
+                                    "GiB" => value * 1024.0 * 1024.0 * 1024.0,
+                                    "TB" => value * 1000.0 * 1000.0 * 1000.0 * 1000.0,
+                                    "TiB" => value * 1024.0 * 1024.0 * 1024.0 * 1024.0,
                                     _ => value, // fallback to raw value (treat as bytes)
                                 };
-                                let _ = written_tx.send(bytes_written);
+                                let _ = written_tx.send(bytes_written as u64);
                             }
                         } else {
                             // No space found, treat the entire second_part as a number (bytes)
-                            if let Ok(value) = second_part.parse::<u64>() {
-                                let _ = written_tx.send(value);
+                            if let Ok(value) = second_part.parse::<f64>() {
+                                let _ = written_tx.send(value as u64);
                             }
                         }
                     }
@@ -443,7 +451,8 @@ async fn handle_compressed_download(
     ));
     
     // Spawn message processors
-    let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx));
+    let debug = options.debug;
+    let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx, debug));
     let error_processor = tokio::spawn(process_error_messages(error_rx));
     
     // Main download loop with retry logic
@@ -578,41 +587,87 @@ async fn handle_compressed_download(
         break;
     }
     
+    eprintln!("\nDownload complete, closing input stream...");
+    
     // Close xzcat stdin to signal end of input
     let _ = xzcat_stdin.shutdown().await;
     
-    // Update final progress counts
-    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-        progress.bytes_decompressed += decompressed_chunk.len() as u64;
-    }
+    // Continue updating progress while waiting for xzcat to finish decompressing
+    eprintln!("Waiting for decompression to complete...");
     
-    while let Ok(written_bytes) = written_rx.try_recv() {
-        progress.bytes_written = written_bytes;
-    }
-    
-    // Wait for processes to complete
-    let xzcat_status = match xzcat.wait().await {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!();
-            return Err(e.into());
+    // Poll for xzcat completion while showing progress
+    loop {
+        // Update progress from channels
+        let mut updated = false;
+        
+        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+            progress.bytes_decompressed += decompressed_chunk.len() as u64;
+            updated = true;
         }
-    };
-    if !xzcat_status.success() {
-        eprintln!();
-        return Err(format!("xzcat process failed with status: {:?}", xzcat_status.code()).into());
+        
+        while let Ok(written_bytes) = written_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+            updated = true;
+        }
+        
+        if updated {
+            let _ = progress.update_progress(None, update_interval);
+        }
+        
+        // Check if xzcat is done (non-blocking check)
+        match xzcat.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!();
+                    return Err(format!("xzcat process failed with status: {:?}", status.code()).into());
+                }
+                break;
+            }
+            Ok(None) => {
+                // Still running, sleep briefly
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                eprintln!();
+                return Err(e.into());
+            }
+        }
     }
     
-    let dd_status = match dd.wait().await {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!();
-            return Err(e.into());
+    eprintln!("\nDecompression complete, waiting for write to finish...");
+    
+    // Poll for dd completion while showing progress
+    loop {
+        // Update progress from channels
+        let mut updated = false;
+        
+        while let Ok(written_bytes) = written_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+            updated = true;
         }
-    };
-    if !dd_status.success() {
-        eprintln!();
-        return Err(format!("dd process failed with status: {:?}", dd_status.code()).into());
+        
+        if updated {
+            let _ = progress.update_progress(None, update_interval);
+        }
+        
+        // Check if dd is done (non-blocking check)
+        match dd.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!();
+                    return Err(format!("dd process failed with status: {:?}", status.code()).into());
+                }
+                break;
+            }
+            Ok(None) => {
+                // Still running, sleep briefly
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                eprintln!();
+                return Err(e.into());
+            }
+        }
     }
     
     // Read any remaining progress updates

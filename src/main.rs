@@ -30,6 +30,9 @@ enum Commands {
         /// Delay in seconds between retry attempts (default: 2)
         #[arg(long, default_value = "2")]
         retry_delay: u64,
+        /// Enable debug output (prints all dd messages)
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -38,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::BlockFlash { url, device, ignore_certificates, buffer_size, max_retries, retry_delay } => {
+        Commands::BlockFlash { url, device, ignore_certificates, buffer_size, max_retries, retry_delay, debug } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
             println!("  Device: {}", device);
@@ -46,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Buffer size: {} MB", buffer_size);
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
+            println!("  Debug: {}", debug);
             
             let options = block_flash::BlockFlashOptions {
                 ignore_certificates,
@@ -53,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buffer_size_mb: buffer_size,
                 max_retries,
                 retry_delay_secs: retry_delay,
+                debug,
             };
             
             block_flash::stream_and_decompress(&url, options).await?;
