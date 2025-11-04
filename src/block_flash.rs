@@ -9,6 +9,8 @@ pub struct BlockFlashOptions {
     pub ignore_certificates: bool,
     pub device: String,
     pub buffer_size_mb: usize,
+    pub max_retries: usize,
+    pub retry_delay_secs: u64,
 }
 
 impl Default for BlockFlashOptions {
@@ -17,6 +19,8 @@ impl Default for BlockFlashOptions {
             ignore_certificates: false,
             device: String::new(),
             buffer_size_mb: 1024,
+            max_retries: 10,
+            retry_delay_secs: 2,
         }
     }
 }
@@ -283,27 +287,46 @@ async fn setup_http_client(options: &BlockFlashOptions) -> Result<Client, Box<dy
     Ok(builder.build()?)
 }
 
-async fn start_download(url: &str, client: &Client) -> Result<(reqwest::Response, bool), Box<dyn std::error::Error>> {
-    println!("Starting download from: {}", url);
+async fn start_download(url: &str, client: &Client, resume_from: Option<u64>) -> Result<(reqwest::Response, bool), Box<dyn std::error::Error>> {
+    if let Some(offset) = resume_from {
+        println!("Resuming download from: {} (byte offset: {})", url, offset);
+    } else {
+        println!("Starting download from: {}", url);
+    }
     
-    let response = client.get(url)
+    let mut request = client.get(url)
         .header("User-Agent", "smallrs/0.1.0")
         .header("Accept", "*/*")
-        .header("Accept-Encoding", "identity") // Don't compress, we're handling .xz ourselves
-        .send()
-        .await?;
+        .header("Accept-Encoding", "identity"); // Don't compress, we're handling .xz ourselves
     
-    if !response.status().is_success() {
+    // Add Range header if resuming
+    if let Some(offset) = resume_from {
+        request = request.header("Range", format!("bytes={}-", offset));
+    }
+    
+    let response = request.send().await?;
+    
+    // Accept both 200 (full content) and 206 (partial content) as success
+    if !response.status().is_success() && response.status().as_u16() != 206 {
         return Err(format!("HTTP error: {}", response.status()).into());
+    }
+    
+    // Check if server supports resume
+    if resume_from.is_some() && response.status().as_u16() != 206 {
+        println!("Warning: Server does not support range requests, starting from beginning");
     }
 
     let content_length = response.content_length();
     if let Some(len) = content_length {
-        println!("Content length: {} bytes", len);
+        if resume_from.is_some() {
+            println!("Remaining content length: {} bytes", len);
+        } else {
+            println!("Content length: {} bytes", len);
+        }
     }
 
     let needs_decompression = url.to_lowercase().ends_with(".xz");
-    if needs_decompression {
+    if needs_decompression && resume_from.is_none() {
         println!("Detected .xz extension, will decompress in real-time");
     }
 
@@ -376,8 +399,9 @@ async fn handle_regular_download(
 }
 
 async fn handle_compressed_download(
-    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin + Send + 'static,
-    content_length: Option<u64>,
+    url: &str,
+    client: &Client,
+    _initial_content_length: Option<u64>,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting xzcat subprocess for streaming decompression...");
@@ -393,13 +417,13 @@ async fn handle_compressed_download(
     let dd_stdin = dd.stdin.take().unwrap();
     let dd_stderr = dd.stderr.take().unwrap();
     
-            // Create channels
-            let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-            let (dd_error_tx, dd_error_rx) = mpsc::unbounded_channel::<String>();
-            let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
+    // Create channels
+    let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
+    let (dd_error_tx, dd_error_rx) = mpsc::unbounded_channel::<String>();
+    let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
     
-    // Spawn background tasks
+    // Spawn background tasks for xzcat and dd
     tokio::spawn(spawn_xzcat_stdout_reader(
         xzcat_stdout,
         decompressed_tx,
@@ -418,175 +442,200 @@ async fn handle_compressed_download(
         dd_error_tx,
     ));
     
-            // Spawn message processors
-            let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx));
-            let error_processor = tokio::spawn(process_error_messages(error_rx));
+    // Spawn message processors
+    let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx));
+    let error_processor = tokio::spawn(process_error_messages(error_rx));
     
-    // Calculate buffer capacity (assume 64KB average chunk size)
-    let buffer_size_mb = options.buffer_size_mb;
-    let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
-    let buffer_capacity = buffer_capacity.max(1); // At least 1
-    
-    println!("Using download buffer: {} MB (capacity: {} chunks)", buffer_size_mb, buffer_capacity);
-    
-    // Create bounded channel for download buffering
-    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
-    
-    // Main download loop
+    // Main download loop with retry logic
     let mut progress = ProgressTracker::new();
     let update_interval = Duration::from_millis(100);
+    let mut bytes_sent_to_xzcat: u64 = 0;
+    let mut retry_count = 0;
     
     use futures_util::StreamExt;
     
-    // Create channel for tracking downloaded bytes
-    let (downloaded_tx, mut downloaded_rx) = mpsc::unbounded_channel::<u64>();
-    
-    // Spawn download task
-    let download_task = tokio::spawn(async move {
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => {
-                    let len = c.len() as u64;
-                    if buffer_tx.send(c).await.is_err() {
-                        break; // Receiver dropped
-                    }
-                    // Notify progress tracker of downloaded bytes
-                    let _ = downloaded_tx.send(len);
-                }
-                Err(e) => {
-                    return Err(Box::new(e) as Box<dyn std::error::Error + Send>);
-                }
-            }
-        }
-        Ok::<(), Box<dyn std::error::Error + Send>>(())
-    });
-    
-    // Spawn xzcat writer task - this runs independently and can be blocked by xzcat
-    let xzcat_writer = tokio::spawn(async move {
-        while let Some(chunk) = buffer_rx.recv().await {
-            if let Err(e) = xzcat_stdin.write_all(&chunk).await {
-                return Err(format!("Error writing to xzcat stdin: {}", e));
-            }
-        }
-        // Close xzcat stdin when done
-        let _ = xzcat_stdin.shutdown().await;
-        Ok::<(), String>(())
-    });
-    
-    // Main progress tracking loop - not blocked by xzcat writes
     loop {
-        // Update progress from all available sources
-        let mut updated = false;
+        let resume_from = if bytes_sent_to_xzcat > 0 {
+            Some(bytes_sent_to_xzcat)
+        } else {
+            None
+        };
         
-        while let Ok(downloaded_bytes) = downloaded_rx.try_recv() {
-            progress.bytes_received += downloaded_bytes;
-            updated = true;
+        // Start or resume download
+        let (response, _) = match start_download(url, client, resume_from).await {
+            Ok(r) => r,
+            Err(e) => {
+                if retry_count >= options.max_retries {
+                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                    return Err(e);
+                }
+                eprintln!("\nDownload connection failed: {}, retrying in {} seconds... (attempt {}/{})", 
+                    e, options.retry_delay_secs, retry_count + 1, options.max_retries);
+                tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
+                retry_count += 1;
+                continue;
+            }
+        };
+        
+        let content_length = if resume_from.is_some() {
+            // For resumed downloads, we need to add the offset to partial content length
+            response.content_length().map(|len| len + bytes_sent_to_xzcat)
+        } else {
+            response.content_length()
+        };
+        
+        let mut stream = response.bytes_stream();
+        
+        // Calculate buffer capacity
+        let buffer_size_mb = options.buffer_size_mb;
+        let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
+        let buffer_capacity = buffer_capacity.max(1);
+        
+        if resume_from.is_none() {
+            println!("Using download buffer: {} MB (capacity: {} chunks)", buffer_size_mb, buffer_capacity);
         }
         
-        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-            progress.bytes_decompressed += decompressed_chunk.len() as u64;
-            updated = true;
-        }
+        // Download and write to xzcat for this connection
+        let mut connection_broken = false;
+        let mut connection_error: Option<Box<dyn std::error::Error>> = None;
         
-        while let Ok(written_bytes) = written_rx.try_recv() {
-            progress.bytes_written = written_bytes;
-            updated = true;
-        }
-        
-        if updated {
-            if let Err(e) = progress.update_progress(content_length, update_interval) {
-                eprintln!(); // Print newline to clear progress line
-                return Err(e);
+        loop {
+            // Try to get next chunk with timeout
+            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                Ok(Some(chunk_result)) => {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            let chunk_len = chunk.len() as u64;
+                            
+                            // Write to xzcat stdin
+                            match xzcat_stdin.write_all(&chunk).await {
+                                Ok(_) => {
+                                    bytes_sent_to_xzcat += chunk_len;
+                                    progress.bytes_received += chunk_len;
+                                    retry_count = 0; // Reset retry count on successful write
+                                }
+                                Err(e) => {
+                                    connection_error = Some(format!("Error writing to xzcat stdin: {}", e).into());
+                                    connection_broken = true;
+                                    break;
+                                }
+                            }
+                            
+                            // Update progress from other channels
+                            while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+                                progress.bytes_decompressed += decompressed_chunk.len() as u64;
+                            }
+                            
+                            while let Ok(written_bytes) = written_rx.try_recv() {
+                                progress.bytes_written = written_bytes;
+                            }
+                            
+                            if let Err(e) = progress.update_progress(content_length, update_interval) {
+                                eprintln!();
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => {
+                            connection_error = Some(Box::new(e));
+                            connection_broken = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Stream ended successfully
+                    break;
+                }
+                Err(_) => {
+                    // Timeout
+                    connection_error = Some("Connection timeout (30s)".into());
+                    connection_broken = true;
+                    break;
+                }
             }
         }
         
-        // Check if download task is done
-        if download_task.is_finished() {
-            break;
+        // If connection broke, retry
+        if connection_broken {
+            if retry_count >= options.max_retries {
+                eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                if let Some(e) = connection_error {
+                    return Err(e);
+                } else {
+                    return Err("Download failed after max retries".into());
+                }
+            }
+            
+            eprintln!("\nConnection interrupted: {}, resuming in {} seconds... (attempt {}/{})", 
+                connection_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string()),
+                options.retry_delay_secs, retry_count + 1, options.max_retries);
+            tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
+            retry_count += 1;
+            continue;
         }
         
-        // Small sleep to avoid busy waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Download completed successfully
+        break;
     }
     
-    // Check if download task had an error
-    match download_task.await {
-        Ok(Ok(())) => {},
-        Ok(Err(e)) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e);
-        }
-        Err(e) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e.into());
-        }
+    // Close xzcat stdin to signal end of input
+    let _ = xzcat_stdin.shutdown().await;
+    
+    // Update final progress counts
+    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+        progress.bytes_decompressed += decompressed_chunk.len() as u64;
     }
     
-    // Wait for xzcat writer task to finish (xzcat stdin is closed within the task)
-    match xzcat_writer.await {
-        Ok(Ok(())) => {},
-        Ok(Err(e)) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e.into());
-        }
-        Err(e) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e.into());
-        }
+    while let Ok(written_bytes) = written_rx.try_recv() {
+        progress.bytes_written = written_bytes;
     }
     
     // Wait for processes to complete
     let xzcat_status = match xzcat.wait().await {
         Ok(status) => status,
         Err(e) => {
-            eprintln!(); // Print newline to clear progress line
+            eprintln!();
             return Err(e.into());
         }
     };
     if !xzcat_status.success() {
-        eprintln!(); // Print newline to clear progress line
+        eprintln!();
         return Err(format!("xzcat process failed with status: {:?}", xzcat_status.code()).into());
     }
     
     let dd_status = match dd.wait().await {
         Ok(status) => status,
         Err(e) => {
-            eprintln!(); // Print newline to clear progress line
+            eprintln!();
             return Err(e.into());
         }
     };
     if !dd_status.success() {
-        eprintln!(); // Print newline to clear progress line
+        eprintln!();
         return Err(format!("dd process failed with status: {:?}", dd_status.code()).into());
     }
     
-            // Read any remaining downloaded bytes for final count
-            while let Ok(downloaded_bytes) = downloaded_rx.try_recv() {
-                progress.bytes_received += downloaded_bytes;
-            }
-            
-            // Read any remaining decompressed data for final count
-            while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-                progress.bytes_decompressed += decompressed_chunk.len() as u64;
-            }
-            
-            // Read any remaining written data for final count
-            while let Ok(written_bytes) = written_rx.try_recv() {
-                progress.bytes_written = written_bytes;
-            }
-            
-            // Wait for message processors to finish
-            let _ = tokio::try_join!(dd_processor, error_processor);
-            
-            let (mb_received, mb_decompressed, mb_written, download_rate, decompress_rate, written_rate) = progress.final_stats();
-            println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-                    mb_received, progress.start_time.elapsed().as_secs_f64(), download_rate);
-            println!("Decompression complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-                    mb_decompressed, progress.start_time.elapsed().as_secs_f64(), decompress_rate);
-            println!("Write complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
-                    mb_written, progress.start_time.elapsed().as_secs_f64(), written_rate);
-            println!("Compression ratio: {:.2}x", 
-                    mb_received / mb_decompressed);
+    // Read any remaining progress updates
+    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+        progress.bytes_decompressed += decompressed_chunk.len() as u64;
+    }
+    
+    while let Ok(written_bytes) = written_rx.try_recv() {
+        progress.bytes_written = written_bytes;
+    }
+    
+    // Wait for message processors to finish
+    let _ = tokio::try_join!(dd_processor, error_processor);
+    
+    let (mb_received, mb_decompressed, mb_written, download_rate, decompress_rate, written_rate) = progress.final_stats();
+    println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
+            mb_received, progress.start_time.elapsed().as_secs_f64(), download_rate);
+    println!("Decompression complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
+            mb_decompressed, progress.start_time.elapsed().as_secs_f64(), decompress_rate);
+    println!("Write complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
+            mb_written, progress.start_time.elapsed().as_secs_f64(), written_rate);
+    println!("Compression ratio: {:.2}x", 
+            mb_decompressed / mb_received);
     
     Ok(())
 }
@@ -596,12 +645,12 @@ pub async fn stream_and_decompress(
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = setup_http_client(&options).await?;
-    let (response, needs_decompression) = start_download(url, &client).await?;
+    let (response, needs_decompression) = start_download(url, &client, None).await?;
     let content_length = response.content_length();
     let stream = response.bytes_stream();
 
     if needs_decompression {
-        handle_compressed_download(stream, content_length, options).await
+        handle_compressed_download(url, &client, content_length, options).await
     } else {
         handle_regular_download(stream, content_length, options.buffer_size_mb).await
     }
