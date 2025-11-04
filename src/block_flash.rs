@@ -135,7 +135,8 @@ impl ProgressTracker {
                 format!("{:.2} MB | {:.2} MB/s", mb_written, written_mb_per_sec)
             };
             
-            print!("\rDownload: {} | Decompressed: {} | Written: {}", 
+            // Use ANSI escape code to clear to end of line to avoid leftover text
+            print!("\r\x1b[KDownload: {} | Decompressed: {} | Written: {}", 
                    download_status, decompress_status, write_status);
             io::stdout().flush()?;
             self.last_update = now;
@@ -891,8 +892,15 @@ async fn handle_compressed_download(
         progress.bytes_written = written_bytes;
     }
     
-    // Wait for message processors to finish
-    let _ = tokio::try_join!(dd_processor, error_processor);
+    // Wait for message processors to finish (with timeout)
+    // Use a timeout since the pipes might have buffered data even after the process exits
+    let timeout_duration = Duration::from_secs(2);
+    let _ = tokio::time::timeout(
+        timeout_duration,
+        async {
+            tokio::try_join!(dd_processor, error_processor)
+        }
+    ).await;
     
     let (mb_received, mb_decompressed, mb_written, download_rate, decompress_rate, written_rate) = progress.final_stats();
     println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 
