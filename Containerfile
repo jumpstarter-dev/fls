@@ -28,12 +28,26 @@ ENV RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc -C link-arg=-static -C link-arg=-
 ENV OPENSSL_STATIC=1
 
 WORKDIR /app
-COPY Makefile .
-COPY Cargo* .
-COPY src src
+
+# Copy only dependency manifests first
+COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 
-# Build the project with static glibc linking
+# Create a dummy source file to allow dependency compilation
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (this layer will be cached)
+RUN cargo build --release --target aarch64-unknown-linux-gnu
+
+# Remove the dummy source and build artifacts (keep dependencies cached)
+RUN rm -rf src target/aarch64-unknown-linux-gnu/release/smallrs* \
+    target/aarch64-unknown-linux-gnu/release/deps/smallrs*
+
+# Now copy the real source code and Makefile
+COPY Makefile .
+COPY src src
+
+# Build the actual project (dependencies are already cached)
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
 # Compress the binary with UPX for smaller size

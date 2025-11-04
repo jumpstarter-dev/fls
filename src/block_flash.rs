@@ -258,20 +258,40 @@ async fn process_error_messages(
 }
 
 async fn setup_http_client(options: &BlockFlashOptions) -> Result<Client, Box<dyn std::error::Error>> {
+    let mut builder = Client::builder()
+        // Enable HTTP/2 adaptive mode (will use HTTP/2 if server supports it)
+        .http2_adaptive_window(true)
+        .http2_initial_stream_window_size(Some(1024 * 1024 * 16)) // 16MB stream window
+        .http2_initial_connection_window_size(Some(1024 * 1024 * 32)) // 32MB connection window
+        // Increase connection pool settings
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        // Enable TCP keepalive to prevent connection drops
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
+        // Very long timeout for large downloads
+        .timeout(Duration::from_secs(3600))
+        .connect_timeout(Duration::from_secs(30))
+        // Use system DNS resolver for better performance
+        .no_hickory_dns();
+    
     if options.ignore_certificates {
         println!("Warning: Certificate verification is disabled");
-        Ok(Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?)
-    } else {
-        Ok(Client::new())
+        builder = builder.danger_accept_invalid_certs(true);
     }
+    
+    Ok(builder.build()?)
 }
 
 async fn start_download(url: &str, client: &Client) -> Result<(reqwest::Response, bool), Box<dyn std::error::Error>> {
     println!("Starting download from: {}", url);
     
-    let response = client.get(url).send().await?;
+    let response = client.get(url)
+        .header("User-Agent", "smallrs/0.1.0")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity") // Don't compress, we're handling .xz ourselves
+        .send()
+        .await?;
     
     if !response.status().is_success() {
         return Err(format!("HTTP error: {}", response.status()).into());

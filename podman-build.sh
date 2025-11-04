@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Manual Podman build for ARM64 static binary
-set -e
+set -e -x
 
 echo "Building ARM64 static binary using Podman..."
 
