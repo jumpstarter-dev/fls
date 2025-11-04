@@ -33,6 +33,10 @@ struct ProgressTracker {
     bytes_written: u64,
     start_time: Instant,
     last_update: Instant,
+    // Store final rates when each phase completes
+    final_download_rate: Option<f64>,
+    final_decompress_rate: Option<f64>,
+    final_write_rate: Option<f64>,
 }
 
 impl ProgressTracker {
@@ -44,6 +48,9 @@ impl ProgressTracker {
             bytes_written: 0,
             start_time: now,
             last_update: now,
+            final_download_rate: None,
+            final_decompress_rate: None,
+            final_write_rate: None,
         }
     }
     
@@ -54,21 +61,29 @@ impl ProgressTracker {
             let mb_received = self.bytes_received as f64 / (1024.0 * 1024.0);
             let mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
             let mb_written = self.bytes_written as f64 / (1024.0 * 1024.0);
-            let download_mb_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                mb_received / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            let decompress_mb_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                mb_decompressed / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            let written_mb_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                mb_written / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
+            
+            // Use stored final rates if available, otherwise calculate current rates
+            let download_mb_per_sec = self.final_download_rate.unwrap_or_else(|| {
+                if elapsed.as_secs_f64() > 0.0 {
+                    mb_received / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                }
+            });
+            let decompress_mb_per_sec = self.final_decompress_rate.unwrap_or_else(|| {
+                if elapsed.as_secs_f64() > 0.0 {
+                    mb_decompressed / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                }
+            });
+            let written_mb_per_sec = self.final_write_rate.unwrap_or_else(|| {
+                if elapsed.as_secs_f64() > 0.0 {
+                    mb_written / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                }
+            });
             
             if let Some(total) = content_length {
                 let progress = (self.bytes_received as f64 / total as f64) * 100.0;
@@ -631,6 +646,13 @@ async fn handle_compressed_download(
         break;
     }
     
+    // Capture the download rate at completion
+    let elapsed = progress.start_time.elapsed();
+    if elapsed.as_secs_f64() > 0.0 {
+        let mb_received = progress.bytes_received as f64 / (1024.0 * 1024.0);
+        progress.final_download_rate = Some(mb_received / elapsed.as_secs_f64());
+    }
+    
     eprintln!("\nDownload complete, closing buffer...");
     
     // Close buffer channel to signal end of download
@@ -685,82 +707,139 @@ async fn handle_compressed_download(
         }
     }
     
+    // Update any remaining progress
+    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+        progress.bytes_decompressed += decompressed_chunk.len() as u64;
+    }
+    
     // Continue updating progress while waiting for xzcat to finish decompressing
     eprintln!("Waiting for decompression to complete...");
     
-    // Poll for xzcat completion while showing progress
-    loop {
-        // Update progress from channels
-        let mut updated = false;
-        
-        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-            progress.bytes_decompressed += decompressed_chunk.len() as u64;
-            updated = true;
-        }
-        
-        while let Ok(written_bytes) = written_rx.try_recv() {
-            progress.bytes_written = written_bytes;
-            updated = true;
-        }
-        
-        if updated {
-            let _ = progress.update_progress(None, update_interval);
-        }
-        
-        // Check if xzcat is done (non-blocking check)
-        match xzcat.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    eprintln!();
-                    return Err(format!("xzcat process failed with status: {:?}", status.code()).into());
-                }
-                break;
-            }
-            Ok(None) => {
-                // Still running, sleep briefly
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
+    // Check if xzcat has already finished
+    let xzcat_already_done = match xzcat.try_wait() {
+        Ok(Some(status)) => {
+            if !status.success() {
                 eprintln!();
-                return Err(e.into());
+                return Err(format!("xzcat process failed with status: {:?}", status.code()).into());
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!();
+            return Err(e.into());
+        }
+    };
+    
+    // Only wait if xzcat is not already done
+    if !xzcat_already_done {
+        // Poll for xzcat completion while showing progress
+        loop {
+            // Update progress from channels
+            let mut updated = false;
+            
+            while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
+                progress.bytes_decompressed += decompressed_chunk.len() as u64;
+                updated = true;
+            }
+            
+            while let Ok(written_bytes) = written_rx.try_recv() {
+                progress.bytes_written = written_bytes;
+                updated = true;
+            }
+            
+            if updated {
+                let _ = progress.update_progress(None, update_interval);
+            }
+            
+            // Check if xzcat is done (non-blocking check)
+            match xzcat.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!();
+                        return Err(format!("xzcat process failed with status: {:?}", status.code()).into());
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    // Still running, sleep briefly
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    eprintln!();
+                    return Err(e.into());
+                }
             }
         }
     }
     
+    // Capture the decompression rate at completion
+    let elapsed = progress.start_time.elapsed();
+    if elapsed.as_secs_f64() > 0.0 {
+        let mb_decompressed = progress.bytes_decompressed as f64 / (1024.0 * 1024.0);
+        progress.final_decompress_rate = Some(mb_decompressed / elapsed.as_secs_f64());
+    }
+    
     eprintln!("\nDecompression complete, waiting for write to finish...");
     
-    // Poll for dd completion while showing progress
-    loop {
-        // Update progress from channels
-        let mut updated = false;
-        
-        while let Ok(written_bytes) = written_rx.try_recv() {
-            progress.bytes_written = written_bytes;
-            updated = true;
-        }
-        
-        if updated {
-            let _ = progress.update_progress(None, update_interval);
-        }
-        
-        // Check if dd is done (non-blocking check)
-        match dd.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    eprintln!();
-                    return Err(format!("dd process failed with status: {:?}", status.code()).into());
-                }
-                break;
-            }
-            Ok(None) => {
-                // Still running, sleep briefly
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
+    // Check if dd has already finished (it might have completed during decompression)
+    let dd_already_done = match dd.try_wait() {
+        Ok(Some(status)) => {
+            if !status.success() {
                 eprintln!();
-                return Err(e.into());
+                return Err(format!("dd process failed with status: {:?}", status.code()).into());
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!();
+            return Err(e.into());
+        }
+    };
+    
+    // Only wait if dd is not already done
+    if !dd_already_done {
+        // Poll for dd completion while showing progress
+        loop {
+            // Update progress from channels
+            let mut updated = false;
+            
+            while let Ok(written_bytes) = written_rx.try_recv() {
+                progress.bytes_written = written_bytes;
+                updated = true;
+            }
+            
+            if updated {
+                let _ = progress.update_progress(None, update_interval);
+            }
+            
+            // Check if dd is done (non-blocking check)
+            match dd.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!();
+                        return Err(format!("dd process failed with status: {:?}", status.code()).into());
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    // Still running, sleep briefly
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    eprintln!();
+                    return Err(e.into());
+                }
             }
         }
+    }
+    
+    // Capture the write rate at completion
+    let elapsed = progress.start_time.elapsed();
+    if elapsed.as_secs_f64() > 0.0 {
+        let mb_written = progress.bytes_written as f64 / (1024.0 * 1024.0);
+        progress.final_write_rate = Some(mb_written / elapsed.as_secs_f64());
     }
     
     // Read any remaining progress updates
