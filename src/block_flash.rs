@@ -112,25 +112,17 @@ impl ProgressTracker {
                 if let Some(total) = self.content_length {
                     let decompress_progress = (self.bytes_sent_to_xzcat as f64 / total as f64) * 100.0;
                     
-                    // Calculate estimated remaining time based on decompression progress
-                    if decompress_progress > 1.0 && elapsed.as_secs_f64() > 0.0 {
-                        let estimated_total_time = elapsed.as_secs_f64() / (decompress_progress / 100.0);
-                        let remaining_secs = estimated_total_time - elapsed.as_secs_f64();
-                        
-                        if remaining_secs > 0.0 {
-                            let mins = (remaining_secs / 60.0) as i32;
-                            let secs = (remaining_secs % 60.0) as i32;
-                            if mins > 0 {
-                                format!("{:.2} MB ({:.1}%) [ETA: {}m {}s]", mb_decompressed, decompress_progress, mins, secs)
-                            } else {
-                                format!("{:.2} MB ({:.1}%) [ETA: {}s]", mb_decompressed, decompress_progress, secs)
-                            }
-                        } else {
-                            format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
-                        }
-                    } else {
-                        format!("{:.2} MB ({:.1}%)", mb_decompressed, decompress_progress)
-                    }
+                    // Create a simple inline progress bar
+                    // Use 10 chars while downloading, 20 chars once download is complete
+                    let bar_width = if self.final_download_rate.is_some() { 20 } else { 10 };
+                    let filled = ((decompress_progress / 100.0) * bar_width as f64) as usize;
+                    let filled = filled.min(bar_width);
+                    let bar = format!("[{}{}]", 
+                        "█".repeat(filled),
+                        "░".repeat(bar_width - filled)
+                    );
+                    
+                    format!("{} {:.1}%", bar, decompress_progress)
                 } else {
                     format!("{:.2} MB", mb_decompressed)
                 }
