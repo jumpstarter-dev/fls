@@ -105,7 +105,7 @@ pub(crate) async fn handle_compressed_download(
     let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(options.device.clone(), written_tx)?;
+    let block_writer = AsyncBlockWriter::new(options.device.clone(), written_tx, options.debug)?;
 
     // Spawn background task to read from decompressor and write to block device
     let error_tx_clone = error_tx.clone();

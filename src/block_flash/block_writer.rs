@@ -6,10 +6,6 @@ use tokio::sync::mpsc;
 const BLOCK_SIZE: usize = 1024 * 1024; // 1MB blocks for better throughput
 const ALIGNMENT: usize = 4096; // 4KB alignment for direct I/O
 
-// Platform-specific constants
-#[cfg(target_os = "linux")]
-const O_DIRECT: i32 = 0x4000; // O_DIRECT flag for Linux
-
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 const F_NOCACHE: i32 = 48; // F_NOCACHE for macOS (use with fcntl)
@@ -40,6 +36,8 @@ pub(crate) struct BlockWriter {
     bytes_since_sync: u64, // Track bytes written since last sync
     written_tx: mpsc::UnboundedSender<u64>,
     use_direct_io: bool, // Track if O_DIRECT is active
+    #[allow(dead_code)]
+    debug: bool, // Debug mode flag
 }
 
 // Sync every 64MB when not using direct I/O
@@ -47,7 +45,11 @@ const SYNC_INTERVAL: u64 = 64 * 1024 * 1024;
 
 impl BlockWriter {
     /// Open a block device for writing with direct I/O
-    pub(crate) fn new(device: &str, written_tx: mpsc::UnboundedSender<u64>) -> io::Result<Self> {
+    pub(crate) fn new(
+        device: &str,
+        written_tx: mpsc::UnboundedSender<u64>,
+        debug: bool,
+    ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let (file, use_direct_io) = {
             // Try O_DIRECT without O_SYNC first (some devices have issues with both)
@@ -55,11 +57,16 @@ impl BlockWriter {
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .custom_flags(O_DIRECT)
+                .custom_flags(libc::O_DIRECT)
                 .open(device)
             {
                 Ok(f) => {
-                    eprintln!("Opened {} with O_DIRECT (direct I/O enabled)", device);
+                    if debug {
+                        eprintln!(
+                            "[DEBUG] Opened {} with O_DIRECT (direct I/O enabled)",
+                            device
+                        );
+                    }
                     (f, true)
                 }
                 Err(e1) => {
@@ -68,24 +75,28 @@ impl BlockWriter {
                         .write(true)
                         .create(true)
                         .truncate(true)
-                        .custom_flags(O_DIRECT | libc::O_SYNC)
+                        .custom_flags(libc::O_DIRECT | libc::O_SYNC)
                         .open(device)
                     {
                         Ok(f) => {
-                            eprintln!(
-                                "Opened {} with O_DIRECT|O_SYNC (direct I/O enabled)",
-                                device
-                            );
+                            if debug {
+                                eprintln!(
+                                    "[DEBUG] Opened {} with O_DIRECT|O_SYNC (direct I/O enabled)",
+                                    device
+                                );
+                            }
                             (f, true)
                         }
                         Err(e2) => {
                             // Fall back to regular buffered I/O without O_SYNC for better performance
                             // We'll sync explicitly during flush instead
-                            eprintln!("Warning: O_DIRECT not supported on {} (tried without O_SYNC: {}, with O_SYNC: {})", 
-                                     device, e1, e2);
-                            eprintln!(
-                                "Falling back to buffered I/O (writes will be synced on flush)"
-                            );
+                            if debug {
+                                eprintln!("[DEBUG] Warning: O_DIRECT not supported on {} (tried without O_SYNC: {}, with O_SYNC: {})", 
+                                         device, e1, e2);
+                                eprintln!(
+                                    "[DEBUG] Falling back to buffered I/O (writes will be synced on flush)"
+                                );
+                            }
                             let f = OpenOptions::new()
                                 .write(true)
                                 .create(true)
@@ -113,10 +124,17 @@ impl BlockWriter {
             let direct_io = unsafe {
                 // Enable F_NOCACHE to bypass filesystem cache
                 if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
-                    eprintln!("Warning: F_NOCACHE not supported, using buffered I/O");
+                    if debug {
+                        eprintln!("[DEBUG] Warning: F_NOCACHE not supported, using buffered I/O");
+                    }
                     false
                 } else {
-                    eprintln!("Opened {} with F_NOCACHE (direct I/O enabled)", device);
+                    if debug {
+                        eprintln!(
+                            "[DEBUG] Opened {} with F_NOCACHE (direct I/O enabled)",
+                            device
+                        );
+                    }
                     true
                 }
             };
@@ -135,6 +153,7 @@ impl BlockWriter {
             bytes_since_sync: 0,
             written_tx,
             use_direct_io,
+            debug,
         })
     }
 
@@ -230,12 +249,16 @@ pub(crate) struct AsyncBlockWriter {
 
 impl AsyncBlockWriter {
     /// Create a new async block writer
-    pub(crate) fn new(device: String, written_tx: mpsc::UnboundedSender<u64>) -> io::Result<Self> {
+    pub(crate) fn new(
+        device: String,
+        written_tx: mpsc::UnboundedSender<u64>,
+        debug: bool,
+    ) -> io::Result<Self> {
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
-            let mut writer = BlockWriter::new(&device, written_tx).map_err(|e| {
+            let mut writer = BlockWriter::new(&device, written_tx, debug).map_err(|e| {
                 eprintln!("Failed to open device '{}': {}", device, e);
                 e
             })?;
