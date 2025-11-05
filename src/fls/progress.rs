@@ -146,7 +146,7 @@ impl ProgressTracker {
             } else {
                 "Progress"
             };
-            
+
             if self.newline_progress {
                 // Print on a new line
                 println!(

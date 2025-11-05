@@ -15,10 +15,7 @@ pub async fn flash_from_url(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = setup_http_client(&options).await?;
 
-    println!("Starting decompressor subprocess for streaming decompression...");
     let (mut decompressor, decompressor_name) = start_decompressor_process(url).await?;
-
-    println!("Opening block device for writing: {}", options.device);
 
     // Extract stdio handles
     let mut decompressor_stdin = decompressor.stdin.take().unwrap();
@@ -29,6 +26,8 @@ pub async fn flash_from_url(
     let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
+
+    println!("Opening block device for writing: {}", options.device);
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
