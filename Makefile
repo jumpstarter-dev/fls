@@ -1,6 +1,6 @@
 # Makefile for fls - ARM64 static builds
 
-.PHONY: all build clean test arm64-static help
+.PHONY: all build clean test arm64-static lint fmt clippy check help
 
 # Default target
 all: build
@@ -28,6 +28,29 @@ all-targets:
 test:
 	cargo test
 
+# Run all lints (format check + clippy)
+lint: fmt-check clippy
+
+# Check code formatting
+fmt-check:
+	@echo "Checking code formatting..."
+	cargo fmt -- --check
+
+# Format code
+fmt:
+	@echo "Formatting code..."
+	cargo fmt
+
+# Run clippy linter
+clippy:
+	@echo "Running clippy..."
+	cargo clippy --all-targets --all-features -- -D warnings
+
+# Run cargo check (quick compile check)
+check:
+	@echo "Running cargo check..."
+	cargo check --all-targets
+
 # Clean build artifacts
 clean:
 	cargo clean
@@ -48,6 +71,11 @@ help:
 	@echo "  arm64-static - Build for ARM64 static (musl) - single binary, no dependencies"
 	@echo "  all-targets  - Build for native + ARM64 static"
 	@echo "  test         - Run tests"
+	@echo "  lint         - Run all lints (format check + clippy)"
+	@echo "  fmt          - Format code with rustfmt"
+	@echo "  fmt-check    - Check code formatting without modifying files"
+	@echo "  clippy       - Run clippy linter"
+	@echo "  check        - Quick compile check"
 	@echo "  clean        - Clean build artifacts"
-	@echo "  install-deps - Install ARM64 musl cross-compilation dependencies (Ubuntu/Debian)"
+	@echo "  install-deps - Install cross-compilation dependencies"
 	@echo "  help         - Show this help"

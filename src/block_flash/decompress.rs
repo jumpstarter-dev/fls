@@ -1,5 +1,5 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Command, Child};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 /// Determines the appropriate decompression command based on URL extension
@@ -30,20 +30,22 @@ pub(crate) fn check_binary_available(cmd: &str) -> Result<(), String> {
 }
 
 /// Starts the appropriate decompression process based on URL extension
-pub(crate) async fn start_decompressor_process(url: &str) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
+pub(crate) async fn start_decompressor_process(
+    url: &str,
+) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
     let cmd = get_decompressor_command(url);
-    
+
     // Check if binary is available before attempting to spawn
     check_binary_available(cmd)?;
-    
+
     println!("Using decompressor: {}", cmd);
-    
+
     let process = Command::new(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    
+
     Ok((process, cmd))
 }
 
@@ -97,4 +99,3 @@ pub(crate) async fn spawn_stderr_reader(
         }
     }
 }
-

@@ -45,7 +45,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::BlockFlash { url, device, ca_cert, ignore_certificates, buffer_size, max_retries, retry_delay, debug } => {
+        Commands::BlockFlash {
+            url,
+            device,
+            ca_cert,
+            ignore_certificates,
+            buffer_size,
+            max_retries,
+            retry_delay,
+            debug,
+        } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
             println!("  Device: {}", device);
@@ -57,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
             println!("  Debug: {}", debug);
-            
+
             let options = block_flash::BlockFlashOptions {
                 ignore_certificates,
                 ca_cert,
@@ -67,10 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_delay_secs: retry_delay,
                 debug,
             };
-            
+
             block_flash::stream_and_decompress(&url, options).await?;
         }
     }
-    
+
     Ok(())
 }
