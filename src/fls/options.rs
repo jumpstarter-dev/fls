@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 pub struct BlockFlashOptions {
-    pub ignore_certificates: bool,
-    pub ca_cert: Option<PathBuf>,
+    pub insecure_tls: bool,
+    pub cacert: Option<PathBuf>,
     pub device: String,
     pub buffer_size_mb: usize,
     pub max_retries: usize,
@@ -14,8 +14,8 @@ pub struct BlockFlashOptions {
 impl Default for BlockFlashOptions {
     fn default() -> Self {
         Self {
-            ignore_certificates: false,
-            ca_cert: None,
+            insecure_tls: false,
+            cacert: None,
             device: String::new(),
             buffer_size_mb: 1024,
             max_retries: 10,

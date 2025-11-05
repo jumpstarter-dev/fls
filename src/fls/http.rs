@@ -23,7 +23,7 @@ pub(crate) async fn setup_http_client(
         .no_hickory_dns();
 
     // Add custom CA certificate if provided
-    if let Some(ca_cert_path) = &options.ca_cert {
+    if let Some(ca_cert_path) = &options.cacert {
         println!("Loading CA certificate from: {}", ca_cert_path.display());
         let cert_bytes = std::fs::read(ca_cert_path)
             .map_err(|e| format!("Failed to read CA certificate file: {}", e))?;
@@ -35,7 +35,7 @@ pub(crate) async fn setup_http_client(
         println!("CA certificate loaded successfully");
     }
 
-    if options.ignore_certificates {
+    if options.insecure_tls {
         println!("Warning: Certificate verification is disabled");
         builder = builder.danger_accept_invalid_certs(true);
     }

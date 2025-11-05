@@ -21,10 +21,10 @@ enum Commands {
         device: String,
         /// Path to CA certificate PEM file for TLS validation
         #[arg(long)]
-        ca_cert: Option<PathBuf>,
+        cacert: Option<PathBuf>,
         /// Ignore SSL certificate verification
-        #[arg(long)]
-        ignore_certificates: bool,
+        #[arg(short = 'k', long = "insecure-tls")]
+        insecure_tls: bool,
         /// Buffer size in MB for download buffering (default: 1024 MB)
         #[arg(long, default_value = "1024")]
         buffer_size: usize,
@@ -51,8 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::FromUrl {
             url,
             device,
-            ca_cert,
-            ignore_certificates,
+            cacert,
+            insecure_tls,
             buffer_size,
             max_retries,
             retry_delay,
@@ -62,10 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Block flash command:");
             println!("  URL: {}", url);
             println!("  Device: {}", device);
-            if let Some(ref cert_path) = ca_cert {
+            if let Some(ref cert_path) = cacert {
                 println!("  CA Certificate: {}", cert_path.display());
             }
-            println!("  Ignore certificates: {}", ignore_certificates);
+            println!("  Ignore certificates: {}", insecure_tls);
             println!("  Buffer size: {} MB", buffer_size);
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
@@ -94,8 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!();
 
             let options = fls::BlockFlashOptions {
-                ignore_certificates,
-                ca_cert,
+                insecure_tls,
+                cacert,
                 device: device.clone(),
                 buffer_size_mb: buffer_size,
                 max_retries,
