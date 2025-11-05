@@ -87,7 +87,7 @@ pub async fn flash_from_url(
     let mut progress = ProgressTracker::new();
     // Set whether we're actually decompressing (not using cat for uncompressed files)
     progress.set_is_compressed(decompressor_name != "cat");
-    let update_interval = Duration::from_millis(100);
+    let update_interval = Duration::from_secs_f64(options.progress_interval_secs);
     let mut bytes_sent_to_decompressor: u64 = 0;
     let mut retry_count = 0;
     let debug = options.debug;
@@ -225,7 +225,7 @@ pub async fn flash_from_url(
                             }
 
                             if let Err(e) =
-                                progress.update_progress(content_length, update_interval)
+                                progress.update_progress(content_length, update_interval, false)
                             {
                                 eprintln!();
                                 return Err(e);
@@ -314,7 +314,7 @@ pub async fn flash_from_url(
         }
 
         if updated {
-            let _ = progress.update_progress(None, update_interval);
+            let _ = progress.update_progress(None, update_interval, false);
         }
 
         // Check if decompressor writer task is done
@@ -383,7 +383,7 @@ pub async fn flash_from_url(
             }
 
             if updated {
-                let _ = progress.update_progress(None, update_interval);
+                let _ = progress.update_progress(None, update_interval, false);
             }
 
             // Check if decompressor is done (non-blocking check)
@@ -431,7 +431,7 @@ pub async fn flash_from_url(
         }
 
         if updated {
-            let _ = progress.update_progress(None, update_interval);
+            let _ = progress.update_progress(None, update_interval, false);
         }
 
         // Check if writer is done
@@ -474,6 +474,9 @@ pub async fn flash_from_url(
     while let Ok(written_bytes) = written_rx.try_recv() {
         progress.bytes_written = written_bytes;
     }
+
+    // Force a final progress update to show completion
+    let _ = progress.update_progress(None, update_interval, true);
 
     // Wait for message processor to finish (with timeout)
     let timeout_duration = Duration::from_secs(2);

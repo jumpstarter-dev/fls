@@ -43,6 +43,9 @@ enum Commands {
         /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
+        /// Progress update interval in seconds (default: 0.1, accepts float values like 1.0 or 0.5)
+        #[arg(short = 'i', long, default_value = "0.1")]
+        progress_interval: f64,
     },
 }
 
@@ -62,6 +65,7 @@ async fn main() {
             debug,
             o_direct,
             headers,
+            progress_interval,
         } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
@@ -108,6 +112,7 @@ async fn main() {
                 debug,
                 o_direct,
                 headers: parsed_headers,
+                progress_interval_secs: progress_interval,
             };
 
             match fls::flash_from_url(&url, options).await {

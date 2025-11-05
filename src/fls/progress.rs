@@ -67,9 +67,10 @@ impl ProgressTracker {
         &mut self,
         content_length: Option<u64>,
         update_interval: Duration,
+        force: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
-        if now.duration_since(self.last_update) >= update_interval {
+        if force || now.duration_since(self.last_update) >= update_interval {
             let elapsed = now.duration_since(self.start_time);
             let mb_received = self.bytes_received as f64 / (1024.0 * 1024.0);
             let mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
