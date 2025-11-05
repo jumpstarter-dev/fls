@@ -178,15 +178,6 @@ pub async fn flash_from_url(
                         Ok(chunk) => {
                             let chunk_len = chunk.len() as u64;
 
-                            // Debug: Show chunk sizes for first 10 MB to verify our buffer sizing
-                            if debug && progress.bytes_received < 10 * 1024 * 1024 {
-                                eprintln!(
-                                    "[DEBUG] HTTP chunk size: {} bytes ({:.1} KB)",
-                                    chunk_len,
-                                    chunk_len as f64 / 1024.0
-                                );
-                            }
-
                             // Send to buffer - detect if it's blocking
                             let send_start = std::time::Instant::now();
                             if buffer_tx.send(chunk).await.is_err() {
