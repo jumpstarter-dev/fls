@@ -8,6 +8,7 @@ pub struct BlockFlashOptions {
     pub max_retries: usize,
     pub retry_delay_secs: u64,
     pub debug: bool,
+    pub o_direct: bool,
     pub headers: Vec<(String, String)>,
 }
 
@@ -21,6 +22,7 @@ impl Default for BlockFlashOptions {
             max_retries: 10,
             retry_delay_secs: 2,
             debug: false,
+            o_direct: false,
             headers: Vec::new(),
         }
     }

@@ -31,7 +31,12 @@ pub async fn flash_from_url(
     let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(options.device.clone(), written_tx, options.debug)?;
+    let block_writer = AsyncBlockWriter::new(
+        options.device.clone(),
+        written_tx,
+        options.debug,
+        options.o_direct,
+    )?;
 
     // Spawn background task to read from decompressor and write to block device
     let error_tx_clone = error_tx.clone();

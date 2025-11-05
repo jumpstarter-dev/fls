@@ -37,6 +37,9 @@ enum Commands {
         /// Enable debug output (prints all dd messages)
         #[arg(long)]
         debug: bool,
+        /// Enable O_DIRECT mode for direct I/O (bypasses OS cache)
+        #[arg(long)]
+        o_direct: bool,
         /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
@@ -57,6 +60,7 @@ async fn main() {
             max_retries,
             retry_delay,
             debug,
+            o_direct,
             headers,
         } => {
             println!("Block flash command:");
@@ -70,6 +74,7 @@ async fn main() {
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
             println!("  Debug: {}", debug);
+            println!("  O_DIRECT mode: {}", o_direct);
 
             // Parse headers in the format "Header: value"
             let parsed_headers: Vec<(String, String)> = headers
@@ -101,6 +106,7 @@ async fn main() {
                 max_retries,
                 retry_delay_secs: retry_delay,
                 debug,
+                o_direct,
                 headers: parsed_headers,
             };
 

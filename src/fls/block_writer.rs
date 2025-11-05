@@ -38,8 +38,7 @@ struct AlignedBuffer {
 
 impl AlignedBuffer {
     fn new(size: usize, alignment: usize) -> Self {
-        let layout = Layout::from_size_align(size, alignment)
-            .expect("Invalid layout");
+        let layout = Layout::from_size_align(size, alignment).expect("Invalid layout");
         let ptr = unsafe {
             let raw_ptr = alloc(layout);
             if raw_ptr.is_null() {
@@ -94,96 +93,123 @@ impl BlockWriter {
         device: &str,
         written_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
+        o_direct: bool,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let (file, use_direct_io) = {
-            // Try O_DIRECT without O_SYNC first (some devices have issues with both)
-            match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(device)
-            {
-                Ok(f) => {
-                    if debug {
-                        eprintln!(
-                            "[DEBUG] Opened {} with O_DIRECT (direct I/O enabled)",
-                            device
-                        );
-                    }
-                    (f, true)
-                }
-                Err(e1) => {
-                    // Try O_DIRECT with O_SYNC
-                    match OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .custom_flags(libc::O_DIRECT | libc::O_SYNC)
-                        .open(device)
-                    {
-                        Ok(f) => {
-                            if debug {
-                                eprintln!(
-                                    "[DEBUG] Opened {} with O_DIRECT|O_SYNC (direct I/O enabled)",
-                                    device
-                                );
-                            }
-                            (f, true)
+            if o_direct {
+                // Try O_DIRECT without O_SYNC first (some devices have issues with both)
+                match OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(device)
+                {
+                    Ok(f) => {
+                        if debug {
+                            eprintln!(
+                                "[DEBUG] Opened {} with O_DIRECT (direct I/O enabled)",
+                                device
+                            );
                         }
-                        Err(e2) => {
-                            // Fall back to regular buffered I/O without O_SYNC for better performance
-                            // We'll sync explicitly during flush instead
-                            if debug {
-                                eprintln!("[DEBUG] Warning: O_DIRECT not supported on {} (tried without O_SYNC: {}, with O_SYNC: {})", 
-                                         device, e1, e2);
-                                eprintln!(
-                                    "[DEBUG] Falling back to buffered I/O (writes will be synced on flush)"
-                                );
+                        (f, true)
+                    }
+                    Err(e1) => {
+                        // Try O_DIRECT with O_SYNC
+                        match OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+                            .open(device)
+                        {
+                            Ok(f) => {
+                                if debug {
+                                    eprintln!(
+                                        "[DEBUG] Opened {} with O_DIRECT|O_SYNC (direct I/O enabled)",
+                                        device
+                                    );
+                                }
+                                (f, true)
                             }
-                            let f = OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .open(device)?;
-                            (f, false)
+                            Err(e2) => {
+                                // Fail if O_DIRECT was explicitly requested but not available
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Unsupported,
+                                    format!(
+                                        "O_DIRECT not supported on {} (tried without O_SYNC: {}, with O_SYNC: {})",
+                                        device, e1, e2
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
+            } else {
+                // Use buffered I/O when O_DIRECT is not requested
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Opened {} with buffered I/O (O_DIRECT not requested)",
+                        device
+                    );
+                }
+                let f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(device)?;
+                (f, false)
             }
         };
 
         #[cfg(target_os = "macos")]
         let (file, use_direct_io) = {
             use std::os::unix::io::AsRawFd;
-            // macOS uses F_NOCACHE instead of O_DIRECT
-            let f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_SYNC)
-                .open(device)?;
 
-            let fd = f.as_raw_fd();
-            let direct_io = unsafe {
-                // Enable F_NOCACHE to bypass filesystem cache
-                if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
-                    if debug {
-                        eprintln!("[DEBUG] Warning: F_NOCACHE not supported, using buffered I/O");
+            if o_direct {
+                // macOS uses F_NOCACHE instead of O_DIRECT
+                let f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_SYNC)
+                    .open(device)?;
+
+                let fd = f.as_raw_fd();
+                let direct_io = unsafe {
+                    // Enable F_NOCACHE to bypass filesystem cache
+                    if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "F_NOCACHE not supported on this device",
+                        ));
+                    } else {
+                        if debug {
+                            eprintln!(
+                                "[DEBUG] Opened {} with F_NOCACHE (direct I/O enabled)",
+                                device
+                            );
+                        }
+                        true
                     }
-                    false
-                } else {
-                    if debug {
-                        eprintln!(
-                            "[DEBUG] Opened {} with F_NOCACHE (direct I/O enabled)",
-                            device
-                        );
-                    }
-                    true
+                };
+                (f, direct_io)
+            } else {
+                // Use buffered I/O when O_DIRECT is not requested
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Opened {} with buffered I/O (O_DIRECT not requested)",
+                        device
+                    );
                 }
-            };
-            (f, direct_io)
+                let f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(device)?;
+                (f, false)
+            }
         };
 
         // Create aligned buffer for direct I/O
@@ -300,15 +326,17 @@ impl AsyncBlockWriter {
         device: String,
         written_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
+        o_direct: bool,
     ) -> io::Result<Self> {
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
-            let mut writer = BlockWriter::new(&device, written_tx, debug).map_err(|e| {
-                eprintln!("Failed to open device '{}': {}", device, e);
-                e
-            })?;
+            let mut writer =
+                BlockWriter::new(&device, written_tx, debug, o_direct).map_err(|e| {
+                    eprintln!("Failed to open device '{}': {}", device, e);
+                    e
+                })?;
 
             while let Some(data) = writer_rx.blocking_recv() {
                 if let Err(e) = writer.write(&data) {
