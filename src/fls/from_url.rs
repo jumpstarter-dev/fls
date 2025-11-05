@@ -132,7 +132,7 @@ pub async fn flash_from_url(
         };
 
         // Start or resume download
-        let response = match start_download(url, &client, resume_from).await {
+        let response = match start_download(url, &client, resume_from, &options.headers).await {
             Ok(r) => r,
             Err(e) => {
                 if retry_count >= options.max_retries {

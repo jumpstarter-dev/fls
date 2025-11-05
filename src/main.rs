@@ -37,6 +37,9 @@ enum Commands {
         /// Enable debug output (prints all dd messages)
         #[arg(long)]
         debug: bool,
+        /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
     },
 }
 
@@ -54,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_retries,
             retry_delay,
             debug,
+            headers,
         } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
@@ -66,6 +70,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
             println!("  Debug: {}", debug);
+
+            // Parse headers in the format "Header: value"
+            let parsed_headers: Vec<(String, String)> = headers
+                .iter()
+                .filter_map(|h| {
+                    let parts: Vec<&str> = h.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+                    } else {
+                        eprintln!("Warning: Ignoring invalid header format: {}", h);
+                        None
+                    }
+                })
+                .collect();
+
+            if !parsed_headers.is_empty() {
+                println!("  Custom headers:");
+                for (name, value) in &parsed_headers {
+                    println!("    {}: {}", name, value);
+                }
+            }
             println!();
 
             let options = fls::BlockFlashOptions {
@@ -76,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_retries,
                 retry_delay_secs: retry_delay,
                 debug,
+                headers: parsed_headers,
             };
 
             fls::flash_from_url(&url, options).await?;

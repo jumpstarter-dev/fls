@@ -47,6 +47,7 @@ pub(crate) async fn start_download(
     url: &str,
     client: &Client,
     resume_from: Option<u64>,
+    custom_headers: &[(String, String)],
 ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
     if let Some(offset) = resume_from {
         println!("Resuming download from: {} (byte offset: {})", url, offset);
@@ -59,6 +60,11 @@ pub(crate) async fn start_download(
         .header("User-Agent", "fls/0.1.0")
         .header("Accept", "*/*")
         .header("Accept-Encoding", "identity"); // Don't compress, we're handling .xz ourselves
+
+    // Add custom headers
+    for (name, value) in custom_headers {
+        request = request.header(name, value);
+    }
 
     // Add Range header if resuming
     if let Some(offset) = resume_from {
