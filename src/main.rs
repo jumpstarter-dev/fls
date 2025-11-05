@@ -43,8 +43,8 @@ enum Commands {
         /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
-        /// Progress update interval in seconds (default: 0.1, accepts float values like 1.0 or 0.5)
-        #[arg(short = 'i', long, default_value = "0.1")]
+        /// Progress update interval in seconds (default: 0.5, accepts float values like 1.0 or 0.5)
+        #[arg(short = 'i', long, default_value = "0.5")]
         progress_interval: f64,
         /// Print progress on new lines instead of clearing and rewriting the same line
         #[arg(short = 'n', long)]
