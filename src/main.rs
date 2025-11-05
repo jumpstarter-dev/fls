@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod block_flash;
+mod fls;
 
 #[derive(Parser)]
-#[command(name = "smallrs")]
+#[command(name = "fls")]
 #[command(about = "A small Rust utility for flashing devices")]
 struct Cli {
     #[command(subcommand)]
@@ -14,7 +14,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Flash a block device from a URL
-    BlockFlash {
+    FromUrl {
         /// URL to download the image from
         url: String,
         /// Destination device path (e.g., /dev/sdb)
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::BlockFlash {
+        Commands::FromUrl {
             url,
             device,
             ca_cert,
@@ -66,8 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
             println!("  Debug: {}", debug);
+            println!();
 
-            let options = block_flash::BlockFlashOptions {
+            let options = fls::BlockFlashOptions {
                 ignore_certificates,
                 ca_cert,
                 device: device.clone(),
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug,
             };
 
-            block_flash::stream_and_decompress(&url, options).await?;
+            fls::flash_from_url(&url, options).await?;
         }
     }
 

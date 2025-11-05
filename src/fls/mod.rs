@@ -1,14 +1,14 @@
 // Module declarations
 mod block_writer;
 mod decompress;
-mod download;
 mod error_handling;
+mod from_url;
 mod http;
 mod options;
 mod progress;
 
 // Public re-exports
-pub use download::stream_and_decompress;
+pub use from_url::flash_from_url;
 pub use options::BlockFlashOptions;
 
 #[cfg(test)]
@@ -18,12 +18,12 @@ mod tests {
     #[tokio::test]
     async fn test_url_extension_detection() {
         assert!(
-            stream_and_decompress("http://example.com/file.xz", BlockFlashOptions::default())
+            flash_from_url("http://example.com/file.xz", BlockFlashOptions::default())
                 .await
                 .is_err()
         ); // Will fail due to network, but we're testing the logic
         assert!(
-            stream_and_decompress("http://example.com/file.img", BlockFlashOptions::default())
+            flash_from_url("http://example.com/file.img", BlockFlashOptions::default())
                 .await
                 .is_err()
         );

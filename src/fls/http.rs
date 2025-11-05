@@ -1,4 +1,4 @@
-use crate::block_flash::options::BlockFlashOptions;
+use crate::fls::options::BlockFlashOptions;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -14,10 +14,10 @@ pub(crate) async fn setup_http_client(
         .pool_max_idle_per_host(10)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         // Enable TCP keepalive to prevent connection drops
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(Duration::from_secs(10)))
         .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
         // Very long timeout for large downloads
-        .timeout(Duration::from_secs(3600))
+        .timeout(Duration::from_secs(2 * 3600))
         .connect_timeout(Duration::from_secs(30))
         // Use system DNS resolver for better performance
         .no_hickory_dns();
@@ -47,7 +47,7 @@ pub(crate) async fn start_download(
     url: &str,
     client: &Client,
     resume_from: Option<u64>,
-) -> Result<(reqwest::Response, bool), Box<dyn std::error::Error>> {
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
     if let Some(offset) = resume_from {
         println!("Resuming download from: {} (byte offset: {})", url, offset);
     } else {
@@ -56,7 +56,7 @@ pub(crate) async fn start_download(
 
     let mut request = client
         .get(url)
-        .header("User-Agent", "smallrs/0.1.0")
+        .header("User-Agent", "fls/0.1.0")
         .header("Accept", "*/*")
         .header("Accept-Encoding", "identity"); // Don't compress, we're handling .xz ourselves
 
@@ -86,17 +86,5 @@ pub(crate) async fn start_download(
         }
     }
 
-    let needs_decompression = matches!(
-        url.rsplit('.').next().map(|s| s.to_lowercase()).as_deref(),
-        Some("xz") | Some("gz") | Some("bz") | Some("bz2")
-    );
-    if needs_decompression && resume_from.is_none() {
-        let extension = url.rsplit('.').next().unwrap_or("unknown");
-        println!(
-            "Detected .{} extension, will decompress in real-time",
-            extension
-        );
-    }
-
-    Ok((response, needs_decompression))
+    Ok(response)
 }

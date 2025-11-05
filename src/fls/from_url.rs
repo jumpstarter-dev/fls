@@ -1,94 +1,20 @@
-use reqwest::Client;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::block_flash::block_writer::AsyncBlockWriter;
-use crate::block_flash::decompress::{spawn_stderr_reader, start_decompressor_process};
-use crate::block_flash::error_handling::process_error_messages;
-use crate::block_flash::http::{setup_http_client, start_download};
-use crate::block_flash::options::BlockFlashOptions;
-use crate::block_flash::progress::ProgressTracker;
+use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
+use crate::fls::error_handling::process_error_messages;
+use crate::fls::http::{setup_http_client, start_download};
+use crate::fls::options::BlockFlashOptions;
+use crate::fls::progress::ProgressTracker;
 
-pub(crate) async fn handle_regular_download(
-    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Unpin
-        + Send
-        + 'static,
-    content_length: Option<u64>,
-    buffer_size_mb: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut progress = ProgressTracker::new();
-    let update_interval = Duration::from_millis(100);
-
-    use futures_util::StreamExt;
-
-    // Calculate buffer capacity (assume 64KB average chunk size)
-    let buffer_capacity = (buffer_size_mb * 1024 * 1024) / (64 * 1024);
-    let buffer_capacity = buffer_capacity.max(1); // At least 1
-
-    println!(
-        "Using download buffer: {} MB (capacity: {} chunks)",
-        buffer_size_mb, buffer_capacity
-    );
-
-    // Create bounded channel for buffering
-    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
-
-    // Spawn download task
-    let download_task = tokio::spawn(async move {
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => {
-                    if buffer_tx.send(c).await.is_err() {
-                        break; // Receiver dropped
-                    }
-                }
-                Err(e) => {
-                    return Err(Box::new(e) as Box<dyn std::error::Error + Send>);
-                }
-            }
-        }
-        Ok::<(), Box<dyn std::error::Error + Send>>(())
-    });
-
-    // Process buffered chunks
-    while let Some(chunk) = buffer_rx.recv().await {
-        progress.bytes_received += chunk.len() as u64;
-        if let Err(e) = progress.update_progress(content_length, update_interval) {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e);
-        }
-    }
-
-    // Check if download task had an error
-    match download_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e);
-        }
-        Err(e) => {
-            eprintln!(); // Print newline to clear progress line
-            return Err(e.into());
-        }
-    }
-
-    let stats = progress.final_stats();
-    println!(
-        "\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)",
-        stats.mb_received, stats.download_secs, stats.download_rate
-    );
-
-    Ok(())
-}
-
-pub(crate) async fn handle_compressed_download(
+pub async fn flash_from_url(
     url: &str,
-    client: &Client,
-    _initial_content_length: Option<u64>,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let client = setup_http_client(&options).await?;
+
     println!("Starting decompressor subprocess for streaming decompression...");
     let (mut decompressor, decompressor_name) = start_decompressor_process(url).await?;
 
@@ -206,7 +132,7 @@ pub(crate) async fn handle_compressed_download(
         };
 
         // Start or resume download
-        let (response, _) = match start_download(url, client, resume_from).await {
+        let response = match start_download(url, &client, resume_from).await {
             Ok(r) => r,
             Err(e) => {
                 if retry_count >= options.max_retries {
@@ -576,20 +502,4 @@ pub(crate) async fn handle_compressed_download(
     );
 
     Ok(())
-}
-
-pub async fn stream_and_decompress(
-    url: &str,
-    options: BlockFlashOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = setup_http_client(&options).await?;
-    let (response, needs_decompression) = start_download(url, &client, None).await?;
-    let content_length = response.content_length();
-    let stream = response.bytes_stream();
-
-    if needs_decompression {
-        handle_compressed_download(url, &client, content_length, options).await
-    } else {
-        handle_regular_download(stream, content_length, options.buffer_size_mb).await
-    }
 }
