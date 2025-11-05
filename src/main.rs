@@ -44,7 +44,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -104,9 +104,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 headers: parsed_headers,
             };
 
-            fls::flash_from_url(&url, options).await?;
+            match fls::flash_from_url(&url, options).await {
+                Ok(_) => {
+                    println!("Result: FLASH_COMPLETED");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    println!("Result: FLASH_FAILED");
+                    std::process::exit(1);
+                }
+            }
         }
     }
-
-    Ok(())
 }
