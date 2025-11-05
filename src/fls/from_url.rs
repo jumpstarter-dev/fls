@@ -84,7 +84,7 @@ pub async fn flash_from_url(
     let error_processor = tokio::spawn(process_error_messages(error_rx));
 
     // Main download loop with retry logic
-    let mut progress = ProgressTracker::new();
+    let mut progress = ProgressTracker::new(options.newline_progress);
     // Set whether we're actually decompressing (not using cat for uncompressed files)
     progress.set_is_compressed(decompressor_name != "cat");
     let update_interval = Duration::from_secs_f64(options.progress_interval_secs);

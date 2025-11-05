@@ -11,6 +11,7 @@ pub struct BlockFlashOptions {
     pub o_direct: bool,
     pub headers: Vec<(String, String)>,
     pub progress_interval_secs: f64,
+    pub newline_progress: bool,
 }
 
 impl Default for BlockFlashOptions {
@@ -26,6 +27,7 @@ impl Default for BlockFlashOptions {
             o_direct: false,
             headers: Vec::new(),
             progress_interval_secs: 0.1,
+            newline_progress: false,
         }
     }
 }

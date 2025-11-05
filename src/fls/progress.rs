@@ -32,10 +32,12 @@ pub(crate) struct ProgressTracker {
     pub(crate) content_length: Option<u64>,
     // Track if we're actually decompressing (not using cat)
     is_compressed: bool,
+    // Whether to print on new lines instead of clearing and rewriting
+    newline_progress: bool,
 }
 
 impl ProgressTracker {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(newline_progress: bool) -> Self {
         let now = Instant::now();
         Self {
             bytes_received: 0,
@@ -52,6 +54,7 @@ impl ProgressTracker {
             write_duration: None,
             content_length: None,
             is_compressed: true,
+            newline_progress,
         }
     }
 
@@ -143,11 +146,21 @@ impl ProgressTracker {
             } else {
                 "Progress"
             };
-            print!(
-                "\r\x1b[KDownload: {} | {}: {} | Written: {}",
-                download_status, progress_label, decompress_status, write_status
-            );
-            io::stdout().flush()?;
+            
+            if self.newline_progress {
+                // Print on a new line
+                println!(
+                    "Download: {} | {}: {} | Written: {}",
+                    download_status, progress_label, decompress_status, write_status
+                );
+            } else {
+                // Use carriage return and clear line
+                print!(
+                    "\r\x1b[KDownload: {} | {}: {} | Written: {}",
+                    download_status, progress_label, decompress_status, write_status
+                );
+                io::stdout().flush()?;
+            }
             self.last_update = now;
         }
         Ok(())

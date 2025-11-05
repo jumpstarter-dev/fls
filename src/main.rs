@@ -46,6 +46,9 @@ enum Commands {
         /// Progress update interval in seconds (default: 0.1, accepts float values like 1.0 or 0.5)
         #[arg(short = 'i', long, default_value = "0.1")]
         progress_interval: f64,
+        /// Print progress on new lines instead of clearing and rewriting the same line
+        #[arg(short = 'n', long)]
+        newline_progress: bool,
     },
 }
 
@@ -66,6 +69,7 @@ async fn main() {
             o_direct,
             headers,
             progress_interval,
+            newline_progress,
         } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
@@ -113,6 +117,7 @@ async fn main() {
                 o_direct,
                 headers: parsed_headers,
                 progress_interval_secs: progress_interval,
+                newline_progress,
             };
 
             match fls::flash_from_url(&url, options).await {
