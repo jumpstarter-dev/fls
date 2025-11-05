@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod block_flash;
 
@@ -18,6 +19,9 @@ enum Commands {
         url: String,
         /// Destination device path (e.g., /dev/sdb)
         device: String,
+        /// Path to CA certificate PEM file for TLS validation
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
         /// Ignore SSL certificate verification
         #[arg(long)]
         ignore_certificates: bool,
@@ -41,10 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::BlockFlash { url, device, ignore_certificates, buffer_size, max_retries, retry_delay, debug } => {
+        Commands::BlockFlash { url, device, ca_cert, ignore_certificates, buffer_size, max_retries, retry_delay, debug } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
             println!("  Device: {}", device);
+            if let Some(ref cert_path) = ca_cert {
+                println!("  CA Certificate: {}", cert_path.display());
+            }
             println!("  Ignore certificates: {}", ignore_certificates);
             println!("  Buffer size: {} MB", buffer_size);
             println!("  Max retries: {}", max_retries);
@@ -53,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let options = block_flash::BlockFlashOptions {
                 ignore_certificates,
+                ca_cert,
                 device: device.clone(),
                 buffer_size_mb: buffer_size,
                 max_retries,

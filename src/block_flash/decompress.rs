@@ -47,6 +47,7 @@ pub(crate) async fn start_decompressor_process(url: &str) -> Result<(Child, &'st
     Ok((process, cmd))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn spawn_decompressor_stdout_reader(
     mut stdout: tokio::process::ChildStdout,
     decompressed_tx: mpsc::UnboundedSender<Vec<u8>>,

@@ -1,13 +1,13 @@
 use reqwest::Client;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::block_flash::options::BlockFlashOptions;
 use crate::block_flash::progress::ProgressTracker;
 use crate::block_flash::http::{setup_http_client, start_download};
-use crate::block_flash::decompress::{start_decompressor_process, spawn_decompressor_stdout_reader, spawn_stderr_reader};
-use crate::block_flash::dd::{start_dd_process, handle_dd_progress, process_dd_messages};
+use crate::block_flash::decompress::{start_decompressor_process, spawn_stderr_reader};
+use crate::block_flash::block_writer::AsyncBlockWriter;
 use crate::block_flash::error_handling::process_error_messages;
 
 pub(crate) async fn handle_regular_download(
@@ -84,29 +84,55 @@ pub(crate) async fn handle_compressed_download(
     println!("Starting decompressor subprocess for streaming decompression...");
     let (mut decompressor, decompressor_name) = start_decompressor_process(url).await?;
     
-    println!("Starting dd subprocess to write to device: {}", options.device);
-    let mut dd = start_dd_process(&options.device).await?;
+    println!("Opening block device for writing: {}", options.device);
     
     // Extract stdio handles
     let mut decompressor_stdin = decompressor.stdin.take().unwrap();
     let decompressor_stdout = decompressor.stdout.take().unwrap();
     let decompressor_stderr = decompressor.stderr.take().unwrap();
-    let dd_stdin = dd.stdin.take().unwrap();
-    let dd_stderr = dd.stderr.take().unwrap();
     
     // Create channels
     let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-    let (dd_error_tx, dd_error_rx) = mpsc::unbounded_channel::<String>();
     let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
     
-    // Spawn background tasks for decompressor and dd
-    tokio::spawn(spawn_decompressor_stdout_reader(
-        decompressor_stdout,
-        decompressed_tx,
-        dd_stdin,
-        error_tx.clone(),
-    ));
+    // Create block writer
+    let block_writer = AsyncBlockWriter::new(options.device.clone(), written_tx)?;
+    
+    // Spawn background task to read from decompressor and write to block device
+    let error_tx_clone = error_tx.clone();
+    let writer_handle = {
+        let writer = block_writer;
+        tokio::spawn(async move {
+            let mut stdout = decompressor_stdout;
+            let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
+            
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let data = buffer[..n].to_vec();
+                        // Send to progress tracking
+                        if decompressed_tx.send(data.clone()).is_err() {
+                            break;
+                        }
+                        // Write to block device
+                        if let Err(e) = writer.write(data).await {
+                            let _ = error_tx_clone.send(format!("Error writing to device: {}", e));
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = error_tx_clone.send(format!("Error reading from decompressor stdout: {}", e));
+                        return Err(e);
+                    }
+                }
+            }
+            
+            // Close writer and get final bytes written
+            writer.close().await
+        })
+    };
     
     tokio::spawn(spawn_stderr_reader(
         decompressor_stderr,
@@ -114,14 +140,7 @@ pub(crate) async fn handle_compressed_download(
         decompressor_name,
     ));
     
-    tokio::spawn(handle_dd_progress(
-        dd_stderr,
-        dd_error_tx,
-    ));
-    
     // Spawn message processors
-    let debug = options.debug;
-    let dd_processor = tokio::spawn(process_dd_messages(dd_error_rx, written_tx, debug));
     let error_processor = tokio::spawn(process_error_messages(error_rx));
     
     // Main download loop with retry logic
@@ -131,6 +150,7 @@ pub(crate) async fn handle_compressed_download(
     let update_interval = Duration::from_millis(100);
     let mut bytes_sent_to_decompressor: u64 = 0;
     let mut retry_count = 0;
+    let debug = options.debug;
     
     use futures_util::StreamExt;
     
@@ -437,56 +457,41 @@ pub(crate) async fn handle_compressed_download(
         progress.final_decompress_rate = Some(mb_decompressed / elapsed.as_secs_f64());
     }
     
-    // Check if dd has already finished (it might have completed during decompression)
-    let dd_already_done = match dd.try_wait() {
-        Ok(Some(status)) => {
-            if !status.success() {
-                eprintln!();
-                return Err(format!("dd process failed with status: {:?}", status.code()).into());
-            }
-            true
+    // Wait for writer to complete
+    loop {
+        // Update progress from channels
+        let mut updated = false;
+        
+        while let Ok(written_bytes) = written_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+            updated = true;
         }
-        Ok(None) => false,
-        Err(e) => {
+        
+        if updated {
+            let _ = progress.update_progress(None, update_interval);
+        }
+        
+        // Check if writer is done
+        if writer_handle.is_finished() {
+            break;
+        }
+        
+        // Small sleep to avoid busy waiting
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    // Get final result from writer
+    match writer_handle.await {
+        Ok(Ok(final_bytes)) => {
+            progress.bytes_written = final_bytes;
+        }
+        Ok(Err(e)) => {
             eprintln!();
             return Err(e.into());
         }
-    };
-    
-    // Only wait if dd is not already done
-    if !dd_already_done {
-        // Poll for dd completion while showing progress
-        loop {
-            // Update progress from channels
-            let mut updated = false;
-            
-            while let Ok(written_bytes) = written_rx.try_recv() {
-                progress.bytes_written = written_bytes;
-                updated = true;
-            }
-            
-            if updated {
-                let _ = progress.update_progress(None, update_interval);
-            }
-            
-            // Check if dd is done (non-blocking check)
-            match dd.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        eprintln!();
-                        return Err(format!("dd process failed with status: {:?}", status.code()).into());
-                    }
-                    break;
-                }
-                Ok(None) => {
-                    // Still running, sleep briefly
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(e) => {
-                    eprintln!();
-                    return Err(e.into());
-                }
-            }
+        Err(e) => {
+            eprintln!();
+            return Err(e.into());
         }
     }
     
@@ -507,15 +512,9 @@ pub(crate) async fn handle_compressed_download(
         progress.bytes_written = written_bytes;
     }
     
-    // Wait for message processors to finish (with timeout)
-    // Use a timeout since the pipes might have buffered data even after the process exits
+    // Wait for message processor to finish (with timeout)
     let timeout_duration = Duration::from_secs(2);
-    let _ = tokio::time::timeout(
-        timeout_duration,
-        async {
-            tokio::try_join!(dd_processor, error_processor)
-        }
-    ).await;
+    let _ = tokio::time::timeout(timeout_duration, error_processor).await;
     
     let stats = progress.final_stats();
     println!("\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)", 

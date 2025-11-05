@@ -20,6 +20,19 @@ pub(crate) async fn setup_http_client(options: &BlockFlashOptions) -> Result<Cli
         // Use system DNS resolver for better performance
         .no_hickory_dns();
     
+    // Add custom CA certificate if provided
+    if let Some(ca_cert_path) = &options.ca_cert {
+        println!("Loading CA certificate from: {}", ca_cert_path.display());
+        let cert_bytes = std::fs::read(ca_cert_path)
+            .map_err(|e| format!("Failed to read CA certificate file: {}", e))?;
+        
+        let cert = reqwest::Certificate::from_pem(&cert_bytes)
+            .map_err(|e| format!("Failed to parse CA certificate: {}", e))?;
+        
+        builder = builder.add_root_certificate(cert);
+        println!("CA certificate loaded successfully");
+    }
+    
     if options.ignore_certificates {
         println!("Warning: Certificate verification is disabled");
         builder = builder.danger_accept_invalid_certs(true);

@@ -2,7 +2,7 @@
 mod options;
 mod progress;
 mod decompress;
-mod dd;
+mod block_writer;
 mod error_handling;
 mod http;
 mod download;
