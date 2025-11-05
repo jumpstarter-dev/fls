@@ -54,6 +54,7 @@ impl BlockWriter {
             match OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .custom_flags(O_DIRECT)
                 .open(device)
             {
@@ -66,6 +67,7 @@ impl BlockWriter {
                     match OpenOptions::new()
                         .write(true)
                         .create(true)
+                        .truncate(true)
                         .custom_flags(O_DIRECT | libc::O_SYNC)
                         .open(device)
                     {
@@ -84,7 +86,11 @@ impl BlockWriter {
                             eprintln!(
                                 "Falling back to buffered I/O (writes will be synced on flush)"
                             );
-                            let f = OpenOptions::new().write(true).create(true).open(device)?;
+                            let f = OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .open(device)?;
                             (f, false)
                         }
                     }
@@ -99,6 +105,7 @@ impl BlockWriter {
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .custom_flags(libc::O_SYNC)
                 .open(device)?;
 

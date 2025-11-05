@@ -1,83 +1,25 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
+        default: 'v0.1.0'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os}}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
-        run: cargo test --all-features
-
-  build:
-    name: Build (${{ matrix.target }})
+  build-and-release:
+    name: Build and Release (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -147,25 +89,48 @@ jobs:
             # Install UPX via Homebrew on macOS
             brew install upx
           fi
+          upx --version
         shell: bash
 
-      - name: Rename and compress binary
+      - name: Prepare and compress binary
         run: |
           if [ -f "target/${{ matrix.target }}/release/fls" ]; then
             cp "target/${{ matrix.target }}/release/fls" "${{ matrix.artifact_name }}"
-            echo "Original size:"
+            
+            echo "📦 Original binary size:"
             ls -lh "${{ matrix.artifact_name }}"
+            original_size=$(stat -f%z "${{ matrix.artifact_name }}" 2>/dev/null || stat -c%s "${{ matrix.artifact_name }}")
+            
             # Compress with UPX
-            upx --best --lzma "${{ matrix.artifact_name }}" || echo "UPX compression failed, using uncompressed binary"
-            echo "Compressed size:"
-            ls -lh "${{ matrix.artifact_name }}"
+            echo "🗜️  Compressing with UPX --best --lzma..."
+            if upx --best --lzma "${{ matrix.artifact_name }}"; then
+              echo "✅ Compression successful!"
+              ls -lh "${{ matrix.artifact_name }}"
+              compressed_size=$(stat -f%z "${{ matrix.artifact_name }}" 2>/dev/null || stat -c%s "${{ matrix.artifact_name }}")
+              ratio=$(awk "BEGIN {printf \"%.1f\", ($original_size - $compressed_size) * 100 / $original_size}")
+              echo "📉 Size reduction: ${ratio}%"
+            else
+              echo "⚠️  UPX compression failed, using uncompressed binary"
+            fi
+            
+            # Create checksum
+            if command -v sha256sum &> /dev/null; then
+              sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+            else
+              shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+            fi
           fi
         shell: bash
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
-          if-no-files-found: error
+          files: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
