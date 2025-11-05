@@ -1,6 +1,8 @@
+use std::alloc::{alloc, dealloc, Layout};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::ptr::NonNull;
 use tokio::sync::mpsc;
 
 const BLOCK_SIZE: usize = 1024 * 1024; // 1MB blocks for better throughput
@@ -27,10 +29,53 @@ const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
 #[allow(dead_code)]
 const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
 
+/// Aligned buffer for direct I/O operations
+/// This ensures the buffer memory is aligned to ALIGNMENT bytes as required by O_DIRECT
+struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    fn new(size: usize, alignment: usize) -> Self {
+        let layout = Layout::from_size_align(size, alignment)
+            .expect("Invalid layout");
+        let ptr = unsafe {
+            let raw_ptr = alloc(layout);
+            if raw_ptr.is_null() {
+                panic!("Failed to allocate aligned buffer");
+            }
+            // Zero the buffer
+            std::ptr::write_bytes(raw_ptr, 0, size);
+            NonNull::new_unchecked(raw_ptr)
+        };
+        Self { ptr, layout }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+// Safety: AlignedBuffer owns its data and the pointer is valid for the lifetime of the struct
+unsafe impl Send for AlignedBuffer {}
+
 /// BlockWriter handles writing data to a block device with direct I/O
 pub(crate) struct BlockWriter {
     file: std::fs::File,
-    buffer: Vec<u8>,
+    buffer: AlignedBuffer,
     buffer_pos: usize, // Current position in buffer
     bytes_written: u64,
     bytes_since_sync: u64, // Track bytes written since last sync
@@ -143,7 +188,7 @@ impl BlockWriter {
 
         // Create aligned buffer for direct I/O
         // Direct I/O requires buffer to be aligned to sector size (typically 512 or 4096)
-        let buffer = vec![0u8; BLOCK_SIZE];
+        let buffer = AlignedBuffer::new(BLOCK_SIZE, ALIGNMENT);
 
         Ok(Self {
             file,
@@ -168,7 +213,8 @@ impl BlockWriter {
             let to_copy = remaining_in_buffer.min(remaining_in_data);
 
             // Copy to internal buffer
-            self.buffer[self.buffer_pos..self.buffer_pos + to_copy]
+            let buffer_slice = self.buffer.as_mut_slice();
+            buffer_slice[self.buffer_pos..self.buffer_pos + to_copy]
                 .copy_from_slice(&data[offset..offset + to_copy]);
 
             self.buffer_pos += to_copy;
@@ -204,8 +250,9 @@ impl BlockWriter {
 
         let write_size = write_size.min(BLOCK_SIZE);
 
+        let buffer_slice = self.buffer.as_slice();
         self.file
-            .write_all(&self.buffer[..write_size])
+            .write_all(&buffer_slice[..write_size])
             .map_err(|e| {
                 eprintln!("Write error at offset {}: {}", self.bytes_written, e);
                 e
