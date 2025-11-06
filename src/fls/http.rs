@@ -1,3 +1,4 @@
+use crate::fls::download_error::DownloadError;
 use crate::fls::options::BlockFlashOptions;
 use reqwest::Client;
 use std::time::Duration;
@@ -48,7 +49,7 @@ pub(crate) async fn start_download(
     client: &Client,
     resume_from: Option<u64>,
     custom_headers: &[(String, String)],
-) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+) -> Result<reqwest::Response, DownloadError> {
     if let Some(offset) = resume_from {
         println!("Resuming download from: {} (byte offset: {})", url, offset);
     } else {
@@ -71,26 +72,11 @@ pub(crate) async fn start_download(
         request = request.header("Range", format!("bytes={}-", offset));
     }
 
-    let response = request.send().await?;
+    let response = request.send().await.map_err(DownloadError::from_reqwest)?;
 
     // Accept both 200 (full content) and 206 (partial content) as success
     if !response.status().is_success() && response.status().as_u16() != 206 {
-        let status = response.status();
-        let status_code = status.as_u16();
-        let error_msg = match status_code {
-            401 => format!("HTTP error: 401 Unauthorized - authentication required"),
-            403 => format!("HTTP error: 403 Forbidden - access denied"),
-            404 => format!("HTTP error: 404 Not Found - the requested file does not exist"),
-            500 => format!("HTTP error: 500 Internal Server Error - server error"),
-            502 => format!("HTTP error: 502 Bad Gateway - proxy/gateway error"),
-            503 => format!("HTTP error: 503 Service Unavailable - server temporarily unavailable"),
-            _ => format!(
-                "HTTP error: {} {}",
-                status_code,
-                status.canonical_reason().unwrap_or("Unknown")
-            ),
-        };
-        return Err(error_msg.into());
+        return Err(DownloadError::from_http_response(&response));
     }
 
     // Check if server supports resume

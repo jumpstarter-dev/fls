@@ -4,54 +4,11 @@ use tokio::sync::mpsc;
 
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
+use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::http::{setup_http_client, start_download};
 use crate::fls::options::BlockFlashOptions;
 use crate::fls::progress::ProgressTracker;
-
-/// Format a download error with detailed information about what went wrong
-fn format_download_error(error: &Box<dyn std::error::Error>) -> String {
-    let error_str = error.to_string();
-
-    // Check for common error patterns and provide helpful context
-    if error_str.contains("HTTP error:") {
-        // HTTP status errors (404, 403, etc.)
-        return error_str;
-    } else if error_str.contains("dns error") || error_str.contains("failed to lookup address") {
-        return format!(
-            "DNS resolution failed - unable to resolve hostname ({})",
-            error_str
-        );
-    } else if error_str.contains("certificate")
-        || error_str.contains("tls")
-        || error_str.contains("ssl")
-    {
-        return format!("TLS/SSL error - certificate validation failed. Try using -k to skip certificate verification ({})", error_str);
-    } else if error_str.contains("connection refused") {
-        return format!(
-            "Connection refused - server is not accepting connections ({})",
-            error_str
-        );
-    } else if error_str.contains("connection reset") || error_str.contains("broken pipe") {
-        return format!(
-            "Connection reset - network connection was interrupted ({})",
-            error_str
-        );
-    } else if error_str.contains("timeout") || error_str.contains("timed out") {
-        return format!(
-            "Connection timeout - server did not respond in time ({})",
-            error_str
-        );
-    } else if error_str.contains("network unreachable") {
-        return format!(
-            "Network unreachable - check your network connection ({})",
-            error_str
-        );
-    } else {
-        // Generic error with full details
-        return format!("{}", error_str);
-    }
-}
 
 pub async fn flash_from_url(
     url: &str,
@@ -183,22 +140,35 @@ pub async fn flash_from_url(
         let response = match start_download(url, &client, resume_from, &options.headers).await {
             Ok(r) => r,
             Err(e) => {
-                // Format a detailed error message
-                let error_details = format_download_error(&e);
+                // Check if this is a permanent error that shouldn't be retried
+                if !e.is_retryable() {
+                    eprintln!(
+                        "\nDownload failed with non-retryable error: {}",
+                        e.format_error()
+                    );
+                    return Err(e.into());
+                }
 
                 if retry_count >= options.max_retries {
                     eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                    eprintln!("Last error: {}", error_details);
-                    return Err(e);
+                    eprintln!("Last error: {}", e.format_error());
+                    return Err(e.into());
                 }
-                eprintln!("\nDownload failed: {}", error_details);
+
+                // Use suggested retry delay if available (e.g., for rate limiting)
+                let retry_delay = e
+                    .suggested_retry_delay()
+                    .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
+                let retry_delay_secs = retry_delay.as_secs();
+
+                eprintln!("\nDownload failed: {}", e.format_error());
                 eprintln!(
                     "Retrying in {} seconds... (attempt {}/{})",
-                    options.retry_delay_secs,
+                    retry_delay_secs,
                     retry_count + 1,
                     options.max_retries
                 );
-                tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
+                tokio::time::sleep(retry_delay).await;
                 retry_count += 1;
                 continue;
             }
@@ -220,7 +190,7 @@ pub async fn flash_from_url(
 
         // Download and buffer chunks for this connection
         let mut connection_broken = false;
-        let mut connection_error: Option<Box<dyn std::error::Error>> = None;
+        let mut connection_error: Option<DownloadError> = None;
 
         loop {
             // Try to get next chunk with timeout
@@ -233,7 +203,8 @@ pub async fn flash_from_url(
                             // Send to buffer - detect if it's blocking
                             let send_start = std::time::Instant::now();
                             if buffer_tx.send(chunk).await.is_err() {
-                                connection_error = Some("Buffer channel closed".into());
+                                connection_error =
+                                    Some(DownloadError::Other("Buffer channel closed".to_string()));
                                 connection_broken = true;
                                 break;
                             }
@@ -279,7 +250,7 @@ pub async fn flash_from_url(
                             }
                         }
                         Err(e) => {
-                            connection_error = Some(Box::new(e));
+                            connection_error = Some(DownloadError::from_reqwest(e));
                             connection_broken = true;
                             break;
                         }
@@ -291,7 +262,9 @@ pub async fn flash_from_url(
                 }
                 Err(_) => {
                     // Timeout
-                    connection_error = Some("Connection timeout (30s)".into());
+                    connection_error = Some(DownloadError::TimeoutError(
+                        "Connection timeout (30s)".to_string(),
+                    ));
                     connection_broken = true;
                     break;
                 }
@@ -300,31 +273,49 @@ pub async fn flash_from_url(
 
         // If connection broke, retry
         if connection_broken {
-            let error_details = connection_error
-                .as_ref()
-                .map(|e| format_download_error(e))
-                .unwrap_or_else(|| "Unknown error".to_string());
+            if let Some(e) = connection_error {
+                // Check if this is a permanent error that shouldn't be retried
+                if !e.is_retryable() {
+                    eprintln!(
+                        "\nConnection failed with non-retryable error: {}",
+                        e.format_error()
+                    );
+                    return Err(e.into());
+                }
 
-            if retry_count >= options.max_retries {
-                eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                eprintln!("Last error: {}", error_details);
-                if let Some(e) = connection_error {
-                    return Err(e);
-                } else {
+                if retry_count >= options.max_retries {
+                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                    eprintln!("Last error: {}", e.format_error());
+                    return Err(e.into());
+                }
+
+                // Use suggested retry delay if available (e.g., for rate limiting)
+                let retry_delay = e
+                    .suggested_retry_delay()
+                    .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
+                let retry_delay_secs = retry_delay.as_secs();
+
+                eprintln!("\nConnection interrupted: {}", e.format_error());
+                eprintln!(
+                    "Resuming in {} seconds... (attempt {}/{})",
+                    retry_delay_secs,
+                    retry_count + 1,
+                    options.max_retries
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_count += 1;
+                continue;
+            } else {
+                // Unknown error
+                eprintln!("\nConnection interrupted with unknown error");
+                if retry_count >= options.max_retries {
+                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
                     return Err("Download failed after max retries".into());
                 }
+                tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
+                retry_count += 1;
+                continue;
             }
-
-            eprintln!("\nConnection interrupted: {}", error_details);
-            eprintln!(
-                "Resuming in {} seconds... (attempt {}/{})",
-                options.retry_delay_secs,
-                retry_count + 1,
-                options.max_retries
-            );
-            tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
-            retry_count += 1;
-            continue;
         }
 
         // Download completed successfully

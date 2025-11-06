@@ -1,6 +1,7 @@
 // Module declarations
 mod block_writer;
 mod decompress;
+mod download_error;
 mod error_handling;
 mod from_url;
 mod http;
