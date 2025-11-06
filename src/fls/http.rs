@@ -75,7 +75,22 @@ pub(crate) async fn start_download(
 
     // Accept both 200 (full content) and 206 (partial content) as success
     if !response.status().is_success() && response.status().as_u16() != 206 {
-        return Err(format!("HTTP error: {}", response.status()).into());
+        let status = response.status();
+        let status_code = status.as_u16();
+        let error_msg = match status_code {
+            401 => format!("HTTP error: 401 Unauthorized - authentication required"),
+            403 => format!("HTTP error: 403 Forbidden - access denied"),
+            404 => format!("HTTP error: 404 Not Found - the requested file does not exist"),
+            500 => format!("HTTP error: 500 Internal Server Error - server error"),
+            502 => format!("HTTP error: 502 Bad Gateway - proxy/gateway error"),
+            503 => format!("HTTP error: 503 Service Unavailable - server temporarily unavailable"),
+            _ => format!(
+                "HTTP error: {} {}",
+                status_code,
+                status.canonical_reason().unwrap_or("Unknown")
+            ),
+        };
+        return Err(error_msg.into());
     }
 
     // Check if server supports resume

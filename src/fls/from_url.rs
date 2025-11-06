@@ -9,6 +9,50 @@ use crate::fls::http::{setup_http_client, start_download};
 use crate::fls::options::BlockFlashOptions;
 use crate::fls::progress::ProgressTracker;
 
+/// Format a download error with detailed information about what went wrong
+fn format_download_error(error: &Box<dyn std::error::Error>) -> String {
+    let error_str = error.to_string();
+
+    // Check for common error patterns and provide helpful context
+    if error_str.contains("HTTP error:") {
+        // HTTP status errors (404, 403, etc.)
+        return error_str;
+    } else if error_str.contains("dns error") || error_str.contains("failed to lookup address") {
+        return format!(
+            "DNS resolution failed - unable to resolve hostname ({})",
+            error_str
+        );
+    } else if error_str.contains("certificate")
+        || error_str.contains("tls")
+        || error_str.contains("ssl")
+    {
+        return format!("TLS/SSL error - certificate validation failed. Try using -k to skip certificate verification ({})", error_str);
+    } else if error_str.contains("connection refused") {
+        return format!(
+            "Connection refused - server is not accepting connections ({})",
+            error_str
+        );
+    } else if error_str.contains("connection reset") || error_str.contains("broken pipe") {
+        return format!(
+            "Connection reset - network connection was interrupted ({})",
+            error_str
+        );
+    } else if error_str.contains("timeout") || error_str.contains("timed out") {
+        return format!(
+            "Connection timeout - server did not respond in time ({})",
+            error_str
+        );
+    } else if error_str.contains("network unreachable") {
+        return format!(
+            "Network unreachable - check your network connection ({})",
+            error_str
+        );
+    } else {
+        // Generic error with full details
+        return format!("{}", error_str);
+    }
+}
+
 pub async fn flash_from_url(
     url: &str,
     options: BlockFlashOptions,
@@ -139,13 +183,17 @@ pub async fn flash_from_url(
         let response = match start_download(url, &client, resume_from, &options.headers).await {
             Ok(r) => r,
             Err(e) => {
+                // Format a detailed error message
+                let error_details = format_download_error(&e);
+
                 if retry_count >= options.max_retries {
                     eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                    eprintln!("Last error: {}", error_details);
                     return Err(e);
                 }
+                eprintln!("\nDownload failed: {}", error_details);
                 eprintln!(
-                    "\nDownload connection failed: {}, retrying in {} seconds... (attempt {}/{})",
-                    e,
+                    "Retrying in {} seconds... (attempt {}/{})",
                     options.retry_delay_secs,
                     retry_count + 1,
                     options.max_retries
@@ -252,8 +300,14 @@ pub async fn flash_from_url(
 
         // If connection broke, retry
         if connection_broken {
+            let error_details = connection_error
+                .as_ref()
+                .map(|e| format_download_error(e))
+                .unwrap_or_else(|| "Unknown error".to_string());
+
             if retry_count >= options.max_retries {
                 eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                eprintln!("Last error: {}", error_details);
                 if let Some(e) = connection_error {
                     return Err(e);
                 } else {
@@ -261,12 +315,9 @@ pub async fn flash_from_url(
                 }
             }
 
+            eprintln!("\nConnection interrupted: {}", error_details);
             eprintln!(
-                "\nConnection interrupted: {}, resuming in {} seconds... (attempt {}/{})",
-                connection_error
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "Unknown error".to_string()),
+                "Resuming in {} seconds... (attempt {}/{})",
                 options.retry_delay_secs,
                 retry_count + 1,
                 options.max_retries
