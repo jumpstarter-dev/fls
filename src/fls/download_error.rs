@@ -51,7 +51,7 @@ impl DownloadError {
 
         let description = Self::http_status_description(code);
 
-        if code >= 400 && code < 500 {
+        if (400..500).contains(&code) {
             DownloadError::HttpClientError(code, description)
         } else {
             DownloadError::HttpServerError(code, description)
@@ -89,14 +89,39 @@ impl DownloadError {
         }
 
         if error.is_connect() {
+            // Check the full error chain (including source errors) for TLS/SSL indicators
             let error_str = error.to_string();
-            // Check for TLS-specific connection errors
-            if error_str.contains("certificate")
-                || error_str.contains("tls")
-                || error_str.contains("ssl")
-            {
+
+            // Check error source chain for TLS/SSL/Certificate errors
+            // We use a hybrid approach: check both type names and error messages
+            // - Type names catch concrete types before trait object erasure
+            // - Error messages catch issues when types are erased to dyn Error
+            let mut current_error: Option<&dyn std::error::Error> = Some(&error);
+            let mut is_tls_error = false;
+
+            while let Some(err) = current_error {
+                let error_msg = err.to_string().to_lowercase();
+
+                // Check error message for TLS-related keywords
+                // This works even when types are erased to trait objects
+                let message_indicates_tls = error_msg.contains("certificate")
+                    || error_msg.contains("tls")
+                    || error_msg.contains("ssl")
+                    || error_msg.contains("trust setting")  // macOS Security Framework
+                    || error_msg.contains("trust policy"); // macOS Security Framework
+
+                if message_indicates_tls {
+                    is_tls_error = true;
+                    break;
+                }
+
+                current_error = err.source();
+            }
+
+            if is_tls_error {
                 return DownloadError::TlsError(error_str);
             }
+
             // Check for DNS errors
             if error_str.contains("dns") || error_str.contains("failed to lookup address") {
                 return DownloadError::DnsError(error_str);
