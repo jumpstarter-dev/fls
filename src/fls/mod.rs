@@ -5,6 +5,7 @@ mod download_error;
 mod error_handling;
 mod from_url;
 mod http;
+mod memory;
 mod options;
 mod progress;
 

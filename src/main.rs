@@ -49,6 +49,9 @@ enum Commands {
         /// Print progress on new lines instead of clearing and rewriting the same line
         #[arg(short = 'n', long)]
         newline_progress: bool,
+        /// Show memory statistics in progress display
+        #[arg(long)]
+        show_memory: bool,
     },
 }
 
@@ -70,6 +73,7 @@ async fn main() {
             headers,
             progress_interval,
             newline_progress,
+            show_memory,
         } => {
             println!("Block flash command:");
             println!("  URL: {}", url);
@@ -118,6 +122,7 @@ async fn main() {
                 headers: parsed_headers,
                 progress_interval_secs: progress_interval,
                 newline_progress,
+                show_memory,
             };
 
             match fls::flash_from_url(&url, options).await {

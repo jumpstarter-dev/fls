@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+use crate::fls::memory;
+
 pub struct FinalStats {
     pub mb_received: f64,
     pub mb_decompressed: f64,
@@ -34,10 +36,12 @@ pub(crate) struct ProgressTracker {
     is_compressed: bool,
     // Whether to print on new lines instead of clearing and rewriting
     newline_progress: bool,
+    // Whether to show memory statistics
+    show_memory: bool,
 }
 
 impl ProgressTracker {
-    pub(crate) fn new(newline_progress: bool) -> Self {
+    pub(crate) fn new(newline_progress: bool, show_memory: bool) -> Self {
         let now = Instant::now();
         Self {
             bytes_received: 0,
@@ -55,6 +59,7 @@ impl ProgressTracker {
             content_length: None,
             is_compressed: true,
             newline_progress,
+            show_memory,
         }
     }
 
@@ -147,17 +152,26 @@ impl ProgressTracker {
                 "Progress"
             };
 
+            // Get memory stats if enabled
+            let memory_suffix = if self.show_memory {
+                memory::get_memory_stats()
+                    .map(|stats| format!(" | {}", stats.format_compact()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
             if self.newline_progress {
                 // Print on a new line
                 println!(
-                    "Download: {} | {}: {} | Written: {}",
-                    download_status, progress_label, decompress_status, write_status
+                    "Download: {} | {}: {} | Written: {}{}",
+                    download_status, progress_label, decompress_status, write_status, memory_suffix
                 );
             } else {
                 // Use carriage return and clear line
                 print!(
-                    "\r\x1b[KDownload: {} | {}: {} | Written: {}",
-                    download_status, progress_label, decompress_status, write_status
+                    "\r\x1b[KDownload: {} | {}: {} | Written: {}{}",
+                    download_status, progress_label, decompress_status, write_status, memory_suffix
                 );
                 io::stdout().flush()?;
             }
