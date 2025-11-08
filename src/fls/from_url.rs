@@ -24,7 +24,7 @@ pub async fn flash_from_url(
     let decompressor_stderr = decompressor.stderr.take().unwrap();
 
     // Create channels
-    let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<u64>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
 
@@ -51,8 +51,8 @@ pub async fn flash_from_url(
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         let data = buffer[..n].to_vec();
-                        // Send to progress tracking
-                        if decompressed_tx.send(data.clone()).is_err() {
+                        // Send byte count to progress tracking
+                        if decompressed_tx.send(n as u64).is_err() {
                             break;
                         }
                         // Write to block device
@@ -98,7 +98,7 @@ pub async fn flash_from_url(
     let buffer_size_mb = options.buffer_size_mb;
     // HTTP chunks from reqwest are typically 8-32 KB, not 64 KB
     // To ensure we get the full buffer size, use a conservative estimate
-    let avg_chunk_size_kb = 8; // Conservative estimate (8 KB)
+    let avg_chunk_size_kb = 16; // From common obvervation: 16kb
     let buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
     let buffer_capacity = buffer_capacity.max(1000); // At least 1000 chunks
 
@@ -234,8 +234,8 @@ pub async fn flash_from_url(
                             }
 
                             // Update progress from other channels
-                            while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-                                progress.bytes_decompressed += decompressed_chunk.len() as u64;
+                            while let Ok(byte_count) = decompressed_rx.try_recv() {
+                                progress.bytes_decompressed += byte_count;
                             }
 
                             while let Ok(written_bytes) = written_rx.try_recv() {
@@ -344,8 +344,8 @@ pub async fn flash_from_url(
             updated = true;
         }
 
-        while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-            progress.bytes_decompressed += decompressed_chunk.len() as u64;
+        while let Ok(byte_count) = decompressed_rx.try_recv() {
+            progress.bytes_decompressed += byte_count;
             updated = true;
         }
 
@@ -381,8 +381,8 @@ pub async fn flash_from_url(
     }
 
     // Update any remaining progress
-    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-        progress.bytes_decompressed += decompressed_chunk.len() as u64;
+    while let Ok(byte_count) = decompressed_rx.try_recv() {
+        progress.bytes_decompressed += byte_count;
     }
 
     // Check if decompressor has already finished
@@ -413,8 +413,8 @@ pub async fn flash_from_url(
             // Update progress from channels
             let mut updated = false;
 
-            while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-                progress.bytes_decompressed += decompressed_chunk.len() as u64;
+            while let Ok(byte_count) = decompressed_rx.try_recv() {
+                progress.bytes_decompressed += byte_count;
                 updated = true;
             }
 
@@ -508,8 +508,8 @@ pub async fn flash_from_url(
     }
 
     // Read any remaining progress updates
-    while let Ok(decompressed_chunk) = decompressed_rx.try_recv() {
-        progress.bytes_decompressed += decompressed_chunk.len() as u64;
+    while let Ok(byte_count) = decompressed_rx.try_recv() {
+        progress.bytes_decompressed += byte_count;
     }
 
     while let Ok(written_bytes) = written_rx.try_recv() {
