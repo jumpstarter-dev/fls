@@ -1,4 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
@@ -47,38 +47,6 @@ pub(crate) async fn start_decompressor_process(
         .spawn()?;
 
     Ok((process, cmd))
-}
-
-#[allow(dead_code)]
-pub(crate) async fn spawn_decompressor_stdout_reader(
-    mut stdout: tokio::process::ChildStdout,
-    decompressed_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut dd_stdin: tokio::process::ChildStdin,
-    error_tx: mpsc::UnboundedSender<String>,
-) {
-    let mut buffer = [0u8; 8 * 1024 * 1024]; // 8MB buffer for better performance
-    loop {
-        match stdout.read(&mut buffer).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                // Send to progress tracking
-                if decompressed_tx.send(buffer[..n].to_vec()).is_err() {
-                    break;
-                }
-                // Write to dd stdin
-                if let Err(e) = dd_stdin.write_all(&buffer[..n]).await {
-                    let _ = error_tx.send(format!("Error writing to dd stdin: {}", e));
-                    break;
-                }
-            }
-            Err(e) => {
-                let _ = error_tx.send(format!("Error reading from decompressor stdout: {}", e));
-                break;
-            }
-        }
-    }
-    // Close dd stdin when decompressor is done
-    let _ = dd_stdin.shutdown().await;
 }
 
 pub(crate) async fn spawn_stderr_reader(

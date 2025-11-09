@@ -78,7 +78,7 @@ pub(crate) struct BlockWriter {
     buffer_pos: usize, // Current position in buffer
     bytes_written: u64,
     bytes_since_sync: u64, // Track bytes written since last sync
-    written_tx: mpsc::UnboundedSender<u64>,
+    written_progress_tx: mpsc::UnboundedSender<u64>,
     use_direct_io: bool, // Track if O_DIRECT is active
     #[allow(dead_code)]
     debug: bool, // Debug mode flag
@@ -91,7 +91,7 @@ impl BlockWriter {
     /// Open a block device for writing with direct I/O
     pub(crate) fn new(
         device: &str,
-        written_tx: mpsc::UnboundedSender<u64>,
+        written_progress_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
         o_direct: bool,
     ) -> io::Result<Self> {
@@ -222,7 +222,7 @@ impl BlockWriter {
             buffer_pos: 0,
             bytes_written: 0,
             bytes_since_sync: 0,
-            written_tx,
+            written_progress_tx,
             use_direct_io,
             debug,
         })
@@ -254,7 +254,7 @@ impl BlockWriter {
 
             // Send progress update periodically (every 256KB to reduce overhead)
             if self.bytes_written.is_multiple_of(256 * 1024) {
-                let _ = self.written_tx.send(self.bytes_written);
+                let _ = self.written_progress_tx.send(self.bytes_written);
             }
         }
 
@@ -304,7 +304,7 @@ impl BlockWriter {
         self.file.sync_all()?;
         self.bytes_since_sync = 0;
         // Send final progress update
-        let _ = self.written_tx.send(self.bytes_written);
+        let _ = self.written_progress_tx.send(self.bytes_written);
         Ok(())
     }
 
@@ -324,7 +324,7 @@ impl AsyncBlockWriter {
     /// Create a new async block writer
     pub(crate) fn new(
         device: String,
-        written_tx: mpsc::UnboundedSender<u64>,
+        written_progress_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
         o_direct: bool,
     ) -> io::Result<Self> {
@@ -333,7 +333,7 @@ impl AsyncBlockWriter {
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
             let mut writer =
-                BlockWriter::new(&device, written_tx, debug, o_direct).map_err(|e| {
+                BlockWriter::new(&device, written_progress_tx, debug, o_direct).map_err(|e| {
                     eprintln!("Failed to open device '{}': {}", device, e);
                     e
                 })?;

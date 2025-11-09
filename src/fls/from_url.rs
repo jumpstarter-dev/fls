@@ -24,16 +24,16 @@ pub async fn flash_from_url(
     let decompressor_stderr = decompressor.stderr.take().unwrap();
 
     // Create channels
-    let (decompressed_tx, mut decompressed_rx) = mpsc::unbounded_channel::<u64>();
+    let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-    let (written_tx, mut written_rx) = mpsc::unbounded_channel::<u64>();
+    let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     println!("Opening block device for writing: {}", options.device);
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
         options.device.clone(),
-        written_tx,
+        written_progress_tx,
         options.debug,
         options.o_direct,
     )?;
@@ -52,7 +52,7 @@ pub async fn flash_from_url(
                     Ok(n) => {
                         let data = buffer[..n].to_vec();
                         // Send byte count to progress tracking
-                        if decompressed_tx.send(n as u64).is_err() {
+                        if decompressed_progress_tx.send(n as u64).is_err() {
                             break;
                         }
                         // Write to block device
@@ -111,7 +111,7 @@ pub async fn flash_from_url(
     let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
 
     // Channels for tracking bytes actually written to decompressor
-    let (decompressor_written_tx, mut decompressor_written_rx) = mpsc::unbounded_channel::<u64>();
+    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // Spawn persistent task to write buffered chunks to decompressor
     let decompressor_writer_handle = tokio::spawn(async move {
@@ -121,7 +121,7 @@ pub async fn flash_from_url(
                 return Err(format!("Error writing to decompressor stdin: {}", e));
             }
             // Notify that bytes were written to decompressor
-            let _ = decompressor_written_tx.send(chunk_len);
+            let _ = decompressor_written_progress_tx.send(chunk_len);
         }
         // Close decompressor stdin when channel is closed
         Ok::<(), String>(())
@@ -220,7 +220,7 @@ pub async fn flash_from_url(
                             retry_count = 0; // Reset retry count on successful download
 
                             // Track bytes actually written to decompressor
-                            while let Ok(written_len) = decompressor_written_rx.try_recv() {
+                            while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
                                 bytes_sent_to_decompressor += written_len;
                                 progress.bytes_sent_to_decompressor += written_len;
                             }
@@ -234,11 +234,11 @@ pub async fn flash_from_url(
                             }
 
                             // Update progress from other channels
-                            while let Ok(byte_count) = decompressed_rx.try_recv() {
+                            while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
                                 progress.bytes_decompressed += byte_count;
                             }
 
-                            while let Ok(written_bytes) = written_rx.try_recv() {
+                            while let Ok(written_bytes) = written_progress_rx.try_recv() {
                                 progress.bytes_written = written_bytes;
                             }
 
@@ -338,18 +338,18 @@ pub async fn flash_from_url(
         // Update progress from all channels
         let mut updated = false;
 
-        while let Ok(written_len) = decompressor_written_rx.try_recv() {
+        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
             bytes_sent_to_decompressor += written_len;
             progress.bytes_sent_to_decompressor += written_len;
             updated = true;
         }
 
-        while let Ok(byte_count) = decompressed_rx.try_recv() {
+        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
             progress.bytes_decompressed += byte_count;
             updated = true;
         }
 
-        while let Ok(written_bytes) = written_rx.try_recv() {
+        while let Ok(written_bytes) = written_progress_rx.try_recv() {
             progress.bytes_written = written_bytes;
             updated = true;
         }
@@ -381,7 +381,7 @@ pub async fn flash_from_url(
     }
 
     // Update any remaining progress
-    while let Ok(byte_count) = decompressed_rx.try_recv() {
+    while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
         progress.bytes_decompressed += byte_count;
     }
 
@@ -413,12 +413,12 @@ pub async fn flash_from_url(
             // Update progress from channels
             let mut updated = false;
 
-            while let Ok(byte_count) = decompressed_rx.try_recv() {
+            while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
                 progress.bytes_decompressed += byte_count;
                 updated = true;
             }
 
-            while let Ok(written_bytes) = written_rx.try_recv() {
+            while let Ok(written_bytes) = written_progress_rx.try_recv() {
                 progress.bytes_written = written_bytes;
                 updated = true;
             }
@@ -466,7 +466,7 @@ pub async fn flash_from_url(
         // Update progress from channels
         let mut updated = false;
 
-        while let Ok(written_bytes) = written_rx.try_recv() {
+        while let Ok(written_bytes) = written_progress_rx.try_recv() {
             progress.bytes_written = written_bytes;
             updated = true;
         }
@@ -508,11 +508,11 @@ pub async fn flash_from_url(
     }
 
     // Read any remaining progress updates
-    while let Ok(byte_count) = decompressed_rx.try_recv() {
+    while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
         progress.bytes_decompressed += byte_count;
     }
 
-    while let Ok(written_bytes) = written_rx.try_recv() {
+    while let Ok(written_bytes) = written_progress_rx.try_recv() {
         progress.bytes_written = written_bytes;
     }
 
