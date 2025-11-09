@@ -14,7 +14,8 @@ impl MemoryStats {
     /// Format memory stats in a compact format for display
     /// Example: "Mem: 1.2G/4G (proc: 250M+50Msw cache: 1.5G)"
     pub fn format_compact(&self) -> String {
-        let system_used_mb = self.system_total_mb - self.system_free_mb - self.system_cached_mb;
+        // MemAvailable already accounts for reclaimable cache, so don't subtract it again
+        let system_used_mb = self.system_total_mb - self.system_free_mb;
 
         format!(
             "Mem: {}/{}  (proc: {}{}  cache: {})",
