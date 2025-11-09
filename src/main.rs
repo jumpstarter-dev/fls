@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod fls;
+// Use the library module
+use fls::fls;
 
 #[derive(Parser)]
 #[command(name = "fls")]

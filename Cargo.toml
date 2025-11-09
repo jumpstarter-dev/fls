@@ -16,6 +16,11 @@ nix = { version = "0.29", features = ["ioctl"] }
 # This ensures OpenSSL builds from source with musl compatibility
 openssl = { version = "0.10", features = ["vendored"] }
 
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1.0", features = ["full", "rt-multi-thread"] }
+
 [profile.release]
 strip = true
 opt-level = "z"
