@@ -59,3 +59,137 @@ async fn test_flash_uncompressed_file() {
         test_data.len()
     );
 }
+
+#[tokio::test]
+async fn test_flash_xz_compressed_file() {
+    // Start mock HTTP server
+    let mock_server = MockServer::start().await;
+
+    // Create test data (5 MB uncompressed)
+    let original_data = common::create_test_data(5 * 1024 * 1024);
+
+    // Compress the data with xz
+    let compressed_data = common::compress_xz(&original_data);
+
+    println!(
+        "Test data: {} bytes uncompressed, {} bytes compressed (ratio: {:.2}x)",
+        original_data.len(),
+        compressed_data.len(),
+        original_data.len() as f64 / compressed_data.len() as f64
+    );
+
+    // Setup mock endpoint to serve the compressed file
+    Mock::given(method("GET"))
+        .and(path("/test.img.xz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed_data.clone()))
+        .mount(&mock_server)
+        .await;
+
+    // Create temporary file to act as the destination device
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let device_path = temp_file.path().to_string_lossy().to_string();
+
+    // Configure options for flashing
+    let options = BlockFlashOptions {
+        device: device_path.clone(),
+        o_direct: false, // Must be false for regular files
+        debug: false,
+        ..Default::default()
+    };
+
+    // Execute the flash operation
+    let url = format!("{}/test.img.xz", mock_server.uri());
+    let result = flash_from_url(&url, options).await;
+
+    // Verify the operation succeeded
+    assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
+
+    // Read back the written data
+    let written_data = std::fs::read(temp_file.path()).expect("Failed to read written file");
+
+    // Verify the decompressed data matches the original uncompressed data
+    assert_eq!(
+        written_data.len(),
+        original_data.len(),
+        "Written data length mismatch"
+    );
+    assert_eq!(
+        written_data, original_data,
+        "Decompressed data does not match original"
+    );
+
+    println!(
+        "✓ Test passed: {} bytes compressed -> {} bytes decompressed and verified",
+        compressed_data.len(),
+        written_data.len()
+    );
+}
+
+#[tokio::test]
+async fn test_flash_gz_compressed_file() {
+    // Start mock HTTP server
+    let mock_server = MockServer::start().await;
+
+    // Create test data (5 MB uncompressed)
+    let original_data = common::create_test_data(5 * 1024 * 1024);
+
+    // Compress the data with gzip
+    let compressed_data = common::compress_gz(&original_data);
+
+    println!(
+        "Test data: {} bytes uncompressed, {} bytes compressed (ratio: {:.2}x)",
+        original_data.len(),
+        compressed_data.len(),
+        original_data.len() as f64 / compressed_data.len() as f64
+    );
+
+    // Setup mock endpoint to serve the compressed file
+    Mock::given(method("GET"))
+        .and(path("/test.img.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed_data.clone()))
+        .mount(&mock_server)
+        .await;
+
+    // Create temporary file to act as the destination device
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let device_path = temp_file.path().to_string_lossy().to_string();
+
+    // Configure options for flashing
+    let options = BlockFlashOptions {
+        device: device_path.clone(),
+        o_direct: false, // Must be false for regular files
+        debug: false,
+        ..Default::default()
+    };
+
+    // Execute the flash operation
+    let url = format!("{}/test.img.gz", mock_server.uri());
+    let result = flash_from_url(&url, options).await;
+
+    // Verify the operation succeeded
+    assert!(
+        result.is_ok(),
+        "Flash operation failed: {:?}",
+        result.err()
+    );
+
+    // Read back the written data
+    let written_data = std::fs::read(temp_file.path()).expect("Failed to read written file");
+
+    // Verify the decompressed data matches the original uncompressed data
+    assert_eq!(
+        written_data.len(),
+        original_data.len(),
+        "Written data length mismatch"
+    );
+    assert_eq!(
+        written_data, original_data,
+        "Decompressed data does not match original"
+    );
+
+    println!(
+        "✓ Test passed: {} bytes compressed -> {} bytes decompressed and verified",
+        compressed_data.len(),
+        written_data.len()
+    );
+}
