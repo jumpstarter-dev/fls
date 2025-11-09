@@ -25,8 +25,8 @@ enum Commands {
         /// Ignore SSL certificate verification
         #[arg(short = 'k', long = "insecure-tls")]
         insecure_tls: bool,
-        /// Buffer size in MB for download buffering (default: 1024 MB)
-        #[arg(long, default_value = "1024")]
+        /// Buffer size in MB for download buffering (default: 128 MB)
+        #[arg(long, default_value = "128")]
         buffer_size: usize,
         /// Maximum number of retry attempts for failed downloads (default: 10)
         #[arg(long, default_value = "10")]
