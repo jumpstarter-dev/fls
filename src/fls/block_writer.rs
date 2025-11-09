@@ -332,8 +332,8 @@ impl AsyncBlockWriter {
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
-            let mut writer =
-                BlockWriter::new(&device, written_progress_tx, debug, o_direct).map_err(|e| {
+            let mut writer = BlockWriter::new(&device, written_progress_tx, debug, o_direct)
+                .map_err(|e| {
                     eprintln!("Failed to open device '{}': {}", device, e);
                     e
                 })?;

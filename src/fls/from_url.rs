@@ -111,7 +111,8 @@ pub async fn flash_from_url(
     let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
 
     // Channels for tracking bytes actually written to decompressor
-    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) = mpsc::unbounded_channel::<u64>();
+    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
+        mpsc::unbounded_channel::<u64>();
 
     // Spawn persistent task to write buffered chunks to decompressor
     let decompressor_writer_handle = tokio::spawn(async move {
@@ -220,7 +221,8 @@ pub async fn flash_from_url(
                             retry_count = 0; // Reset retry count on successful download
 
                             // Track bytes actually written to decompressor
-                            while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+                            while let Ok(written_len) = decompressor_written_progress_rx.try_recv()
+                            {
                                 bytes_sent_to_decompressor += written_len;
                                 progress.bytes_sent_to_decompressor += written_len;
                             }
