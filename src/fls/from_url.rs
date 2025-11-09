@@ -527,21 +527,28 @@ pub async fn flash_from_url(
 
     let stats = progress.final_stats();
     println!(
-        "\nDownload complete: {:.2} MB in {:.2}s ({:.2} MB/s)",
-        stats.mb_received, stats.download_secs, stats.download_rate
+        "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
+        stats.mb_received,
+        stats.download_time_formatted(),
+        stats.download_rate
     );
     println!(
-        "Decompression complete: {:.2} MB in {:.2}s ({:.2} MB/s)",
-        stats.mb_decompressed, stats.decompress_secs, stats.decompress_rate
+        "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
+        stats.mb_decompressed,
+        stats.decompress_time_formatted(),
+        stats.decompress_rate
     );
     println!(
-        "Write complete: {:.2} MB in {:.2}s ({:.2} MB/s)",
-        stats.mb_written, stats.write_secs, stats.write_rate
+        "Write complete: {:.2} MB in {} ({:.2} MB/s)",
+        stats.mb_written,
+        stats.write_time_formatted(),
+        stats.write_rate
     );
     println!(
         "Compression ratio: {:.2}x",
         stats.mb_decompressed / stats.mb_received
     );
+    println!("Total flash runtime: {}", stats.total_time_formatted());
 
     Ok(())
 }

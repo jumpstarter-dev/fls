@@ -3,6 +3,23 @@ use std::time::{Duration, Instant};
 
 use crate::fls::memory;
 
+/// Format seconds into a human-readable time string (e.g., "1h30m45s", "5m30s", or "45s")
+fn format_time(secs: f64) -> String {
+    let total_secs = secs as u64;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h{}m{}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m{}s", minutes, seconds)
+    } else {
+        // Show fractional seconds for times under 1 minute
+        format!("{:.2}s", secs)
+    }
+}
+
 pub struct FinalStats {
     pub mb_received: f64,
     pub mb_decompressed: f64,
@@ -13,6 +30,29 @@ pub struct FinalStats {
     pub download_secs: f64,
     pub decompress_secs: f64,
     pub write_secs: f64,
+    pub total_secs: f64,
+}
+
+impl FinalStats {
+    /// Format download time as human-readable string
+    pub fn download_time_formatted(&self) -> String {
+        format_time(self.download_secs)
+    }
+
+    /// Format decompress time as human-readable string
+    pub fn decompress_time_formatted(&self) -> String {
+        format_time(self.decompress_secs)
+    }
+
+    /// Format write time as human-readable string
+    pub fn write_time_formatted(&self) -> String {
+        format_time(self.write_secs)
+    }
+
+    /// Format total runtime as human-readable string
+    pub fn total_time_formatted(&self) -> String {
+        format_time(self.total_secs)
+    }
 }
 
 pub(crate) struct ProgressTracker {
@@ -185,6 +225,9 @@ impl ProgressTracker {
         let final_mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
         let final_mb_written = self.bytes_written as f64 / (1024.0 * 1024.0);
 
+        // Calculate total runtime from start to now
+        let total_secs = self.start_time.elapsed().as_secs_f64();
+
         // Use the stored durations for each phase
         let download_secs = self
             .download_duration
@@ -225,6 +268,7 @@ impl ProgressTracker {
             download_secs,
             decompress_secs,
             write_secs,
+            total_secs,
         }
     }
 }
