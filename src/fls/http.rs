@@ -7,6 +7,8 @@ pub(crate) async fn setup_http_client(
     options: &BlockFlashOptions,
 ) -> Result<Client, Box<dyn std::error::Error>> {
     let mut builder = Client::builder()
+        // Explicitly use rustls TLS backend for better custom CA support
+        .use_rustls_tls()
         // Enable HTTP/2 adaptive mode (will use HTTP/2 if server supports it)
         .http2_adaptive_window(true)
         .http2_initial_stream_window_size(Some(1024 * 1024 * 16)) // 16MB stream window
