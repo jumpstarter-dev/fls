@@ -316,7 +316,7 @@ impl BlockWriter {
 
 /// Async wrapper for BlockWriter that runs in a blocking task
 pub(crate) struct AsyncBlockWriter {
-    writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    writer_tx: mpsc::Sender<Vec<u8>>,
     writer_handle: tokio::task::JoinHandle<io::Result<u64>>,
 }
 
@@ -327,8 +327,23 @@ impl AsyncBlockWriter {
         written_progress_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
         o_direct: bool,
+        write_buffer_size_mb: usize,
     ) -> io::Result<Self> {
-        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Calculate channel capacity based on buffer size
+        // Assuming 8MB chunks from decompressor reader (see from_url.rs line 47)
+        const CHUNK_SIZE_MB: usize = 8;
+        let channel_capacity = (write_buffer_size_mb / CHUNK_SIZE_MB).max(1);
+
+        if debug {
+            eprintln!(
+                "[DEBUG] Write buffer: {} MB (capacity: {} chunks of {}MB each)",
+                write_buffer_size_mb, channel_capacity, CHUNK_SIZE_MB
+            );
+        }
+
+        // Create bounded channel to prevent OOM when decompression outpaces disk writes
+        // This provides backpressure when writing is slower than decompression
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(channel_capacity);
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
@@ -359,6 +374,7 @@ impl AsyncBlockWriter {
     pub(crate) async fn write(&self, data: Vec<u8>) -> io::Result<()> {
         self.writer_tx
             .send(data)
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Writer channel closed"))?;
         Ok(())
     }

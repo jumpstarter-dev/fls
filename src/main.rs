@@ -29,6 +29,9 @@ enum Commands {
         /// Buffer size in MB for download buffering (default: 128 MB)
         #[arg(long, default_value = "128")]
         buffer_size: usize,
+        /// Write buffer size in MB for decompressed data buffering (default: 128 MB)
+        #[arg(long, default_value = "128")]
+        write_buffer_size: usize,
         /// Maximum number of retry attempts for failed downloads (default: 10)
         #[arg(long, default_value = "10")]
         max_retries: usize,
@@ -67,6 +70,7 @@ async fn main() {
             cacert,
             insecure_tls,
             buffer_size,
+            write_buffer_size,
             max_retries,
             retry_delay,
             debug,
@@ -84,6 +88,7 @@ async fn main() {
             }
             println!("  Ignore certificates: {}", insecure_tls);
             println!("  Buffer size: {} MB", buffer_size);
+            println!("  Write buffer size: {} MB", write_buffer_size);
             println!("  Max retries: {}", max_retries);
             println!("  Retry delay: {} seconds", retry_delay);
             println!("  Debug: {}", debug);
@@ -116,6 +121,7 @@ async fn main() {
                 cacert,
                 device: device.clone(),
                 buffer_size_mb: buffer_size,
+                write_buffer_size_mb: write_buffer_size,
                 max_retries,
                 retry_delay_secs: retry_delay,
                 debug,

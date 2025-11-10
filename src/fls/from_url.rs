@@ -36,6 +36,7 @@ pub async fn flash_from_url(
         written_progress_tx,
         options.debug,
         options.o_direct,
+        options.write_buffer_size_mb,
     )?;
 
     // Spawn background task to read from decompressor and write to block device
