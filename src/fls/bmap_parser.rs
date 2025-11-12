@@ -6,14 +6,18 @@ use std::io;
 pub struct BmapRange {
     pub start_block: u64,
     pub end_block: u64, // inclusive
+    #[allow(dead_code)]
     pub checksum: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct BmapFile {
+    #[allow(dead_code)]
     pub image_size: u64,
     pub block_size: u64,
+    #[allow(dead_code)]
     pub blocks_count: u64,
+    #[allow(dead_code)]
     pub mapped_blocks_count: u64,
     pub ranges: Vec<BmapRange>,
 }
@@ -55,6 +59,7 @@ impl BmapFile {
     }
 
     /// Check if a byte range is mapped (should be written)
+    #[allow(dead_code)]
     pub fn is_range_mapped(&self, byte_offset: u64, size: u64) -> bool {
         let start_block = byte_offset / self.block_size;
         let end_block = (byte_offset + size - 1) / self.block_size;
@@ -162,11 +167,7 @@ impl BmapFile {
 
                 // Extract checksum if present
                 let checksum = if let Some(chksum_start) = range_xml.find("chksum=\"") {
-                    if let Some(chksum_end) = range_xml[chksum_start + 8..].find("\"") {
-                        Some(range_xml[chksum_start + 8..chksum_start + 8 + chksum_end].to_string())
-                    } else {
-                        None
-                    }
+                    range_xml[chksum_start + 8..].find("\"").map(|chksum_end| range_xml[chksum_start + 8..chksum_start + 8 + chksum_end].to_string())
                 } else {
                     None
                 };
