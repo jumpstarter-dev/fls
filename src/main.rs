@@ -44,6 +44,9 @@ enum Commands {
         /// Enable O_DIRECT mode for direct I/O (bypasses OS cache)
         #[arg(long)]
         o_direct: bool,
+        /// Path to BMAP file for efficient flashing (skips unmapped blocks)
+        #[arg(long)]
+        bmap: Option<String>,
         /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
@@ -75,6 +78,7 @@ async fn main() {
             retry_delay,
             debug,
             o_direct,
+            bmap,
             headers,
             progress_interval,
             newline_progress,
@@ -126,6 +130,7 @@ async fn main() {
                 retry_delay_secs: retry_delay,
                 debug,
                 o_direct,
+                bmap_file: bmap,
                 headers: parsed_headers,
                 progress_interval_secs: progress_interval,
                 newline_progress,

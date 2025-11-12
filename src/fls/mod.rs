@@ -1,5 +1,6 @@
 // Module declarations
 mod block_writer;
+mod bmap_parser;
 mod decompress;
 mod download_error;
 mod error_handling;
