@@ -363,7 +363,10 @@ impl BmapBlockWriter {
                         if !is_block_dev {
                             opts.create(true).truncate(true);
                         }
-                        match opts.custom_flags(libc::O_DIRECT | libc::O_SYNC).open(device) {
+                        match opts
+                            .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+                            .open(device)
+                        {
                             Ok(f) => {
                                 if debug {
                                     eprintln!("[BMAP] Opened {} with O_DIRECT|O_SYNC", device);
@@ -406,7 +409,10 @@ impl BmapBlockWriter {
                 let fd = f.as_raw_fd();
                 let direct_io = unsafe {
                     if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
-                        return Err(io::Error::new(io::ErrorKind::Unsupported, "F_NOCACHE not supported"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "F_NOCACHE not supported",
+                        ));
                     } else {
                         if debug {
                             eprintln!("[BMAP] Opened {} with F_NOCACHE", device);
@@ -492,7 +498,11 @@ impl BmapBlockWriter {
                         if written != overlap_data.len() {
                             return Err(io::Error::new(
                                 io::ErrorKind::WriteZero,
-                                format!("pwrite() wrote {} bytes, expected {}", written, overlap_data.len()),
+                                format!(
+                                    "pwrite() wrote {} bytes, expected {}",
+                                    written,
+                                    overlap_data.len()
+                                ),
                             ));
                         }
 
@@ -584,11 +594,12 @@ impl AsyncBlockWriter {
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
             let mut writer = if let Some(bmap) = bmap {
-                let writer = BmapBlockWriter::new(&device, written_progress_tx, debug, o_direct, bmap)
-                    .map_err(|e| {
-                        eprintln!("Failed to open device '{}': {}", device, e);
-                        e
-                    })?;
+                let writer =
+                    BmapBlockWriter::new(&device, written_progress_tx, debug, o_direct, bmap)
+                        .map_err(|e| {
+                            eprintln!("Failed to open device '{}': {}", device, e);
+                            e
+                        })?;
                 WriterEnum::Bmap(writer)
             } else {
                 let writer = BlockWriter::new(&device, written_progress_tx, debug, o_direct)
