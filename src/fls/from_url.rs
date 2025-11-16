@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::bmap_parser::BmapFile;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
@@ -28,6 +29,18 @@ pub async fn flash_from_url(
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
+    // Load BMAP file if provided
+    let bmap = if let Some(ref bmap_path) = options.bmap_file {
+        println!("Loading BMAP file: {}", bmap_path);
+        let bmap_content = std::fs::read_to_string(bmap_path)
+            .map_err(|e| format!("Failed to read BMAP file {}: {}", bmap_path, e))?;
+        let parsed_bmap = BmapFile::parse(&bmap_content)
+            .map_err(|e| format!("Failed to parse BMAP file: {}", e))?;
+        Some(parsed_bmap)
+    } else {
+        None
+    };
+
     println!("Opening block device for writing: {}", options.device);
 
     // Create block writer
@@ -37,6 +50,7 @@ pub async fn flash_from_url(
         options.debug,
         options.o_direct,
         options.write_buffer_size_mb,
+        bmap,
     )?;
 
     // Spawn background task to read from decompressor and write to block device
@@ -500,7 +514,7 @@ pub async fn flash_from_url(
             eprintln!();
             return Err(e.into());
         }
-    }
+    };
 
     // Capture the write rate and duration at completion
     let elapsed = progress.start_time.elapsed();
