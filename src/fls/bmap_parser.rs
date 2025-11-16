@@ -167,7 +167,9 @@ impl BmapFile {
 
                 // Extract checksum if present
                 let checksum = if let Some(chksum_start) = range_xml.find("chksum=\"") {
-                    range_xml[chksum_start + 8..].find("\"").map(|chksum_end| range_xml[chksum_start + 8..chksum_start + 8 + chksum_end].to_string())
+                    range_xml[chksum_start + 8..].find("\"").map(|chksum_end| {
+                        range_xml[chksum_start + 8..chksum_start + 8 + chksum_end].to_string()
+                    })
                 } else {
                     None
                 };
@@ -216,6 +218,17 @@ impl BmapFile {
 mod tests {
     use super::*;
 
+    fn test_range_mapped_cases(bmap: &BmapFile, cases: &[(u64, u64, bool, &str)]) {
+        for (byte_offset, size, expected, description) in cases {
+            let actual = bmap.is_range_mapped(*byte_offset, *size);
+            assert_eq!(
+                actual, *expected,
+                "Failed for {}: byte_offset={}, size={}, expected={}, actual={}",
+                description, byte_offset, size, expected, actual
+            );
+        }
+    }
+
     #[test]
     fn test_parse_simple_bmap() {
         let xml = r#"
@@ -240,5 +253,255 @@ mod tests {
         assert_eq!(bmap.ranges[0].end_block, 0);
         assert_eq!(bmap.ranges[1].start_block, 256);
         assert_eq!(bmap.ranges[1].end_block, 1805);
+    }
+
+    #[test]
+    fn test_is_range_mapped_edge_cases() {
+        let block_size = 4096;
+        let bmap = BmapFile {
+            image_size: 1000000,
+            block_size,
+            blocks_count: 1000,
+            mapped_blocks_count: 12,
+            ranges: vec![
+                BmapRange {
+                    start_block: 10,
+                    end_block: 15,
+                    checksum: None,
+                },
+                BmapRange {
+                    start_block: 20,
+                    end_block: 25,
+                    checksum: None,
+                },
+            ],
+        };
+
+        let test_cases = vec![
+            (10 * block_size, 1, true, "single byte at start of range 1"),
+            (
+                10 * block_size,
+                block_size,
+                true,
+                "full block at start of range 1",
+            ),
+            (15 * block_size, 1, true, "single byte at end of range 1"),
+            (
+                15 * block_size,
+                block_size,
+                true,
+                "full block at end of range 1",
+            ),
+            (
+                14 * block_size + 1,
+                block_size,
+                true,
+                "query ending at last byte of block 15",
+            ),
+            (
+                15 * block_size,
+                block_size + 1,
+                true,
+                "query spanning from range 1 into gap",
+            ),
+            (
+                15 * block_size + block_size / 2,
+                block_size,
+                true,
+                "query starting mid-block 15, ending in gap",
+            ),
+            (
+                16 * block_size,
+                block_size,
+                false,
+                "single block in gap (block 16)",
+            ),
+            (
+                17 * block_size,
+                block_size,
+                false,
+                "single block in gap (block 17)",
+            ),
+            (
+                18 * block_size,
+                block_size,
+                false,
+                "single block in gap (block 18)",
+            ),
+            (
+                19 * block_size,
+                block_size,
+                false,
+                "single block in gap (block 19)",
+            ),
+            (
+                16 * block_size,
+                4 * block_size,
+                false,
+                "multi-block query in gap",
+            ),
+            (0, block_size, false, "query before first range (block 0)"),
+            (
+                5 * block_size,
+                block_size,
+                false,
+                "query before first range (block 5)",
+            ),
+            (
+                0,
+                5 * block_size,
+                false,
+                "multi-block query before first range",
+            ),
+            (
+                30 * block_size,
+                block_size,
+                false,
+                "query after last range (block 30)",
+            ),
+            (
+                35 * block_size,
+                block_size,
+                false,
+                "query after last range (block 35)",
+            ),
+            (
+                30 * block_size,
+                5 * block_size,
+                false,
+                "multi-block query after last range",
+            ),
+            (
+                5 * block_size,
+                25 * block_size,
+                true,
+                "query spanning all ranges and gaps",
+            ),
+            (
+                9 * block_size,
+                3 * block_size,
+                true,
+                "partial overlap: starts before range 1, ends in range 1",
+            ),
+            (
+                9 * block_size + block_size / 2,
+                2 * block_size,
+                true,
+                "partial overlap: starts mid-block 9, ends in range 1",
+            ),
+            (
+                14 * block_size,
+                3 * block_size,
+                true,
+                "partial overlap: starts in range 1, ends in gap",
+            ),
+            (
+                14 * block_size + block_size / 2,
+                2 * block_size,
+                true,
+                "partial overlap: starts mid-block 14, ends in gap",
+            ),
+            (
+                12 * block_size,
+                block_size,
+                true,
+                "single full block in mapped range (block 12)",
+            ),
+            (
+                12 * block_size,
+                1,
+                true,
+                "single byte in mapped range (block 12)",
+            ),
+            (
+                12 * block_size + 100,
+                block_size - 100,
+                true,
+                "partial block in mapped range (block 12)",
+            ),
+            (
+                17 * block_size,
+                block_size,
+                false,
+                "single full block in gap (block 17)",
+            ),
+            (17 * block_size, 1, false, "single byte in gap (block 17)"),
+            (
+                17 * block_size + 100,
+                block_size - 100,
+                false,
+                "partial block in gap (block 17)",
+            ),
+            (
+                12 * block_size,
+                10 * block_size,
+                true,
+                "query spanning both ranges and gap",
+            ),
+            (
+                19 * block_size,
+                block_size + 1,
+                true,
+                "query spanning from gap into range 2",
+            ),
+            (
+                19 * block_size + block_size / 2,
+                block_size,
+                true,
+                "query starting mid-block 19, ending in range 2",
+            ),
+            (25 * block_size, 1, true, "single byte at end of range 2"),
+            (
+                25 * block_size,
+                block_size,
+                true,
+                "full block at end of range 2",
+            ),
+            (
+                24 * block_size + 1,
+                block_size,
+                true,
+                "query ending at last byte of block 25",
+            ),
+            (
+                10 * block_size - 1,
+                1,
+                false,
+                "query ending exactly at last byte of block 9 (unmapped)",
+            ),
+            (
+                10 * block_size - 1,
+                2,
+                true,
+                "query spanning from block 9 into block 10 (mapped)",
+            ),
+            (
+                10 * block_size - 100,
+                200,
+                true,
+                "query starting before block 10, ending in block 10",
+            ),
+            (
+                9 * block_size + 2000,
+                block_size + 1000,
+                true,
+                "query starting in block 9, ending in block 11",
+            ),
+            (
+                15 * block_size + 2000,
+                block_size + 1000,
+                true,
+                "query starting in block 15, ending in block 17",
+            ),
+            (10 * block_size, 1, true, "1 byte at start of range 1"),
+            (15 * block_size, 1, true, "1 byte at end of range 1"),
+            (20 * block_size, 1, true, "1 byte at start of range 2"),
+            (25 * block_size, 1, true, "1 byte at end of range 2"),
+            (16 * block_size, 1, false, "1 byte in gap"),
+            (0, 1, false, "1 byte before first range"),
+            (30 * block_size, 1, false, "1 byte after last range"),
+        ];
+
+        test_range_mapped_cases(&bmap, &test_cases);
     }
 }
