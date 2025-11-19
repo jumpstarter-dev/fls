@@ -84,7 +84,8 @@ pub(crate) struct BlockWriter {
     debug: bool, // Debug mode flag
 }
 
-// Sync every 64MB when not using direct I/O
+// Sync every 64MB when not using direct I/O (Linux only - macOS doesn't sync during writes)
+#[cfg(not(target_os = "macos"))]
 const SYNC_INTERVAL: u64 = 64 * 1024 * 1024;
 
 impl BlockWriter {
@@ -97,15 +98,32 @@ impl BlockWriter {
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let (file, use_direct_io) = {
+            use std::os::unix::fs::FileTypeExt;
+
+            // Check if this is a block device
+            let is_block_dev = std::fs::metadata(device)
+                .map(|m| m.file_type().is_block_device())
+                .unwrap_or(false);
+
             if o_direct {
                 // Try O_DIRECT without O_SYNC first (some devices have issues with both)
-                match OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open(device)
-                {
+                let result1 = if is_block_dev {
+                    // For block devices, open with read+write (required by some drivers)
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(device)
+                } else {
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(device)
+                };
+
+                match result1 {
                     Ok(f) => {
                         if debug {
                             eprintln!(
@@ -117,13 +135,23 @@ impl BlockWriter {
                     }
                     Err(e1) => {
                         // Try O_DIRECT with O_SYNC
-                        match OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .custom_flags(libc::O_DIRECT | libc::O_SYNC)
-                            .open(device)
-                        {
+                        let result2 = if is_block_dev {
+                            // For block devices, open with read+write (required by some drivers)
+                            OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+                                .open(device)
+                        } else {
+                            OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+                                .open(device)
+                        };
+
+                        match result2 {
                             Ok(f) => {
                                 if debug {
                                     eprintln!(
@@ -154,11 +182,19 @@ impl BlockWriter {
                         device
                     );
                 }
-                let f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(device)?;
+                let f = if is_block_dev {
+                    // For block devices, open with read+write (required by some drivers)
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(device)?
+                } else {
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(device)?
+                };
                 (f, false)
             }
         };
@@ -166,15 +202,52 @@ impl BlockWriter {
         #[cfg(target_os = "macos")]
         let (file, use_direct_io) = {
             use std::os::unix::io::AsRawFd;
+            use std::os::unix::fs::FileTypeExt;
+
+            // Check if this is a block device or character device (raw disk)
+            let metadata = std::fs::metadata(device)?;
+            let file_type = metadata.file_type();
+            let is_block_dev = file_type.is_block_device();
+            let is_char_dev = file_type.is_char_device();
+            let is_device = is_block_dev || is_char_dev;
+
+            if debug {
+                eprintln!("[DEBUG] Device type check for {}:", device);
+                eprintln!("[DEBUG]   Block device: {}", is_block_dev);
+                eprintln!("[DEBUG]   Character device (raw): {}", is_char_dev);
+                eprintln!("[DEBUG]   Regular file: {}", file_type.is_file());
+            }
+
+            // On macOS, strongly warn if using /dev/diskN instead of /dev/rdiskN
+            // Buffered block devices often fail with ioctl errors when writing raw data
+            if is_block_dev && device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk") {
+                eprintln!("\n⚠️  WARNING: You are using buffered device {}", device);
+                eprintln!("   On macOS, buffered block devices (/dev/diskN) often fail with 'Inappropriate ioctl' errors");
+                eprintln!("   when writing raw disk images, especially if the disk has partitions.");
+                eprintln!("   \n   STRONGLY RECOMMENDED: Use the raw device instead:");
+                eprintln!("   {}", device.replace("/dev/disk", "/dev/rdisk"));
+                eprintln!();
+            }
 
             if o_direct {
                 // macOS uses F_NOCACHE instead of O_DIRECT
-                let f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .custom_flags(libc::O_SYNC)
-                    .open(device)?;
+                let f = if is_device {
+                    // For devices (block or character), don't use create/truncate
+                    // On macOS, raw devices often require read+write access even for write-only operations
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_SYNC)
+                        .open(device)?
+                } else {
+                    // For regular files, use create/truncate
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .custom_flags(libc::O_SYNC)
+                        .open(device)?
+                };
 
                 let fd = f.as_raw_fd();
                 let direct_io = unsafe {
@@ -203,11 +276,21 @@ impl BlockWriter {
                         device
                     );
                 }
-                let f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(device)?;
+                let f = if is_device {
+                    // For devices (block or character), don't use create/truncate
+                    // On macOS, raw devices often require read+write access even for write-only operations
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(device)?
+                } else {
+                    // For regular files, use create/truncate
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(device)?
+                };
                 (f, false)
             }
         };
@@ -281,6 +364,13 @@ impl BlockWriter {
             .write_all(&buffer_slice[..write_size])
             .map_err(|e| {
                 eprintln!("Write error at offset {}: {}", self.bytes_written, e);
+                #[cfg(target_os = "macos")]
+                {
+                    // On macOS, error 25 (ENOTTY) often indicates disk is mounted or wrong device type
+                    if e.raw_os_error() == Some(25) {
+                        eprintln!("Error 25 (Inappropriate ioctl) on macOS - see detailed error message above.");
+                    }
+                }
                 e
             })?;
 
@@ -288,9 +378,19 @@ impl BlockWriter {
         self.buffer_pos = 0;
 
         // For buffered I/O, sync periodically to avoid losing too much data on failure
-        if !self.use_direct_io && self.bytes_since_sync >= SYNC_INTERVAL {
-            self.file.sync_data()?;
-            self.bytes_since_sync = 0;
+        // On macOS, don't sync during writes to block devices (matches dd behavior)
+        // Syncing during writes can cause "Inappropriate ioctl" errors on macOS
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, don't sync during writes - only sync at the end
+            // This matches dd's behavior and avoids ioctl errors
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if !self.use_direct_io && self.bytes_since_sync >= SYNC_INTERVAL {
+                self.file.sync_data()?;
+                self.bytes_since_sync = 0;
+            }
         }
 
         Ok(())
@@ -299,9 +399,21 @@ impl BlockWriter {
     /// Flush any remaining data and sync to disk
     pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.flush_buffer()?;
-        // Always do a final sync to ensure data is on disk
-        self.file.flush()?;
-        self.file.sync_all()?;
+        // On macOS, avoid flush() and sync() on block devices as they can cause ioctl errors
+        // The data is already written to the kernel buffer, and macOS will flush it automatically
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS block devices, flush() and sync() can cause "Inappropriate ioctl" errors
+            // Since we're writing directly to the device, the data is already in the kernel buffer
+            // macOS will handle the final flush automatically when the file is closed
+            // This matches dd's behavior - it doesn't explicitly sync on macOS block devices
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // On Linux, we can safely flush and sync
+            self.file.flush()?;
+            self.file.sync_all()?;
+        }
         self.bytes_since_sync = 0;
         // Send final progress update
         let _ = self.written_progress_tx.send(self.bytes_written);
@@ -356,6 +468,20 @@ impl AsyncBlockWriter {
             while let Some(data) = writer_rx.blocking_recv() {
                 if let Err(e) = writer.write(&data) {
                     eprintln!("Failed to write to device '{}': {}", device, e);
+                    #[cfg(target_os = "macos")]
+                    {
+                        // On macOS, provide helpful hints for common errors
+                        if e.raw_os_error() == Some(25) {
+                            eprintln!("\n⚠️  Error 25 (Inappropriate ioctl) on macOS:");
+                            if device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk") {
+                                eprintln!("  You MUST use the raw device: {}", device.replace("/dev/disk", "/dev/rdisk"));
+                                eprintln!("  Buffered devices (/dev/diskN) cannot be used for raw disk writes.");
+                            } else {
+                                eprintln!("  Try unmounting the disk: diskutil unmountDisk {}", device);
+                                eprintln!("  Or ejecting it: diskutil eject {}", device);
+                            }
+                        }
+                    }
                     return Err(e);
                 }
             }

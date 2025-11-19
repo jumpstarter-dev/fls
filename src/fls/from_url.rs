@@ -130,6 +130,26 @@ pub async fn flash_from_url(
     });
 
     loop {
+        // Check if writer has failed before attempting download/retry
+        if writer_handle.is_finished() {
+            eprintln!();
+            eprintln!("Writer task has terminated, stopping download");
+            // Get the actual error from the writer
+            match writer_handle.await {
+                Ok(Ok(_)) => {
+                    return Err("Writer closed unexpectedly".into());
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Writer error: {}", e);
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    eprintln!("Writer task panicked: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+
         // Resume from the HTTP download position, not the decompressor write position
         // The buffer may contain data that's been downloaded but not yet written to decompressor
         let resume_from = if progress.bytes_received > 0 {
@@ -139,7 +159,7 @@ pub async fn flash_from_url(
         };
 
         // Start or resume download
-        let response = match start_download(url, &client, resume_from, &options.headers).await {
+        let response = match start_download(url, &client, resume_from, &options.headers, options.debug).await {
             Ok(r) => r,
             Err(e) => {
                 // Check if this is a permanent error that shouldn't be retried
@@ -205,6 +225,25 @@ pub async fn flash_from_url(
                             // Send to buffer - detect if it's blocking
                             let send_start = std::time::Instant::now();
                             if buffer_tx.send(chunk).await.is_err() {
+                                // Check if writer has failed
+                                if writer_handle.is_finished() {
+                                    eprintln!();
+                                    eprintln!("Writer task has terminated unexpectedly");
+                                    // Get the actual error from the writer
+                                    match writer_handle.await {
+                                        Ok(Ok(_)) => {
+                                            return Err("Writer closed unexpectedly".into());
+                                        }
+                                        Ok(Err(e)) => {
+                                            eprintln!("Writer error: {}", e);
+                                            return Err(e.into());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Writer task panicked: {}", e);
+                                            return Err(e.into());
+                                        }
+                                    }
+                                }
                                 connection_error =
                                     Some(DownloadError::Other("Buffer channel closed".to_string()));
                                 connection_broken = true;
@@ -276,6 +315,26 @@ pub async fn flash_from_url(
 
         // If connection broke, retry
         if connection_broken {
+            // First check if writer has failed - if so, don't retry
+            if writer_handle.is_finished() {
+                eprintln!();
+                eprintln!("Connection interrupted and writer task has terminated");
+                // Get the actual error from the writer
+                match writer_handle.await {
+                    Ok(Ok(_)) => {
+                        return Err("Writer closed unexpectedly during download".into());
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Writer error: {}", e);
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        eprintln!("Writer task panicked: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            }
+
             if let Some(e) = connection_error {
                 // Check if this is a permanent error that shouldn't be retried
                 if !e.is_retryable() {

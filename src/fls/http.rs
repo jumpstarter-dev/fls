@@ -6,6 +6,21 @@ use std::time::Duration;
 pub(crate) async fn setup_http_client(
     options: &BlockFlashOptions,
 ) -> Result<Client, Box<dyn std::error::Error>> {
+    if options.debug {
+        eprintln!("\n[DEBUG] Initializing HTTP Client:");
+        eprintln!("[DEBUG]   TLS Backend: rustls");
+        eprintln!("[DEBUG]   HTTP/2: Adaptive mode enabled");
+        eprintln!("[DEBUG]   HTTP/2 Stream Window: 16 MB");
+        eprintln!("[DEBUG]   HTTP/2 Connection Window: 32 MB");
+        eprintln!("[DEBUG]   Connection Pool: max 10 idle per host");
+        eprintln!("[DEBUG]   Pool Idle Timeout: 90s");
+        eprintln!("[DEBUG]   TCP Keepalive: 10s");
+        eprintln!("[DEBUG]   TCP Nodelay: enabled");
+        eprintln!("[DEBUG]   Request Timeout: 7200s (2 hours)");
+        eprintln!("[DEBUG]   Connect Timeout: 30s");
+        eprintln!("[DEBUG]   DNS Resolver: system resolver");
+    }
+
     let mut builder = Client::builder()
         // Explicitly use rustls TLS backend for better custom CA support
         .use_rustls_tls()
@@ -28,6 +43,9 @@ pub(crate) async fn setup_http_client(
     // Add custom CA certificate if provided
     if let Some(ca_cert_path) = &options.cacert {
         println!("Loading CA certificate from: {}", ca_cert_path.display());
+        if options.debug {
+            eprintln!("[DEBUG]   Custom CA Certificate: {}", ca_cert_path.display());
+        }
         let cert_bytes = std::fs::read(ca_cert_path)
             .map_err(|e| format!("Failed to read CA certificate file: {}", e))?;
 
@@ -40,7 +58,14 @@ pub(crate) async fn setup_http_client(
 
     if options.insecure_tls {
         println!("Warning: Certificate verification is disabled");
+        if options.debug {
+            eprintln!("[DEBUG]   Certificate Verification: DISABLED (insecure)");
+        }
         builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    if options.debug {
+        eprintln!("[DEBUG] HTTP Client initialized successfully\n");
     }
 
     Ok(builder.build()?)
@@ -51,6 +76,7 @@ pub(crate) async fn start_download(
     client: &Client,
     resume_from: Option<u64>,
     custom_headers: &[(String, String)],
+    debug: bool,
 ) -> Result<reqwest::Response, DownloadError> {
     if let Some(offset) = resume_from {
         println!("Resuming download from: {} (byte offset: {})", url, offset);
@@ -74,7 +100,43 @@ pub(crate) async fn start_download(
         request = request.header("Range", format!("bytes={}-", offset));
     }
 
+    // Debug: Log request details
+    if debug {
+        eprintln!("\n[DEBUG] HTTP Request:");
+        eprintln!("[DEBUG]   Method: GET");
+        eprintln!("[DEBUG]   URL: {}", url);
+        eprintln!("[DEBUG]   Headers:");
+        eprintln!("[DEBUG]     User-Agent: fls/0.1.0");
+        eprintln!("[DEBUG]     Accept: */*");
+        eprintln!("[DEBUG]     Accept-Encoding: identity");
+        for (name, value) in custom_headers {
+            eprintln!("[DEBUG]     {}: {}", name, value);
+        }
+        if let Some(offset) = resume_from {
+            eprintln!("[DEBUG]     Range: bytes={}-", offset);
+        }
+    }
+
     let response = request.send().await.map_err(DownloadError::from_reqwest)?;
+
+    // Debug: Log response details
+    if debug {
+        eprintln!("\n[DEBUG] HTTP Response:");
+        eprintln!("[DEBUG]   Status: {} {}", response.status().as_u16(), response.status().canonical_reason().unwrap_or(""));
+        eprintln!("[DEBUG]   Version: {:?}", response.version());
+        eprintln!("[DEBUG]   Headers:");
+        for (name, value) in response.headers() {
+            if let Ok(val_str) = value.to_str() {
+                eprintln!("[DEBUG]     {}: {}", name, val_str);
+            } else {
+                eprintln!("[DEBUG]     {}: <binary data>", name);
+            }
+        }
+        if let Some(remote_addr) = response.remote_addr() {
+            eprintln!("[DEBUG]   Remote Address: {}", remote_addr);
+        }
+        eprintln!();
+    }
 
     // Accept both 200 (full content) and 206 (partial content) as success
     if !response.status().is_success() && response.status().as_u16() != 206 {

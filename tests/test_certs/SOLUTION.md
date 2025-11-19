@@ -175,3 +175,5 @@ This was a subtle issue with TLS backend selection that wasn't documented in req
 **Date Solved:** November 9, 2025
 **Key Insight:** Explicit backend selection matters more than feature flags
 
+
+
