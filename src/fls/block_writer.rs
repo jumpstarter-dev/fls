@@ -202,17 +202,20 @@ impl BlockWriter {
             use std::os::unix::io::AsRawFd;
 
             // Check if this is a block device or character device (raw disk)
-            let metadata = std::fs::metadata(device)?;
-            let file_type = metadata.file_type();
-            let is_block_dev = file_type.is_block_device();
-            let is_char_dev = file_type.is_char_device();
+            let (is_block_dev, is_char_dev) = if let Ok(metadata) = std::fs::metadata(device) {
+                let file_type = metadata.file_type();
+                (file_type.is_block_device(), file_type.is_char_device())
+            } else {
+                // File doesn't exist yet - not a device
+                (false, false)
+            };
             let is_device = is_block_dev || is_char_dev;
 
             if debug {
                 eprintln!("[DEBUG] Device type check for {}:", device);
                 eprintln!("[DEBUG]   Block device: {}", is_block_dev);
                 eprintln!("[DEBUG]   Character device (raw): {}", is_char_dev);
-                eprintln!("[DEBUG]   Regular file: {}", file_type.is_file());
+                eprintln!("[DEBUG]   Regular file: {}", !is_device);
             }
 
             // On macOS, strongly warn if using /dev/diskN instead of /dev/rdiskN

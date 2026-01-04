@@ -95,6 +95,10 @@ async fn main() {
             // Detect URL scheme to determine handler
             let is_oci = url.starts_with("docker://") || url.starts_with("oci://");
 
+            if debug {
+                eprintln!("[DEBUG] URL: '{}', is_oci: {}", url, is_oci);
+            }
+
             if is_oci {
                 // OCI image - strip scheme prefix
                 let image_ref = url

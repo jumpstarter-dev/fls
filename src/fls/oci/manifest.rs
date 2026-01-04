@@ -94,7 +94,7 @@ pub struct ImageIndex {
 /// Parsed manifest - can be either a single manifest or an index
 #[derive(Debug)]
 pub enum Manifest {
-    Image(ImageManifest),
+    Image(Box<ImageManifest>),
     Index(ImageIndex),
 }
 
@@ -114,7 +114,7 @@ impl Manifest {
 
         // Try as image manifest
         if let Ok(manifest) = serde_json::from_str::<ImageManifest>(data_str) {
-            return Ok(Manifest::Image(manifest));
+            return Ok(Manifest::Image(Box::new(manifest)));
         }
 
         // Try based on content-type
@@ -133,7 +133,7 @@ impl Manifest {
     /// Returns error if there are no layers or multiple layers
     pub fn get_single_layer(&self) -> Result<&Descriptor, String> {
         match self {
-            Manifest::Image(m) => {
+            Manifest::Image(ref m) => {
                 if m.layers.is_empty() {
                     Err("Manifest has no layers".to_string())
                 } else if m.layers.len() > 1 {
@@ -154,7 +154,7 @@ impl Manifest {
     #[allow(dead_code)]
     pub fn get_layers(&self) -> Result<&[Descriptor], String> {
         match self {
-            Manifest::Image(m) => Ok(&m.layers),
+            Manifest::Image(ref m) => Ok(&m.layers),
             Manifest::Index(_) => Err("Cannot get layers from manifest index".to_string()),
         }
     }
@@ -237,7 +237,7 @@ mod tests {
 
         let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
         match manifest {
-            Manifest::Image(m) => {
+            Manifest::Image(ref m) => {
                 assert_eq!(m.schema_version, 2);
                 assert_eq!(m.layers.len(), 1);
                 assert_eq!(m.layers[0].digest, "sha256:layer123");

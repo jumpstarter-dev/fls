@@ -97,7 +97,12 @@ impl ImageReference {
 
     /// Get the registry URL (with https:// prefix)
     pub fn registry_url(&self) -> String {
-        format!("https://{}", self.registry)
+        // Docker Hub uses registry-1.docker.io for the registry API
+        if self.registry == "docker.io" {
+            "https://registry-1.docker.io".to_string()
+        } else {
+            format!("https://{}", self.registry)
+        }
     }
 }
 

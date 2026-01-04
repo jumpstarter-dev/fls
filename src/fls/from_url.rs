@@ -409,7 +409,6 @@ pub async fn flash_from_url(
         let mut updated = false;
 
         while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
-            bytes_sent_to_decompressor += written_len;
             progress.bytes_sent_to_decompressor += written_len;
             updated = true;
         }
