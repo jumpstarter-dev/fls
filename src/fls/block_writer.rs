@@ -184,10 +184,7 @@ impl BlockWriter {
                 }
                 let f = if is_block_dev {
                     // For block devices, open with read+write (required by some drivers)
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(device)?
+                    OpenOptions::new().read(true).write(true).open(device)?
                 } else {
                     OpenOptions::new()
                         .write(true)
@@ -201,8 +198,8 @@ impl BlockWriter {
 
         #[cfg(target_os = "macos")]
         let (file, use_direct_io) = {
-            use std::os::unix::io::AsRawFd;
             use std::os::unix::fs::FileTypeExt;
+            use std::os::unix::io::AsRawFd;
 
             // Check if this is a block device or character device (raw disk)
             let metadata = std::fs::metadata(device)?;
@@ -220,10 +217,13 @@ impl BlockWriter {
 
             // On macOS, strongly warn if using /dev/diskN instead of /dev/rdiskN
             // Buffered block devices often fail with ioctl errors when writing raw data
-            if is_block_dev && device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk") {
+            if is_block_dev && device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk")
+            {
                 eprintln!("\n⚠️  WARNING: You are using buffered device {}", device);
                 eprintln!("   On macOS, buffered block devices (/dev/diskN) often fail with 'Inappropriate ioctl' errors");
-                eprintln!("   when writing raw disk images, especially if the disk has partitions.");
+                eprintln!(
+                    "   when writing raw disk images, especially if the disk has partitions."
+                );
                 eprintln!("   \n   STRONGLY RECOMMENDED: Use the raw device instead:");
                 eprintln!("   {}", device.replace("/dev/disk", "/dev/rdisk"));
                 eprintln!();
@@ -279,10 +279,7 @@ impl BlockWriter {
                 let f = if is_device {
                     // For devices (block or character), don't use create/truncate
                     // On macOS, raw devices often require read+write access even for write-only operations
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(device)?
+                    OpenOptions::new().read(true).write(true).open(device)?
                 } else {
                     // For regular files, use create/truncate
                     OpenOptions::new()
@@ -473,11 +470,18 @@ impl AsyncBlockWriter {
                         // On macOS, provide helpful hints for common errors
                         if e.raw_os_error() == Some(25) {
                             eprintln!("\n⚠️  Error 25 (Inappropriate ioctl) on macOS:");
-                            if device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk") {
-                                eprintln!("  You MUST use the raw device: {}", device.replace("/dev/disk", "/dev/rdisk"));
+                            if device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk")
+                            {
+                                eprintln!(
+                                    "  You MUST use the raw device: {}",
+                                    device.replace("/dev/disk", "/dev/rdisk")
+                                );
                                 eprintln!("  Buffered devices (/dev/diskN) cannot be used for raw disk writes.");
                             } else {
-                                eprintln!("  Try unmounting the disk: diskutil unmountDisk {}", device);
+                                eprintln!(
+                                    "  Try unmounting the disk: diskutil unmountDisk {}",
+                                    device
+                                );
                                 eprintln!("  Or ejecting it: diskutil eject {}", device);
                             }
                         }

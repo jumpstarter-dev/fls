@@ -159,7 +159,15 @@ pub async fn flash_from_url(
         };
 
         // Start or resume download
-        let response = match start_download(url, &client, resume_from, &options.headers, options.debug).await {
+        let response = match start_download(
+            url,
+            &client,
+            resume_from,
+            &options.headers,
+            options.debug,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // Check if this is a permanent error that shouldn't be retried

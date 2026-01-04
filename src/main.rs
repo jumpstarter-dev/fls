@@ -14,9 +14,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash a block device from a URL
+    /// Flash a block device from a URL (supports http://, https://, docker://, oci://)
     FromUrl {
-        /// URL to download the image from
+        /// URL to download the image from (http://, https://, docker://, oci://)
         url: String,
         /// Destination device path (e.g., /dev/sdb)
         device: String,
@@ -56,6 +56,15 @@ enum Commands {
         /// Show memory statistics in progress display
         #[arg(long)]
         show_memory: bool,
+        /// Registry username for OCI authentication (docker:// and oci:// URLs)
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+        /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
+        #[arg(short = 'p', long, env = "FLS_REGISTRY_PASSWORD")]
+        password: Option<String>,
+        /// Glob pattern to match disk image file inside OCI layer tar (e.g., "*.img.xz")
+        #[arg(long)]
+        file_pattern: Option<String>,
     },
 }
 
@@ -79,68 +88,132 @@ async fn main() {
             progress_interval,
             newline_progress,
             show_memory,
+            username,
+            password,
+            file_pattern,
         } => {
-            println!("Block flash command:");
-            println!("  URL: {}", url);
-            println!("  Device: {}", device);
-            if let Some(ref cert_path) = cacert {
-                println!("  CA Certificate: {}", cert_path.display());
-            }
-            println!("  Ignore certificates: {}", insecure_tls);
-            println!("  Buffer size: {} MB", buffer_size);
-            println!("  Write buffer size: {} MB", write_buffer_size);
-            println!("  Max retries: {}", max_retries);
-            println!("  Retry delay: {} seconds", retry_delay);
-            println!("  Debug: {}", debug);
-            println!("  O_DIRECT mode: {}", o_direct);
+            // Detect URL scheme to determine handler
+            let is_oci = url.starts_with("docker://") || url.starts_with("oci://");
 
-            // Parse headers in the format "Header: value"
-            let parsed_headers: Vec<(String, String)> = headers
-                .iter()
-                .filter_map(|h| {
-                    let parts: Vec<&str> = h.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
-                    } else {
-                        eprintln!("Warning: Ignoring invalid header format: {}", h);
-                        None
+            if is_oci {
+                // OCI image - strip scheme prefix
+                let image_ref = url
+                    .strip_prefix("docker://")
+                    .or_else(|| url.strip_prefix("oci://"))
+                    .unwrap();
+
+                println!("OCI flash command:");
+                println!("  Image: {}", image_ref);
+                println!("  Device: {}", device);
+                if username.is_some() {
+                    println!("  Auth: Using provided credentials");
+                } else {
+                    println!("  Auth: Anonymous");
+                }
+                if let Some(ref pattern) = file_pattern {
+                    println!("  File pattern: {}", pattern);
+                }
+                if let Some(ref cert_path) = cacert {
+                    println!("  CA Certificate: {}", cert_path.display());
+                }
+                println!("  Ignore certificates: {}", insecure_tls);
+                println!("  Buffer size: {} MB", buffer_size);
+                println!("  Write buffer size: {} MB", write_buffer_size);
+                println!("  Debug: {}", debug);
+                println!("  O_DIRECT mode: {}", o_direct);
+                println!();
+
+                let options = fls::OciOptions {
+                    username,
+                    password,
+                    insecure_tls,
+                    cacert,
+                    buffer_size_mb: buffer_size,
+                    write_buffer_size_mb: write_buffer_size,
+                    debug,
+                    o_direct,
+                    progress_interval_secs: progress_interval,
+                    newline_progress,
+                    show_memory,
+                    file_pattern,
+                    device: device.clone(),
+                };
+
+                match fls::flash_from_oci(image_ref, options).await {
+                    Ok(_) => {
+                        println!("Result: FLASH_COMPLETED");
+                        std::process::exit(0);
                     }
-                })
-                .collect();
-
-            if !parsed_headers.is_empty() {
-                println!("  Custom headers:");
-                for (name, value) in &parsed_headers {
-                    println!("    {}: {}", name, value);
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        println!("Result: FLASH_FAILED");
+                        std::process::exit(1);
+                    }
                 }
-            }
-            println!();
-
-            let options = fls::BlockFlashOptions {
-                insecure_tls,
-                cacert,
-                device: device.clone(),
-                buffer_size_mb: buffer_size,
-                write_buffer_size_mb: write_buffer_size,
-                max_retries,
-                retry_delay_secs: retry_delay,
-                debug,
-                o_direct,
-                headers: parsed_headers,
-                progress_interval_secs: progress_interval,
-                newline_progress,
-                show_memory,
-            };
-
-            match fls::flash_from_url(&url, options).await {
-                Ok(_) => {
-                    println!("Result: FLASH_COMPLETED");
-                    std::process::exit(0);
+            } else {
+                // HTTP/HTTPS URL
+                println!("Block flash command:");
+                println!("  URL: {}", url);
+                println!("  Device: {}", device);
+                if let Some(ref cert_path) = cacert {
+                    println!("  CA Certificate: {}", cert_path.display());
                 }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    println!("Result: FLASH_FAILED");
-                    std::process::exit(1);
+                println!("  Ignore certificates: {}", insecure_tls);
+                println!("  Buffer size: {} MB", buffer_size);
+                println!("  Write buffer size: {} MB", write_buffer_size);
+                println!("  Max retries: {}", max_retries);
+                println!("  Retry delay: {} seconds", retry_delay);
+                println!("  Debug: {}", debug);
+                println!("  O_DIRECT mode: {}", o_direct);
+
+                // Parse headers in the format "Header: value"
+                let parsed_headers: Vec<(String, String)> = headers
+                    .iter()
+                    .filter_map(|h| {
+                        let parts: Vec<&str> = h.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+                        } else {
+                            eprintln!("Warning: Ignoring invalid header format: {}", h);
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !parsed_headers.is_empty() {
+                    println!("  Custom headers:");
+                    for (name, value) in &parsed_headers {
+                        println!("    {}: {}", name, value);
+                    }
+                }
+                println!();
+
+                let options = fls::BlockFlashOptions {
+                    insecure_tls,
+                    cacert,
+                    device: device.clone(),
+                    buffer_size_mb: buffer_size,
+                    write_buffer_size_mb: write_buffer_size,
+                    max_retries,
+                    retry_delay_secs: retry_delay,
+                    debug,
+                    o_direct,
+                    headers: parsed_headers,
+                    progress_interval_secs: progress_interval,
+                    newline_progress,
+                    show_memory,
+                };
+
+                match fls::flash_from_url(&url, options).await {
+                    Ok(_) => {
+                        println!("Result: FLASH_COMPLETED");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        println!("Result: FLASH_FAILED");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

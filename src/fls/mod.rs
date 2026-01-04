@@ -4,13 +4,15 @@ mod decompress;
 mod download_error;
 mod error_handling;
 mod from_url;
-mod http;
+pub(crate) mod http;
 mod memory;
+pub mod oci;
 mod options;
 mod progress;
 
 // Public re-exports
 pub use from_url::flash_from_url;
+pub use oci::{flash_from_oci, OciOptions};
 pub use options::BlockFlashOptions;
 
 #[cfg(test)]
