@@ -26,13 +26,12 @@ enum ContentType {
     TarArchive,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum CompressionType {
     None,
     Gzip,
     Xz,
 }
-
 
 /// Flash a block device from an OCI image
 pub async fn flash_from_oci(
@@ -145,6 +144,21 @@ pub async fn flash_from_oci(
         .await;
     }
 
+    // Handle XZ-compressed tar archives - bypass tar extraction and pass directly to main pipeline
+    if compression_type == CompressionType::Xz {
+        if options.debug {
+            eprintln!("[DEBUG] XZ-compressed layer detected - bypassing tar extraction, passing directly to main pipeline");
+        }
+        return flash_raw_disk_image_directly(
+            content_detection_buffer,
+            stream,
+            compression_type,
+            options,
+            layer_size,
+        )
+        .await;
+    }
+
     // For tar archives, continue with the complex pipeline
     println!("Processing tar archive...");
 
@@ -182,8 +196,32 @@ pub async fn flash_from_oci(
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // We'll determine the right decompressor after content analysis
-    // Start with a placeholder - we'll replace it once we know what we have
-    let initial_decompressor_hint = options.file_pattern.as_deref().unwrap_or("disk.img.xz");
+    // Choose decompressor based on content type and compression detection
+    let initial_decompressor_hint = match (content_type, compression, compression_type) {
+        // If layer itself is compressed (either from manifest or content detection),
+        // we'll decompress it before tar extraction, so external decompressor should be "cat"
+        (ContentType::TarArchive, LayerCompression::Gzip | LayerCompression::Zstd, _) => {
+            if options.debug {
+                eprintln!(
+                    "[DEBUG] Layer is compressed (manifest), using 'cat' for extracted files"
+                );
+            }
+            "disk.img" // This will result in "cat"
+        }
+        (ContentType::TarArchive, LayerCompression::None, CompressionType::Gzip) => {
+            if options.debug {
+                eprintln!("[DEBUG] Layer is gzip compressed (content detection), using 'cat' for extracted files");
+            }
+            "disk.img" // This will result in "cat"
+        }
+        (ContentType::TarArchive, LayerCompression::None, CompressionType::Xz) => {
+            if options.debug {
+                eprintln!("[DEBUG] Layer is XZ compressed (content detection), using external 'xzcat' for the main pipeline");
+            }
+            "disk.img.xz" // This will result in "xzcat" in the main pipeline
+        }
+        _ => options.file_pattern.as_deref().unwrap_or("disk.img.xz"),
+    };
     let (mut decompressor, decompressor_name) =
         start_decompressor_process(initial_decompressor_hint).await?;
 
@@ -277,6 +315,7 @@ pub async fn flash_from_oci(
             tar_tx,
             file_pattern.as_deref(),
             compression,
+            compression_type,
             debug,
         )
     });
@@ -451,7 +490,6 @@ pub async fn flash_from_oci(
     Ok(())
 }
 
-
 /// Common implementation for tar stream extraction
 fn extract_tar_stream_impl<R: Read + Send>(
     reader: R,
@@ -468,12 +506,16 @@ fn extract_tar_stream_impl<R: Read + Send>(
     let mut magic_reader = MagicDetectingReader::new(buffered_reader);
 
     // Read first few bytes to detect compression
-    let mut magic_buf = [0u8; 3];
+    let mut magic_buf = [0u8; 4];
     magic_reader
         .peek_bytes(&mut magic_buf)
         .map_err(|e| format!("Failed to peek magic bytes: {}", e))?;
 
     let is_gzipped = magic_buf[0] == 0x1f && magic_buf[1] == 0x8b;
+    let is_xz = magic_buf[0] == 0xfd
+        && magic_buf[1] == 0x37
+        && magic_buf[2] == 0x7a
+        && magic_buf[3] == 0x58;
 
     let reader: Box<dyn Read + Send> = if is_gzipped {
         if debug {
@@ -486,6 +528,13 @@ fn extract_tar_stream_impl<R: Read + Send>(
             let gz_decoder = GzDecoder::new(magic_reader);
             Box::new(gz_decoder)
         }
+    } else if is_xz {
+        if debug {
+            eprintln!("[DEBUG] Auto-detected XZ compression from magic bytes - passing raw XZ data to main pipeline");
+        }
+        // Don't decompress XZ internally - let the main pipeline's external xzcat handle it
+        // Pass the raw XZ data through as-is
+        Box::new(magic_reader)
     } else {
         if debug {
             eprintln!("[DEBUG] No compression detected, treating as raw tar");
@@ -644,7 +693,6 @@ fn detect_content_type(data: &[u8], debug: bool) -> ContentType {
     ContentType::RawDiskImage
 }
 
-
 /// Check if a path matches a disk image
 fn is_disk_image(path: &Path, pattern: Option<&str>) -> bool {
     let name = path
@@ -684,6 +732,7 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         name == pattern
     }
 }
+
 
 /// Reader that pulls bytes from a tokio channel
 struct ChannelReader {
@@ -875,6 +924,7 @@ impl<R: Read> DebugGzReader<R> {
     }
 }
 
+
 impl<R: Read> Read for DebugGzReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self.inner.read(buf) {
@@ -925,6 +975,7 @@ impl<R: Read> Read for DebugGzReader<R> {
         }
     }
 }
+
 
 impl<R: Read> DebugReader<R> {
     fn new(inner: R) -> Self {
@@ -1086,7 +1137,10 @@ async fn flash_raw_disk_image_directly(
             Box::new(flate2::read::GzDecoder::new(data_cursor))
         }
         CompressionType::Xz => {
-            return Err("XZ-compressed raw disk images are not yet supported. Use tar archives with XZ compression.".into());
+            if options.debug {
+                eprintln!("[DEBUG] Applying XZ decompression");
+            }
+            Box::new(xz2::read::XzDecoder::new(data_cursor))
         }
     };
 
@@ -1168,14 +1222,50 @@ fn extract_tar_archive_from_stream(
     http_rx: mpsc::Receiver<bytes::Bytes>,
     tar_tx: mpsc::Sender<Vec<u8>>,
     file_pattern: Option<&str>,
-    _compression: LayerCompression,
+    compression: LayerCompression,
+    compression_type: CompressionType,
     debug: bool,
 ) -> Result<(), String> {
     let reader = ChannelReader::new(http_rx);
-    extract_tar_stream_impl(
-        reader,
-        tar_tx,
-        file_pattern,
-        debug,
-    )
+
+    // Handle layer compression before tar extraction
+    // Use both manifest compression and content-detected compression
+    let decompressed_reader: Box<dyn Read + Send> = match compression {
+        LayerCompression::Gzip => {
+            if debug {
+                eprintln!("[DEBUG] Layer is gzip compressed (manifest), decompressing before tar extraction");
+            }
+            Box::new(GzDecoder::new(reader))
+        }
+        LayerCompression::Zstd => {
+            return Err("Zstd layer compression is not supported yet".to_string());
+        }
+        LayerCompression::None => {
+            // When manifest says no compression, use content detection result
+            match compression_type {
+                CompressionType::Gzip => {
+                    if debug {
+                        eprintln!("[DEBUG] Content is gzip compressed (detected), decompressing before tar extraction");
+                    }
+                    Box::new(GzDecoder::new(reader))
+                }
+                CompressionType::Xz => {
+                    if debug {
+                        eprintln!("[DEBUG] Content is XZ compressed layer (detected), passing raw XZ data to main pipeline");
+                    }
+                    // Don't decompress XZ here - let the main pipeline's external xzcat handle it
+                    // Just pass the raw XZ data through
+                    Box::new(reader)
+                }
+                CompressionType::None => {
+                    if debug {
+                        eprintln!("[DEBUG] No compression detected, processing tar directly");
+                    }
+                    Box::new(reader)
+                }
+            }
+        }
+    };
+
+    extract_tar_stream_impl(decompressed_reader, tar_tx, file_pattern, debug)
 }
