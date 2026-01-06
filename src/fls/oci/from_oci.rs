@@ -195,33 +195,19 @@ pub async fn flash_from_oci(
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
-    // We'll determine the right decompressor after content analysis
     // Choose decompressor based on content type and compression detection
-    let initial_decompressor_hint = match (content_type, compression, compression_type) {
-        // If layer itself is compressed (either from manifest or content detection),
-        // we'll decompress it before tar extraction, so external decompressor should be "cat"
-        (ContentType::TarArchive, LayerCompression::Gzip | LayerCompression::Zstd, _) => {
-            if options.debug {
-                eprintln!(
-                    "[DEBUG] Layer is compressed (manifest), using 'cat' for extracted files"
-                );
-            }
-            "disk.img" // This will result in "cat"
-        }
-        (ContentType::TarArchive, LayerCompression::None, CompressionType::Gzip) => {
-            if options.debug {
-                eprintln!("[DEBUG] Layer is gzip compressed (content detection), using 'cat' for extracted files");
-            }
-            "disk.img" // This will result in "cat"
-        }
-        (ContentType::TarArchive, LayerCompression::None, CompressionType::Xz) => {
-            if options.debug {
-                eprintln!("[DEBUG] Layer is XZ compressed (content detection), using external 'xzcat' for the main pipeline");
-            }
-            "disk.img.xz" // This will result in "xzcat" in the main pipeline
-        }
-        _ => options.file_pattern.as_deref().unwrap_or("disk.img.xz"),
-    };
+    let initial_decompressor_hint = get_decompressor_hint(
+        content_type.clone(),
+        compression,
+        compression_type,
+        options.file_pattern.as_deref(),
+    );
+    if options.debug {
+        eprintln!(
+            "[DEBUG] Selected decompressor hint: '{}' (content={:?}, layer_compression={:?}, content_compression={:?})",
+            initial_decompressor_hint, content_type, compression, compression_type
+        );
+    }
     let (mut decompressor, decompressor_name) =
         start_decompressor_process(initial_decompressor_hint).await?;
 
@@ -503,7 +489,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
     // Create a reader that auto-detects compression from magic bytes
     // Add substantial buffering for streaming gzip decompression
     let buffered_reader = std::io::BufReader::with_capacity(1024 * 1024, reader); // 1MB buffer
-    let mut magic_reader = MagicDetectingReader::new(buffered_reader);
+    let mut magic_reader = MagicDetectingReader::new(buffered_reader, debug);
 
     // Read first few bytes to detect compression
     let mut magic_buf = [0u8; 4];
@@ -523,7 +509,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
             // Save first 1MB of raw gzip data for debugging
             let tee_reader = TeeReader::new(magic_reader, "/tmp/debug_gzip_data.gz", 1024 * 1024);
             let gz_decoder = GzDecoder::new(tee_reader);
-            Box::new(DebugGzReader::new(gz_decoder))
+            Box::new(DebugGzReader::new(gz_decoder, debug))
         } else {
             let gz_decoder = GzDecoder::new(magic_reader);
             Box::new(gz_decoder)
@@ -544,7 +530,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
 
     // Wrap with debug reader if debug mode
     let reader: Box<dyn Read + Send> = if debug {
-        Box::new(DebugReader::new(reader))
+        Box::new(DebugReader::new(reader, debug))
     } else {
         reader
     };
@@ -595,6 +581,34 @@ fn extract_tar_stream_impl<R: Read + Send>(
     }
 
     Err("No disk image found in tar archive".to_string())
+}
+
+/// Determine the appropriate decompressor hint based on content and compression types.
+///
+/// Returns a file pattern string that `start_decompressor_process` uses to select
+/// the appropriate decompressor command (e.g., "disk.img" → cat, "disk.img.xz" → xzcat).
+fn get_decompressor_hint(
+    content_type: ContentType,
+    layer_compression: LayerCompression,
+    content_compression: CompressionType,
+    file_pattern: Option<&str>,
+) -> &'static str {
+    match (content_type, layer_compression, content_compression) {
+        // Layer is compressed per manifest (gzip/zstd) - we decompress before tar extraction,
+        // so external decompressor for extracted files should be "cat"
+        (ContentType::TarArchive, LayerCompression::Gzip | LayerCompression::Zstd, _) => "disk.img",
+        // Layer is uncompressed per manifest but content detection found gzip
+        (ContentType::TarArchive, LayerCompression::None, CompressionType::Gzip) => "disk.img",
+        // Layer is uncompressed per manifest but content detection found XZ
+        (ContentType::TarArchive, LayerCompression::None, CompressionType::Xz) => "disk.img.xz",
+        // Default: use file pattern or assume XZ compressed disk image
+        _ => match file_pattern {
+            Some(p) if p.ends_with(".xz") => "disk.img.xz",
+            Some(p) if p.ends_with(".gz") => "disk.img.gz",
+            Some(_) => "disk.img",
+            None => "disk.img.xz",
+        },
+    }
 }
 
 /// Detect content and compression type from pre-buffered data
@@ -733,7 +747,6 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
     }
 }
 
-
 /// Reader that pulls bytes from a tokio channel
 struct ChannelReader {
     rx: mpsc::Receiver<bytes::Bytes>,
@@ -746,37 +759,43 @@ struct MagicDetectingReader<R: Read> {
     inner: R,
     peeked: Vec<u8>,
     peek_pos: usize,
+    debug: bool,
 }
 
 impl<R: Read> MagicDetectingReader<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, debug: bool) -> Self {
         Self {
             inner,
             peeked: Vec::new(),
             peek_pos: 0,
+            debug,
         }
     }
 
     fn peek_bytes(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        eprintln!(
-            "[DEBUG] MagicDetectingReader::peek_bytes called for {} bytes",
-            buf.len()
-        );
-        eprintln!(
-            "[DEBUG]   Current peeked.len(): {}, peek_pos: {}",
-            self.peeked.len(),
-            self.peek_pos
-        );
+        if self.debug {
+            eprintln!(
+                "[DEBUG] MagicDetectingReader::peek_bytes called for {} bytes",
+                buf.len()
+            );
+            eprintln!(
+                "[DEBUG]   Current peeked.len(): {}, peek_pos: {}",
+                self.peeked.len(),
+                self.peek_pos
+            );
+        }
 
         // Read enough bytes to fill the peek buffer
         while self.peeked.len() < buf.len() {
             let mut temp_buf = [0u8; 1024];
             let n = self.inner.read(&mut temp_buf)?;
-            eprintln!("[DEBUG]   Read {} bytes from inner reader", n);
+            if self.debug {
+                eprintln!("[DEBUG]   Read {} bytes from inner reader", n);
+            }
             if n == 0 {
                 break; // EOF
             }
-            if n > 0 {
+            if n > 0 && self.debug {
                 eprintln!(
                     "[DEBUG]   First 8 bytes read: {:02x?}",
                     &temp_buf[..n.min(8)]
@@ -788,30 +807,34 @@ impl<R: Read> MagicDetectingReader<R> {
         // Copy the requested bytes
         let to_copy = buf.len().min(self.peeked.len());
         buf[..to_copy].copy_from_slice(&self.peeked[..to_copy]);
-        eprintln!(
-            "[DEBUG]   Copying {} bytes to peek buffer: {:02x?}",
-            to_copy,
-            &self.peeked[..to_copy]
-        );
-        eprintln!(
-            "[DEBUG]   Total peeked buffer now: {} bytes",
-            self.peeked.len()
-        );
+        if self.debug {
+            eprintln!(
+                "[DEBUG]   Copying {} bytes to peek buffer: {:02x?}",
+                to_copy,
+                &self.peeked[..to_copy]
+            );
+            eprintln!(
+                "[DEBUG]   Total peeked buffer now: {} bytes",
+                self.peeked.len()
+            );
+        }
         Ok(())
     }
 }
 
 impl<R: Read> Read for MagicDetectingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        eprintln!(
-            "[DEBUG] MagicDetectingReader::read called for {} bytes",
-            buf.len()
-        );
-        eprintln!(
-            "[DEBUG]   peek_pos: {}, peeked.len(): {}",
-            self.peek_pos,
-            self.peeked.len()
-        );
+        if self.debug {
+            eprintln!(
+                "[DEBUG] MagicDetectingReader::read called for {} bytes",
+                buf.len()
+            );
+            eprintln!(
+                "[DEBUG]   peek_pos: {}, peeked.len(): {}",
+                self.peek_pos,
+                self.peeked.len()
+            );
+        }
 
         // First, drain any peeked bytes
         if self.peek_pos < self.peeked.len() {
@@ -819,24 +842,28 @@ impl<R: Read> Read for MagicDetectingReader<R> {
             let to_copy = buf.len().min(available);
             buf[..to_copy].copy_from_slice(&self.peeked[self.peek_pos..self.peek_pos + to_copy]);
             self.peek_pos += to_copy;
-            eprintln!(
-                "[DEBUG]   Returning {} peeked bytes: {:02x?}",
-                to_copy,
-                &buf[..to_copy.min(8)]
-            );
+            if self.debug {
+                eprintln!(
+                    "[DEBUG]   Returning {} peeked bytes: {:02x?}",
+                    to_copy,
+                    &buf[..to_copy.min(8)]
+                );
+            }
             return Ok(to_copy);
         }
 
         // No more peeked data, read directly from inner
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            eprintln!(
-                "[DEBUG]   Read {} bytes directly from inner: {:02x?}",
-                n,
-                &buf[..n.min(8)]
-            );
-        } else {
-            eprintln!("[DEBUG]   EOF from inner reader");
+        if self.debug {
+            if n > 0 {
+                eprintln!(
+                    "[DEBUG]   Read {} bytes directly from inner: {:02x?}",
+                    n,
+                    &buf[..n.min(8)]
+                );
+            } else {
+                eprintln!("[DEBUG]   EOF from inner reader");
+            }
         }
         Ok(n)
     }
@@ -846,6 +873,7 @@ impl<R: Read> Read for MagicDetectingReader<R> {
 struct DebugReader<R: Read> {
     inner: R,
     logged_first: bool,
+    debug: bool,
 }
 
 /// Reader that saves data to file while passing it through (for debugging)
@@ -911,36 +939,43 @@ struct DebugGzReader<R: Read> {
     inner: R,
     bytes_read: u64,
     last_log: u64,
+    debug: bool,
 }
 
 impl<R: Read> DebugGzReader<R> {
-    fn new(inner: R) -> Self {
-        eprintln!("[DEBUG] DebugGzReader created");
+    fn new(inner: R, debug: bool) -> Self {
+        if debug {
+            eprintln!("[DEBUG] DebugGzReader created");
+        }
         Self {
             inner,
             bytes_read: 0,
             last_log: 0,
+            debug,
         }
     }
 }
-
 
 impl<R: Read> Read for DebugGzReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self.inner.read(buf) {
             Ok(n) => {
                 if n == 0 {
-                    eprintln!(
-                        "[DEBUG] DebugGzReader: EOF reached after {} bytes",
-                        self.bytes_read
-                    );
+                    if self.debug {
+                        eprintln!(
+                            "[DEBUG] DebugGzReader: EOF reached after {} bytes",
+                            self.bytes_read
+                        );
+                    }
                     return Ok(0);
                 }
 
                 self.bytes_read += n as u64;
 
                 // Log every 10MB or first read
-                if self.bytes_read - self.last_log >= 10 * 1024 * 1024 || self.last_log == 0 {
+                if self.debug
+                    && (self.bytes_read - self.last_log >= 10 * 1024 * 1024 || self.last_log == 0)
+                {
                     eprintln!(
                         "[DEBUG] DebugGzReader: Read {} bytes (total: {} MB)",
                         n,
@@ -966,43 +1001,49 @@ impl<R: Read> Read for DebugGzReader<R> {
                 Ok(n)
             }
             Err(e) => {
-                eprintln!(
-                    "[DEBUG] DebugGzReader: ERROR during read: {} (after {} bytes)",
-                    e, self.bytes_read
-                );
+                if self.debug {
+                    eprintln!(
+                        "[DEBUG] DebugGzReader: ERROR during read: {} (after {} bytes)",
+                        e, self.bytes_read
+                    );
+                }
                 Err(e)
             }
         }
     }
 }
 
-
 impl<R: Read> DebugReader<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, debug: bool) -> Self {
         Self {
             inner,
             logged_first: false,
+            debug,
         }
     }
 }
 
 impl<R: Read> Read for DebugReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        eprintln!("[DEBUG] DebugReader::read called for {} bytes", buf.len());
+        if self.debug {
+            eprintln!("[DEBUG] DebugReader::read called for {} bytes", buf.len());
+        }
         let n = self.inner.read(buf)?;
-        eprintln!("[DEBUG] DebugReader got {} bytes from inner", n);
+        if self.debug {
+            eprintln!("[DEBUG] DebugReader got {} bytes from inner", n);
 
-        if !self.logged_first && n > 0 {
-            eprintln!(
-                "[DEBUG] First 16 bytes after decompression: {:02x?}",
-                &buf[..n.min(16)]
-            );
-            self.logged_first = true;
-        } else if n > 0 {
-            eprintln!(
-                "[DEBUG] Subsequent read: first 8 bytes: {:02x?}",
-                &buf[..n.min(8)]
-            );
+            if !self.logged_first && n > 0 {
+                eprintln!(
+                    "[DEBUG] First 16 bytes after decompression: {:02x?}",
+                    &buf[..n.min(16)]
+                );
+                self.logged_first = true;
+            } else if n > 0 {
+                eprintln!(
+                    "[DEBUG] Subsequent read: first 8 bytes: {:02x?}",
+                    &buf[..n.min(8)]
+                );
+            }
         }
 
         Ok(n)
@@ -1030,14 +1071,17 @@ impl Read for ChannelReader {
                     buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
                     self.offset += to_copy;
 
-                    // Debug: print first few bytes
-                    static FIRST_READ: std::sync::Once = std::sync::Once::new();
-                    FIRST_READ.call_once(|| {
-                        eprintln!(
-                            "[DEBUG] First 16 bytes from layer: {:02x?}",
-                            &buf[..to_copy.min(16)]
-                        );
-                    });
+                    // Debug: print first few bytes (only in debug builds)
+                    #[cfg(debug_assertions)]
+                    {
+                        static FIRST_READ: std::sync::Once = std::sync::Once::new();
+                        FIRST_READ.call_once(|| {
+                            eprintln!(
+                                "[DEBUG] First 16 bytes from layer: {:02x?}",
+                                &buf[..to_copy.min(16)]
+                            );
+                        });
+                    }
 
                     return Ok(to_copy);
                 }
@@ -1090,22 +1134,232 @@ async fn flash_raw_disk_image_directly(
         options.write_buffer_size_mb,
     )?;
 
-    // Download all remaining data first (simpler than complex async-to-sync bridging)
-    let mut all_data = initial_buffer;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-            Ok(Some(Ok(chunk))) => {
-                progress.bytes_received += chunk.len() as u64;
-                all_data.extend_from_slice(&chunk);
+    // Set up streaming pipeline using channels
+    let buffer_size_mb = options.buffer_size_mb;
+    let buffer_capacity = ((buffer_size_mb * 1024) / 16).max(1000); // 16KB average chunk size
 
-                // Update progress periodically during download
-                if let Err(e) = progress.update_progress(Some(layer_size), update_interval, false) {
-                    eprintln!();
-                    return Err(e);
+    let (http_tx, http_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
+
+    // For gzip and none, we can decompress in-process and write directly to block writer
+    // For XZ, we need the external xzcat process
+    let needs_external_decompressor = compression_type == CompressionType::Xz;
+
+    if options.debug {
+        eprintln!(
+            "[DEBUG] Compression type: {:?}, using external decompressor: {}",
+            compression_type, needs_external_decompressor
+        );
+    }
+
+    // Spawn the processing pipeline based on compression type
+    let writer_handle = if needs_external_decompressor {
+        // XZ: Use external xzcat process
+        let (mut decompressor, decompressor_name) =
+            start_decompressor_process("disk.img.xz").await?;
+
+        let decompressor_stdin = decompressor.stdin.take().unwrap();
+        let decompressor_stdout = decompressor.stdout.take().unwrap();
+        let decompressor_stderr = decompressor.stderr.take().unwrap();
+
+        let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
+
+        // Spawn stderr reader
+        tokio::spawn(spawn_stderr_reader(
+            decompressor_stderr,
+            error_tx.clone(),
+            decompressor_name,
+        ));
+
+        // Spawn error processor
+        tokio::spawn(process_error_messages(error_rx));
+
+        // Spawn blocking task: read from channel and write to xzcat stdin
+        // First, create a sync file handle from the async stdin
+        #[cfg(unix)]
+        let stdin_fd = {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let raw_fd = decompressor_stdin.as_raw_fd();
+            // Duplicate the fd so we can use it in blocking context
+            let dup_fd = unsafe { libc::dup(raw_fd) };
+            if dup_fd == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: dup_fd is a valid file descriptor (we checked above)
+            unsafe { std::fs::File::from_raw_fd(dup_fd) }
+        };
+        #[cfg(not(unix))]
+        let stdin_fd: std::fs::File = {
+            return Err("XZ streaming decompression is not supported on non-unix platforms".into());
+        };
+
+        // Drop the original async stdin (the dup'd fd still points to the pipe)
+        drop(decompressor_stdin);
+
+        let stdin_writer_handle = {
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write as _;
+                let reader = ChannelReader::new(http_rx);
+                let mut reader = reader;
+                let mut stdin = stdin_fd;
+                let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if let Err(e) = stdin.write_all(&buffer[..n]) {
+                                return Err(format!("Error writing to xzcat: {}", e));
+                            }
+                        }
+                        Err(e) => return Err(format!("Error reading stream: {}", e)),
+                    }
+                }
+
+                drop(stdin);
+                Ok::<(), String>(())
+            })
+        };
+
+        // Spawn task: xzcat stdout -> block writer
+        let writer = block_writer;
+        let progress_tx = decompressed_progress_tx;
+        tokio::spawn(async move {
+            let mut stdout = decompressor_stdout;
+            let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
+
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let data = buffer[..n].to_vec();
+                        let _ = progress_tx.send(n as u64);
+                        writer.write(data).await?
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            Ok(Some(Err(e))) => {
-                return Err(format!("Download error: {}", e).into());
+
+            // Wait for stdin writer to finish
+            let _ = stdin_writer_handle.await;
+
+            // Wait for decompressor to finish
+            let _ = decompressor.wait().await;
+
+            writer.close().await
+        })
+    } else {
+        // Gzip or None: decompress in-process and write directly to block writer
+        let writer = block_writer;
+        let progress_tx = decompressed_progress_tx;
+        let debug = options.debug;
+
+        // Create an async channel for decompressed data
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
+
+        // Capture the runtime handle before entering the blocking task
+        let rt = tokio::runtime::Handle::current();
+
+        // Spawn blocking task: read, decompress, send to async channel
+        let reader_handle = tokio::task::spawn_blocking(move || {
+            let reader = ChannelReader::new(http_rx);
+
+            // Apply in-process gzip decompression if needed
+            let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
+                CompressionType::Gzip => {
+                    if debug {
+                        eprintln!("[DEBUG] Applying in-process gzip decompression");
+                    }
+                    Box::new(flate2::read::GzDecoder::new(reader))
+                }
+                _ => Box::new(reader),
+            };
+
+            let mut reader = processed_reader;
+            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        // Send to async channel using block_on
+                        if rt.block_on(data_tx.send(buffer[..n].to_vec())).is_err() {
+                            return Err("Data channel closed".to_string());
+                        }
+                    }
+                    Err(e) => return Err(format!("Error reading/decompressing: {}", e)),
+                }
+            }
+
+            Ok::<(), String>(())
+        });
+
+        // Spawn async task: receive from channel and write to block writer
+        tokio::spawn(async move {
+            while let Some(data) = data_rx.recv().await {
+                let len = data.len() as u64;
+                let _ = progress_tx.send(len);
+                writer.write(data).await?
+            }
+
+            let _ = reader_handle.await;
+            writer.close().await
+        })
+    };
+
+    // Send the already-downloaded detection buffer first
+    if http_tx
+        .send(bytes::Bytes::from(initial_buffer))
+        .await
+        .is_err()
+    {
+        return Err("Failed to send detection buffer to streaming pipeline".into());
+    }
+
+    // Main download loop - stream chunks to processing pipeline
+    let mut chunk_count = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(chunk_result)) => {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let chunk_len = chunk.len() as u64;
+                        progress.bytes_received += chunk_len;
+                        chunk_count += 1;
+
+                        if options.debug && chunk_count <= 5 {
+                            eprintln!(
+                                "[DEBUG] Received chunk {}: {} bytes (total: {} MB)",
+                                chunk_count,
+                                chunk_len,
+                                progress.bytes_received / (1024 * 1024)
+                            );
+                        }
+
+                        if http_tx.send(chunk).await.is_err() {
+                            eprintln!("\nStreaming pipeline closed");
+                            break;
+                        }
+
+                        // Update progress
+                        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+                            progress.bytes_decompressed += byte_count;
+                        }
+                        while let Ok(written_bytes) = raw_written_progress_rx.try_recv() {
+                            progress.bytes_written = written_bytes;
+                        }
+
+                        if let Err(e) =
+                            progress.update_progress(Some(layer_size), update_interval, false)
+                        {
+                            eprintln!();
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("Download error: {}", e).into());
+                    }
+                }
             }
             Ok(None) => {
                 // Stream ended
@@ -1117,71 +1371,30 @@ async fn flash_raw_disk_image_directly(
         }
     }
 
+    // Close HTTP channel to signal download complete
+    drop(http_tx);
+
     if options.debug {
         eprintln!(
-            "[DEBUG] Downloaded {} MB total",
-            all_data.len() / (1024 * 1024)
+            "[DEBUG] Download completed, {} bytes received",
+            progress.bytes_received
         );
     }
 
-    // Create appropriate reader based on compression
-    let data_cursor = std::io::Cursor::new(all_data);
-
-    // Apply decompression if needed
-    let reader: Box<dyn std::io::Read + Send> = match compression_type {
-        CompressionType::None => Box::new(data_cursor),
-        CompressionType::Gzip => {
-            if options.debug {
-                eprintln!("[DEBUG] Applying gzip decompression");
-            }
-            Box::new(flate2::read::GzDecoder::new(data_cursor))
-        }
-        CompressionType::Xz => {
-            if options.debug {
-                eprintln!("[DEBUG] Applying XZ decompression");
-            }
-            Box::new(xz2::read::XzDecoder::new(data_cursor))
-        }
-    };
-
-    // Stream data directly to block writer in a background task
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let mut reader = reader;
-        let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB chunks
-
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if let Err(e) = rt.block_on(block_writer.write(buffer[..n].to_vec())) {
-                        return Err(format!("Write error: {}", e));
-                    }
-                }
-                Err(e) => return Err(format!("Read error: {}", e)),
-            }
-        }
-
-        // Close and return final byte count
-        rt.block_on(block_writer.close())
-            .map_err(|e| format!("Close error: {}", e))
-    });
-
-    // Wait for writer to complete
+    // Wait for the processing pipeline to complete
     loop {
-        // Update written bytes
+        // Update progress from decompression and writes
+        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+            progress.bytes_decompressed += byte_count;
+        }
         while let Ok(written_bytes) = raw_written_progress_rx.try_recv() {
             progress.bytes_written = written_bytes;
-            progress.bytes_decompressed = written_bytes;
         }
-
-        // Update progress
         let _ = progress.update_progress(Some(layer_size), update_interval, false);
 
         if writer_handle.is_finished() {
             break;
         }
-
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -1205,6 +1418,12 @@ async fn flash_raw_disk_image_directly(
         stats.mb_received,
         stats.download_time_formatted(),
         stats.download_rate
+    );
+    println!(
+        "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
+        stats.mb_decompressed,
+        stats.decompress_time_formatted(),
+        stats.decompress_rate
     );
     println!(
         "Write complete: {:.2} MB in {} ({:.2} MB/s)",

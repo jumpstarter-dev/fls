@@ -62,9 +62,7 @@ impl ImageReference {
         // Split by @ for digest references
         let (name_part, reference) = if let Some(at_pos) = input.rfind('@') {
             let digest = &input[at_pos + 1..];
-            if !digest.starts_with("sha256:") && !digest.starts_with("sha512:") {
-                return Err(format!("Invalid digest format: {}", digest));
-            }
+            validate_digest(digest)?;
             (&input[..at_pos], Reference::Digest(digest.to_string()))
         } else {
             // Split by : for tag, but be careful about registry port
@@ -106,6 +104,72 @@ impl ImageReference {
     }
 }
 
+/// Validate digest format according to OCI spec
+/// Digests must be in format `algorithm:hex` where:
+/// - sha256 requires exactly 64 hex characters
+/// - sha512 requires exactly 128 hex characters
+fn validate_digest(digest: &str) -> Result<(), String> {
+    let (algorithm, hash) = digest
+        .split_once(':')
+        .ok_or_else(|| format!("Invalid digest format (missing ':'): {}", digest))?;
+
+    let expected_len = match algorithm {
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => {
+            return Err(format!(
+                "Unsupported digest algorithm '{}' (expected sha256 or sha512)",
+                algorithm
+            ))
+        }
+    };
+
+    if hash.len() != expected_len {
+        return Err(format!(
+            "Invalid {} digest: expected {} hex characters, got {}",
+            algorithm,
+            expected_len,
+            hash.len()
+        ));
+    }
+
+    // Validate hex characters (lowercase per OCI spec)
+    if !hash
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "Invalid {} digest: must contain only lowercase hex characters (0-9, a-f)",
+            algorithm
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check if a string looks like a hostname (contains dot, is localhost, or is IP literal)
+fn looks_like_hostname(authority: &str) -> bool {
+    // Contains a dot (e.g., registry.example.com)
+    if authority.contains('.') {
+        return true;
+    }
+
+    // Is localhost
+    if authority == "localhost" {
+        return true;
+    }
+
+    // Is an IPv6 literal (starts with '[')
+    if authority.starts_with('[') {
+        return true;
+    }
+
+    // Could add IPv4 detection here if needed, but most practical
+    // IPv4 addresses would contain dots anyway
+
+    false
+}
+
 /// Split image name and tag, handling registry ports correctly
 fn split_name_and_tag(input: &str) -> Result<(&str, Option<&str>), String> {
     // Find the last colon
@@ -126,10 +190,14 @@ fn split_name_and_tag(input: &str) -> Result<(&str, Option<&str>), String> {
         }
 
         // Could be either "registry:port" or "image:tag"
-        // If after_colon is all digits and short, treat as port
+        // Only treat all-digit short suffix as port if authority looks like a host
         if after_colon.len() <= 5 && after_colon.chars().all(|c| c.is_ascii_digit()) {
-            // Likely a port number, no tag
-            return Ok((input, None));
+            // Check if the portion before colon looks like a hostname
+            // (contains a dot, is "localhost", or is an IP literal)
+            if looks_like_hostname(before_colon) {
+                // Likely a port number, no tag
+                return Ok((input, None));
+            }
         }
 
         Ok((before_colon, Some(after_colon)))
@@ -203,15 +271,70 @@ mod tests {
 
     #[test]
     fn test_parse_digest() {
-        let r = ImageReference::parse("ghcr.io/org/repo@sha256:abc123").unwrap();
+        let r = ImageReference::parse(
+            "ghcr.io/org/repo@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
         assert_eq!(r.registry, "ghcr.io");
         assert_eq!(r.repository, "org/repo");
-        assert!(matches!(r.reference, Reference::Digest(d) if d == "sha256:abc123"));
+        assert!(matches!(r.reference, Reference::Digest(d) if d.starts_with("sha256:")));
     }
 
     #[test]
     fn test_parse_default_tag() {
         let r = ImageReference::parse("ghcr.io/org/repo").unwrap();
         assert!(matches!(r.reference, Reference::Tag(t) if t == "latest"));
+    }
+
+    #[test]
+    fn test_parse_numeric_tag() {
+        // Test that "myrepo:12345" yields tag "12345" (not treated as port)
+        let r = ImageReference::parse("myrepo:12345").unwrap();
+        assert_eq!(r.registry, "docker.io");
+        assert_eq!(r.repository, "library/myrepo");
+        assert!(matches!(r.reference, Reference::Tag(t) if t == "12345"));
+    }
+
+    #[test]
+    fn test_parse_registry_port_no_tag() {
+        // Test that "registry:5000/repo" yields no tag (port number)
+        let r = ImageReference::parse("registry:5000/repo").unwrap();
+        assert_eq!(r.registry, "registry:5000");
+        assert_eq!(r.repository, "repo");
+        assert!(matches!(r.reference, Reference::Tag(t) if t == "latest")); // should default to latest
+    }
+
+    #[test]
+    fn test_valid_sha256_digest() {
+        let r = ImageReference::parse(
+            "ghcr.io/org/repo@sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4",
+        )
+        .unwrap();
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.repository, "org/repo");
+        assert!(matches!(r.reference, Reference::Digest(d) if d.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn test_invalid_digest_too_short() {
+        let result = ImageReference::parse("ghcr.io/org/repo@sha256:abc123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 64 hex characters"));
+    }
+
+    #[test]
+    fn test_invalid_digest_uppercase() {
+        let result = ImageReference::parse(
+            "ghcr.io/org/repo@sha256:A3ED95CAEB02FFE68CDD9FD84406680AE93D633CB16422D00E8A7C22955B46D4",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("lowercase hex"));
+    }
+
+    #[test]
+    fn test_invalid_digest_algorithm() {
+        let result = ImageReference::parse("ghcr.io/org/repo@md5:d41d8cd98f00b204e9800998ecf8427e");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported digest algorithm"));
     }
 }
