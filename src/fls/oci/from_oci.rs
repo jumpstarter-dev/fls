@@ -184,6 +184,9 @@ pub async fn flash_from_oci(
     let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
+    // Channel for tracking bytes actually written to decompressor (for progress bar)
+    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
+        mpsc::unbounded_channel::<u64>();
 
     // Choose decompressor based on content type and compression detection
     let initial_decompressor_hint = get_decompressor_hint(
@@ -264,9 +267,12 @@ pub async fn flash_from_oci(
     // Spawn task: tar channel -> decompressor stdin
     let decompressor_writer_handle = tokio::spawn(async move {
         while let Some(chunk) = tar_rx.recv().await {
+            let chunk_len = chunk.len() as u64;
             if let Err(e) = decompressor_stdin.write_all(&chunk).await {
                 return Err(format!("Error writing to decompressor: {}", e));
             }
+            // Notify that bytes were written to decompressor (for progress bar)
+            let _ = decompressor_written_progress_tx.send(chunk_len);
         }
         // Close stdin to signal EOF
         drop(decompressor_stdin);
@@ -341,6 +347,10 @@ pub async fn flash_from_oci(
                         // Update progress
                         while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
                             progress.bytes_decompressed += byte_count;
+                        }
+                        // Track bytes actually written to decompressor (for progress bar)
+                        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+                            progress.bytes_sent_to_decompressor += written_len;
                         }
                         while let Ok(written_bytes) = written_progress_rx.try_recv() {
                             progress.bytes_written = written_bytes;
@@ -1176,6 +1186,9 @@ async fn flash_raw_disk_image_directly(
                         while let Ok(written_bytes) = raw_written_progress_rx.try_recv() {
                             progress.bytes_written = written_bytes;
                         }
+                        // For raw disk images, bytes_sent_to_decompressor tracks bytes_received
+                        // since data is immediately forwarded to the decompression pipeline
+                        progress.bytes_sent_to_decompressor = progress.bytes_received;
 
                         if let Err(e) =
                             progress.update_progress(Some(layer_size), update_interval, false)
