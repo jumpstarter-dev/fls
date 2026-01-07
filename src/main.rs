@@ -14,9 +14,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash a block device from a URL (supports http://, https://, docker://, oci://)
+    /// Flash a block device from a URL (supports http://, https://, oci://)
     FromUrl {
-        /// URL to download the image from (http://, https://, docker://, oci://)
+        /// URL to download the image from (http://, https://, oci://)
         url: String,
         /// Destination device path (e.g., /dev/sdb)
         device: String,
@@ -56,7 +56,7 @@ enum Commands {
         /// Show memory statistics in progress display
         #[arg(long)]
         show_memory: bool,
-        /// Registry username for OCI authentication (docker:// and oci:// URLs)
+        /// Registry username for OCI authentication
         #[arg(short = 'u', long)]
         username: Option<String>,
         /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
@@ -93,7 +93,7 @@ async fn main() {
             file_pattern,
         } => {
             // Detect URL scheme to determine handler
-            let is_oci = url.starts_with("docker://") || url.starts_with("oci://");
+            let is_oci = url.starts_with("oci://");
 
             if debug {
                 eprintln!("[DEBUG] URL: '{}', is_oci: {}", url, is_oci);
@@ -101,10 +101,7 @@ async fn main() {
 
             if is_oci {
                 // OCI image - strip scheme prefix
-                let image_ref = url
-                    .strip_prefix("docker://")
-                    .or_else(|| url.strip_prefix("oci://"))
-                    .unwrap();
+                let image_ref = url.strip_prefix("oci://").unwrap();
 
                 println!("OCI flash command:");
                 println!("  Image: {}", image_ref);
@@ -128,19 +125,21 @@ async fn main() {
                 println!();
 
                 let options = fls::OciOptions {
+                    common: fls::FlashOptions {
+                        insecure_tls,
+                        cacert,
+                        device: device.clone(),
+                        buffer_size_mb: buffer_size,
+                        write_buffer_size_mb: write_buffer_size,
+                        debug,
+                        o_direct,
+                        progress_interval_secs: progress_interval,
+                        newline_progress,
+                        show_memory,
+                    },
                     username,
                     password,
-                    insecure_tls,
-                    cacert,
-                    buffer_size_mb: buffer_size,
-                    write_buffer_size_mb: write_buffer_size,
-                    debug,
-                    o_direct,
-                    progress_interval_secs: progress_interval,
-                    newline_progress,
-                    show_memory,
                     file_pattern,
-                    device: device.clone(),
                 };
 
                 match fls::flash_from_oci(image_ref, options).await {
@@ -176,7 +175,18 @@ async fn main() {
                     .filter_map(|h| {
                         let parts: Vec<&str> = h.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+                            let header_name = parts[0].trim().to_string();
+                            let header_value = parts[1].trim().to_string();
+
+                            if header_name.is_empty() {
+                                eprintln!("Warning: Ignoring header with empty name: {}", h);
+                                None
+                            } else if header_value.is_empty() {
+                                eprintln!("Warning: Header '{}' has empty value", header_name);
+                                Some((header_name, header_value))
+                            } else {
+                                Some((header_name, header_value))
+                            }
                         } else {
                             eprintln!("Warning: Ignoring invalid header format: {}", h);
                             None
@@ -193,19 +203,21 @@ async fn main() {
                 println!();
 
                 let options = fls::BlockFlashOptions {
-                    insecure_tls,
-                    cacert,
-                    device: device.clone(),
-                    buffer_size_mb: buffer_size,
-                    write_buffer_size_mb: write_buffer_size,
+                    common: fls::FlashOptions {
+                        insecure_tls,
+                        cacert,
+                        device: device.clone(),
+                        buffer_size_mb: buffer_size,
+                        write_buffer_size_mb: write_buffer_size,
+                        debug,
+                        o_direct,
+                        progress_interval_secs: progress_interval,
+                        newline_progress,
+                        show_memory,
+                    },
                     max_retries,
                     retry_delay_secs: retry_delay,
-                    debug,
-                    o_direct,
                     headers: parsed_headers,
-                    progress_interval_secs: progress_interval,
-                    newline_progress,
-                    show_memory,
                 };
 
                 match fls::flash_from_url(&url, options).await {

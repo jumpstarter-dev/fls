@@ -13,25 +13,15 @@ use tokio::sync::mpsc;
 
 use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
-use super::registry::{OciOptions, RegistryClient};
+use super::registry::RegistryClient;
 use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
+use crate::fls::magic_bytes::{detect_content_and_compression, ContentType};
+use crate::fls::options::OciOptions;
 use crate::fls::progress::ProgressTracker;
-
-/// Content and compression detection
-#[derive(Debug, Clone, PartialEq)]
-enum ContentType {
-    RawDiskImage,
-    TarArchive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CompressionType {
-    None,
-    Gzip,
-    Xz,
-}
+use crate::fls::stream_utils::ChannelReader;
 
 /// Flash a block device from an OCI image
 pub async fn flash_from_oci(
@@ -123,9 +113,9 @@ pub async fn flash_from_oci(
 
     // Detect content and compression type
     let (content_type, compression_type) =
-        detect_content_and_compression(&content_detection_buffer, options.debug)?;
+        detect_content_and_compression(&content_detection_buffer, options.common.debug)?;
 
-    if options.debug {
+    if options.common.debug {
         eprintln!(
             "[DEBUG] Detected content: {:?}, compression: {:?}",
             content_type, compression_type
@@ -145,8 +135,8 @@ pub async fn flash_from_oci(
     }
 
     // Handle XZ-compressed tar archives - bypass tar extraction and pass directly to main pipeline
-    if compression_type == CompressionType::Xz {
-        if options.debug {
+    if compression_type == Compression::Xz {
+        if options.common.debug {
             eprintln!("[DEBUG] XZ-compressed layer detected - bypassing tar extraction, passing directly to main pipeline");
         }
         return flash_raw_disk_image_directly(
@@ -164,7 +154,7 @@ pub async fn flash_from_oci(
 
     // Set up the streaming pipeline
     // Channel for HTTP chunks -> blocking tar extractor
-    let buffer_size_mb = options.buffer_size_mb;
+    let buffer_size_mb = options.common.buffer_size_mb;
     let avg_chunk_size_kb = 16;
     let mut buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
     buffer_capacity = buffer_capacity.max(1000);
@@ -172,7 +162,7 @@ pub async fn flash_from_oci(
     // For compressed layers, use much larger buffering to ensure gzip decoder gets enough data
     if compression != LayerCompression::None {
         buffer_capacity = buffer_capacity.max(10000); // Ensure substantial buffering for compression
-        if options.debug {
+        if options.common.debug {
             eprintln!(
                 "[DEBUG] Using enhanced buffering for compressed layer: {} chunks",
                 buffer_capacity
@@ -202,7 +192,7 @@ pub async fn flash_from_oci(
         compression_type,
         options.file_pattern.as_deref(),
     );
-    if options.debug {
+    if options.common.debug {
         eprintln!(
             "[DEBUG] Selected decompressor hint: '{}' (content={:?}, layer_compression={:?}, content_compression={:?})",
             initial_decompressor_hint, content_type, compression, compression_type
@@ -215,15 +205,18 @@ pub async fn flash_from_oci(
     let decompressor_stdout = decompressor.stdout.take().unwrap();
     let decompressor_stderr = decompressor.stderr.take().unwrap();
 
-    println!("Opening block device for writing: {}", options.device);
+    println!(
+        "Opening block device for writing: {}",
+        options.common.device
+    );
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
-        options.device.clone(),
+        options.common.device.clone(),
         written_progress_tx.clone(),
-        options.debug,
-        options.o_direct,
-        options.write_buffer_size_mb,
+        options.common.debug,
+        options.common.o_direct,
+        options.common.write_buffer_size_mb,
     )?;
 
     // Spawn task: decompressor stdout -> block writer
@@ -294,7 +287,7 @@ pub async fn flash_from_oci(
 
     // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
     let file_pattern = options.file_pattern.clone();
-    let debug = options.debug;
+    let debug = options.common.debug;
     let tar_extractor_handle = tokio::task::spawn_blocking(move || {
         extract_tar_archive_from_stream(
             http_rx,
@@ -307,11 +300,12 @@ pub async fn flash_from_oci(
     });
 
     // Main download loop
-    let mut progress = ProgressTracker::new(options.newline_progress, options.show_memory);
+    let mut progress =
+        ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_content_length(content_length);
     progress.set_is_compressed(decompressor_name != "cat");
     progress.bytes_received = detection_buffer_size; // Account for detection buffer
-    let update_interval = Duration::from_secs_f64(options.progress_interval_secs);
+    let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
 
     // Download and send chunks (using stream from earlier)
     let mut chunk_count = 0;
@@ -452,26 +446,7 @@ pub async fn flash_from_oci(
     let _ = tokio::time::timeout(Duration::from_secs(2), error_processor).await;
 
     // Print final stats
-    let stats = progress.final_stats();
-    println!(
-        "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_received,
-        stats.download_time_formatted(),
-        stats.download_rate
-    );
-    println!(
-        "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_decompressed,
-        stats.decompress_time_formatted(),
-        stats.decompress_rate
-    );
-    println!(
-        "Write complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_written,
-        stats.write_time_formatted(),
-        stats.write_rate
-    );
-    println!("Total flash runtime: {}", stats.total_time_formatted());
+    progress.print_final_stats();
 
     Ok(())
 }
@@ -590,7 +565,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
 fn get_decompressor_hint(
     content_type: ContentType,
     layer_compression: LayerCompression,
-    content_compression: CompressionType,
+    content_compression: Compression,
     file_pattern: Option<&str>,
 ) -> &'static str {
     match (content_type, layer_compression, content_compression) {
@@ -598,9 +573,9 @@ fn get_decompressor_hint(
         // so external decompressor for extracted files should be "cat"
         (ContentType::TarArchive, LayerCompression::Gzip | LayerCompression::Zstd, _) => "disk.img",
         // Layer is uncompressed per manifest but content detection found gzip
-        (ContentType::TarArchive, LayerCompression::None, CompressionType::Gzip) => "disk.img",
+        (ContentType::TarArchive, LayerCompression::None, Compression::Gzip) => "disk.img",
         // Layer is uncompressed per manifest but content detection found XZ
-        (ContentType::TarArchive, LayerCompression::None, CompressionType::Xz) => "disk.img.xz",
+        (ContentType::TarArchive, LayerCompression::None, Compression::Xz) => "disk.img.xz",
         // Default: use file pattern or assume XZ compressed disk image
         _ => match file_pattern {
             Some(p) if p.ends_with(".xz") => "disk.img.xz",
@@ -609,102 +584,6 @@ fn get_decompressor_hint(
             None => "disk.img.xz",
         },
     }
-}
-
-/// Detect content and compression type from pre-buffered data
-fn detect_content_and_compression(
-    data: &[u8],
-    debug: bool,
-) -> Result<(ContentType, CompressionType), String> {
-    if data.len() < 16 {
-        return Err("Insufficient data for detection".to_string());
-    }
-
-    // First, detect compression from magic bytes
-    let compression_type = if data.len() >= 3 && data[0] == 0x1f && data[1] == 0x8b {
-        CompressionType::Gzip
-    } else if data.len() >= 6 && &data[0..6] == b"\xfd7zXZ\x00" {
-        CompressionType::Xz
-    } else {
-        CompressionType::None
-    };
-
-    if debug {
-        eprintln!("[DEBUG] Compression detection: {:?}", compression_type);
-        eprintln!(
-            "[DEBUG] First 16 bytes: {:02x?}",
-            &data[..16.min(data.len())]
-        );
-    }
-
-    // For compressed data, we need to peek at the decompressed content to determine type
-    // For now, if it's compressed, we'll decompress a bit to check
-    let content_to_analyze = match compression_type {
-        CompressionType::Gzip => {
-            // Try to decompress first few KB to analyze content
-            match decompress_sample_gzip(data) {
-                Ok(decompressed) => decompressed,
-                Err(e) => {
-                    if debug {
-                        eprintln!("[DEBUG] Failed to decompress gzip sample: {}", e);
-                    }
-                    // Fall back to assuming it's a tar if we can't decompress
-                    return Ok((ContentType::TarArchive, compression_type));
-                }
-            }
-        }
-        CompressionType::Xz => {
-            // For XZ, we'll assume it's likely a tar archive (common pattern)
-            // since XZ decompression is more complex to do partial
-            if debug {
-                eprintln!("[DEBUG] XZ detected, assuming tar archive");
-            }
-            return Ok((ContentType::TarArchive, compression_type));
-        }
-        CompressionType::None => data.to_vec(),
-    };
-
-    // Now analyze the (possibly decompressed) content
-    let content_type = detect_content_type(&content_to_analyze, debug);
-
-    Ok((content_type, compression_type))
-}
-
-/// Decompress a sample of gzip data to analyze content type
-fn decompress_sample_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    let mut decoder = GzDecoder::new(data);
-    let mut buffer = vec![0u8; 8192]; // Decompress up to 8KB to analyze
-
-    match decoder.read(&mut buffer) {
-        Ok(n) => {
-            buffer.truncate(n);
-            Ok(buffer)
-        }
-        Err(e) => Err(format!("Gzip decompression failed: {}", e)),
-    }
-}
-
-/// Detect content type from raw (uncompressed) data
-fn detect_content_type(data: &[u8], debug: bool) -> ContentType {
-    // Check for tar header magic ("ustar" at offset 257)
-    if data.len() >= 262 {
-        let tar_magic = &data[257..262];
-        if tar_magic == b"ustar" || tar_magic == b"posix" {
-            if debug {
-                eprintln!("[DEBUG] Found tar magic signature, detected as tar archive");
-            }
-            return ContentType::TarArchive;
-        }
-    }
-
-    // Everything else gets streamed directly
-    if debug {
-        eprintln!("[DEBUG] No tar signature found, streaming as raw data");
-    }
-    ContentType::RawDiskImage
 }
 
 /// Check if a path matches a disk image
@@ -734,6 +613,14 @@ fn is_disk_image(path: &Path, pattern: Option<&str>) -> bool {
 }
 
 /// Simple glob pattern matching
+///
+/// Supports limited glob patterns:
+/// - `*.ext` - matches any file ending with `.ext`
+/// - `prefix*` - matches any file starting with `prefix`
+/// - `exact` - exact string match
+///
+/// **Limitations**: Does not support wildcards in the middle of patterns
+/// (e.g., `disk*.img` or `*.img.*` won't work as expected)
 fn matches_pattern(name: &str, pattern: &str) -> bool {
     if pattern.starts_with('*') && pattern.len() > 1 {
         // *.ext pattern
@@ -745,13 +632,6 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         // Exact match
         name == pattern
     }
-}
-
-/// Reader that pulls bytes from a tokio channel
-struct ChannelReader {
-    rx: mpsc::Receiver<bytes::Bytes>,
-    current: Option<bytes::Bytes>,
-    offset: usize,
 }
 
 /// Reader that can peek at magic bytes without consuming them
@@ -1050,92 +930,40 @@ impl<R: Read> Read for DebugReader<R> {
     }
 }
 
-impl ChannelReader {
-    fn new(rx: mpsc::Receiver<bytes::Bytes>) -> Self {
-        Self {
-            rx,
-            current: None,
-            offset: 0,
-        }
-    }
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            // If we have current data, use it
-            if let Some(ref data) = self.current {
-                let remaining = &data[self.offset..];
-                if !remaining.is_empty() {
-                    let to_copy = remaining.len().min(buf.len());
-                    buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
-                    self.offset += to_copy;
-
-                    // Debug: print first few bytes (only in debug builds)
-                    #[cfg(debug_assertions)]
-                    {
-                        static FIRST_READ: std::sync::Once = std::sync::Once::new();
-                        FIRST_READ.call_once(|| {
-                            eprintln!(
-                                "[DEBUG] First 16 bytes from layer: {:02x?}",
-                                &buf[..to_copy.min(16)]
-                            );
-                        });
-                    }
-
-                    return Ok(to_copy);
-                }
-            }
-
-            // Need more data - blocking receive
-            match self.rx.blocking_recv() {
-                Some(data) => {
-                    self.current = Some(data);
-                    self.offset = 0;
-                    // Loop to process the new data
-                }
-                None => {
-                    // Channel closed - EOF
-                    return Ok(0);
-                }
-            }
-        }
-    }
-}
-
 /// Flash raw disk image directly without tar extraction
 async fn flash_raw_disk_image_directly(
     initial_buffer: Vec<u8>,
     mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
-    compression_type: CompressionType,
+    compression_type: Compression,
     options: OciOptions,
     layer_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Raw disk image detected - streaming directly to device");
     println!("Compression: {:?}", compression_type);
-    println!("Opening device: {}", options.device);
+    println!("Opening device: {}", options.common.device);
 
     // Create progress tracking
-    let mut progress = ProgressTracker::new(options.newline_progress, options.show_memory);
+    let mut progress =
+        ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_content_length(Some(layer_size));
-    progress.set_is_compressed(compression_type != CompressionType::None);
+    progress.set_is_compressed(compression_type != Compression::None);
     progress.bytes_received = initial_buffer.len() as u64;
-    let update_interval = Duration::from_secs_f64(options.progress_interval_secs);
+    let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
 
     // Set up single-purpose block writer with its own progress channel
     let (raw_written_progress_tx, mut raw_written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
-        options.device,
+        options.common.device,
         raw_written_progress_tx,
-        options.debug,
-        options.o_direct,
-        options.write_buffer_size_mb,
+        options.common.debug,
+        options.common.o_direct,
+        options.common.write_buffer_size_mb,
     )?;
 
     // Set up streaming pipeline using channels
-    let buffer_size_mb = options.buffer_size_mb;
+    let buffer_size_mb = options.common.buffer_size_mb;
     let buffer_capacity = ((buffer_size_mb * 1024) / 16).max(1000); // 16KB average chunk size
 
     let (http_tx, http_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
@@ -1143,9 +971,9 @@ async fn flash_raw_disk_image_directly(
 
     // For gzip and none, we can decompress in-process and write directly to block writer
     // For XZ, we need the external xzcat process
-    let needs_external_decompressor = compression_type == CompressionType::Xz;
+    let needs_external_decompressor = compression_type == Compression::Xz;
 
-    if options.debug {
+    if options.common.debug {
         eprintln!(
             "[DEBUG] Compression type: {:?}, using external decompressor: {}",
             compression_type, needs_external_decompressor
@@ -1252,7 +1080,7 @@ async fn flash_raw_disk_image_directly(
         // Gzip or None: decompress in-process and write directly to block writer
         let writer = block_writer;
         let progress_tx = decompressed_progress_tx;
-        let debug = options.debug;
+        let debug = options.common.debug;
 
         // Create an async channel for decompressed data
         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
@@ -1266,7 +1094,7 @@ async fn flash_raw_disk_image_directly(
 
             // Apply in-process gzip decompression if needed
             let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
-                CompressionType::Gzip => {
+                Compression::Gzip => {
                     if debug {
                         eprintln!("[DEBUG] Applying in-process gzip decompression");
                     }
@@ -1327,7 +1155,7 @@ async fn flash_raw_disk_image_directly(
                         progress.bytes_received += chunk_len;
                         chunk_count += 1;
 
-                        if options.debug && chunk_count <= 5 {
+                        if options.common.debug && chunk_count <= 5 {
                             eprintln!(
                                 "[DEBUG] Received chunk {}: {} bytes (total: {} MB)",
                                 chunk_count,
@@ -1374,7 +1202,7 @@ async fn flash_raw_disk_image_directly(
     // Close HTTP channel to signal download complete
     drop(http_tx);
 
-    if options.debug {
+    if options.common.debug {
         eprintln!(
             "[DEBUG] Download completed, {} bytes received",
             progress.bytes_received
@@ -1412,26 +1240,7 @@ async fn flash_raw_disk_image_directly(
     let _ = progress.update_progress(Some(layer_size), update_interval, true);
 
     // Print final stats
-    let stats = progress.final_stats();
-    println!(
-        "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_received,
-        stats.download_time_formatted(),
-        stats.download_rate
-    );
-    println!(
-        "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_decompressed,
-        stats.decompress_time_formatted(),
-        stats.decompress_rate
-    );
-    println!(
-        "Write complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_written,
-        stats.write_time_formatted(),
-        stats.write_rate
-    );
-    println!("Total flash runtime: {}", stats.total_time_formatted());
+    progress.print_final_stats();
 
     Ok(())
 }
@@ -1442,7 +1251,7 @@ fn extract_tar_archive_from_stream(
     tar_tx: mpsc::Sender<Vec<u8>>,
     file_pattern: Option<&str>,
     compression: LayerCompression,
-    compression_type: CompressionType,
+    compression_type: Compression,
     debug: bool,
 ) -> Result<(), String> {
     let reader = ChannelReader::new(http_rx);
@@ -1462,13 +1271,13 @@ fn extract_tar_archive_from_stream(
         LayerCompression::None => {
             // When manifest says no compression, use content detection result
             match compression_type {
-                CompressionType::Gzip => {
+                Compression::Gzip => {
                     if debug {
                         eprintln!("[DEBUG] Content is gzip compressed (detected), decompressing before tar extraction");
                     }
                     Box::new(GzDecoder::new(reader))
                 }
-                CompressionType::Xz => {
+                Compression::Xz => {
                     if debug {
                         eprintln!("[DEBUG] Content is XZ compressed layer (detected), passing raw XZ data to main pipeline");
                     }
@@ -1476,11 +1285,14 @@ fn extract_tar_archive_from_stream(
                     // Just pass the raw XZ data through
                     Box::new(reader)
                 }
-                CompressionType::None => {
+                Compression::None => {
                     if debug {
                         eprintln!("[DEBUG] No compression detected, processing tar directly");
                     }
                     Box::new(reader)
+                }
+                Compression::Zstd => {
+                    return Err("Zstd content compression is not supported yet".to_string());
                 }
             }
         }

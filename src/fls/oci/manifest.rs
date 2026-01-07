@@ -212,6 +212,16 @@ pub enum LayerCompression {
     Zstd,
 }
 
+impl From<LayerCompression> for crate::fls::compression::Compression {
+    fn from(layer_compression: LayerCompression) -> Self {
+        match layer_compression {
+            LayerCompression::None => crate::fls::compression::Compression::None,
+            LayerCompression::Gzip => crate::fls::compression::Compression::Gzip,
+            LayerCompression::Zstd => crate::fls::compression::Compression::Zstd,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,7 @@ use reqwest::{Client, Response, StatusCode};
 use super::auth::{request_token, Credentials, WwwAuthenticate};
 use super::manifest::{media_types, Manifest};
 use super::reference::ImageReference;
-use crate::fls::options::BlockFlashOptions;
+use crate::fls::options::{HttpClientOptions, OciOptions};
 
 /// OCI Registry client
 pub struct RegistryClient {
@@ -26,23 +26,9 @@ impl RegistryClient {
         image_ref: ImageReference,
         options: &OciOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Reuse the HTTP client setup from the existing module
-        let client = crate::fls::http::setup_http_client(&BlockFlashOptions {
-            insecure_tls: options.insecure_tls,
-            cacert: options.cacert.clone(),
-            device: String::new(),
-            buffer_size_mb: options.buffer_size_mb,
-            write_buffer_size_mb: options.write_buffer_size_mb,
-            max_retries: 10,
-            retry_delay_secs: 2,
-            debug: options.debug,
-            o_direct: false,
-            headers: Vec::new(),
-            progress_interval_secs: 0.5,
-            newline_progress: false,
-            show_memory: false,
-        })
-        .await?;
+        // Use HttpClientOptions for clean HTTP client setup
+        let http_options: HttpClientOptions = options.into();
+        let client = crate::fls::http::setup_http_client(&http_options).await?;
 
         let credentials = Credentials::new(options.username.clone(), options.password.clone());
 
@@ -51,7 +37,7 @@ impl RegistryClient {
             image_ref,
             credentials,
             token: None,
-            debug: options.debug,
+            debug: options.common.debug,
         })
     }
 
@@ -80,7 +66,6 @@ impl RegistryClient {
                 let www_auth_header = response
                     .headers()
                     .get("www-authenticate")
-                    .or_else(|| response.headers().get("WWW-Authenticate"))
                     .ok_or("No WWW-Authenticate header in 401 response")?
                     .to_str()
                     .map_err(|e| format!("Invalid WWW-Authenticate header: {}", e))?;
@@ -253,43 +238,5 @@ impl RegistryClient {
     #[allow(dead_code)]
     pub fn image_ref(&self) -> &ImageReference {
         &self.image_ref
-    }
-}
-
-/// Options for OCI operations
-#[derive(Debug, Clone)]
-pub struct OciOptions {
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub insecure_tls: bool,
-    pub cacert: Option<std::path::PathBuf>,
-    pub buffer_size_mb: usize,
-    pub write_buffer_size_mb: usize,
-    pub debug: bool,
-    pub o_direct: bool,
-    pub progress_interval_secs: f64,
-    pub newline_progress: bool,
-    pub show_memory: bool,
-    pub file_pattern: Option<String>,
-    pub device: String,
-}
-
-impl Default for OciOptions {
-    fn default() -> Self {
-        Self {
-            username: None,
-            password: None,
-            insecure_tls: false,
-            cacert: None,
-            buffer_size_mb: 128,
-            write_buffer_size_mb: 128,
-            debug: false,
-            o_direct: false,
-            progress_interval_secs: 0.5,
-            newline_progress: false,
-            show_memory: false,
-            file_pattern: None,
-            device: String::new(),
-        }
     }
 }

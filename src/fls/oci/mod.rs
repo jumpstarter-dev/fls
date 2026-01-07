@@ -11,4 +11,3 @@ mod registry;
 // Public re-exports
 pub use from_oci::flash_from_oci;
 pub use reference::ImageReference;
-pub use registry::OciOptions;

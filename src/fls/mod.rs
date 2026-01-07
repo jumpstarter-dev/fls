@@ -1,19 +1,22 @@
 // Module declarations
 mod block_writer;
+pub(crate) mod compression;
 mod decompress;
 mod download_error;
 mod error_handling;
 mod from_url;
 pub(crate) mod http;
+mod magic_bytes;
 mod memory;
 pub mod oci;
 mod options;
 mod progress;
+mod stream_utils;
 
 // Public re-exports
 pub use from_url::flash_from_url;
-pub use oci::{flash_from_oci, OciOptions};
-pub use options::BlockFlashOptions;
+pub use oci::flash_from_oci;
+pub use options::{BlockFlashOptions, FlashOptions, HttpClientOptions, OciOptions};
 
 #[cfg(test)]
 mod tests {

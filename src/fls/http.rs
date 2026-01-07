@@ -1,10 +1,10 @@
 use crate::fls::download_error::DownloadError;
-use crate::fls::options::BlockFlashOptions;
+use crate::fls::options::HttpClientOptions;
 use reqwest::Client;
 use std::time::Duration;
 
 pub(crate) async fn setup_http_client(
-    options: &BlockFlashOptions,
+    options: &HttpClientOptions,
 ) -> Result<Client, Box<dyn std::error::Error>> {
     if options.debug {
         eprintln!("\n[DEBUG] Initializing HTTP Client:");

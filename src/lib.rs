@@ -4,4 +4,4 @@
 pub mod fls;
 
 // Re-export the main public API
-pub use fls::{flash_from_url, BlockFlashOptions};
+pub use fls::{flash_from_oci, flash_from_url, BlockFlashOptions, FlashOptions, OciOptions};
