@@ -23,21 +23,63 @@ use crate::fls::options::OciOptions;
 use crate::fls::progress::ProgressTracker;
 use crate::fls::stream_utils::ChannelReader;
 
-/// Flash a block device from an OCI image
-pub async fn flash_from_oci(
-    image: &str,
-    options: OciOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse image reference
-    let image_ref = ImageReference::parse(image)?;
-    println!("Pulling image: {}", image_ref);
+/// Parameters for download coordination functions
+struct DownloadCoordinationParams {
+    http_tx: mpsc::Sender<bytes::Bytes>,
+    decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
+    written_progress_rx: mpsc::UnboundedReceiver<u64>,
+    decompressor_written_progress_rx: mpsc::UnboundedReceiver<u64>,
+}
 
-    // Create registry client and authenticate
-    let mut client = RegistryClient::new(image_ref.clone(), &options).await?;
-    println!("Connecting to registry: {}", image_ref.registry);
-    client.authenticate().await?;
+/// Download context parameters
+struct DownloadContext {
+    content_detection_buffer: Vec<u8>,
+    content_length: Option<u64>,
+    decompressor_name: &'static str,
+}
 
-    // Fetch manifest
+/// Parameters for raw disk download coordination
+struct RawDiskDownloadParams {
+    http_tx: mpsc::Sender<bytes::Bytes>,
+    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    external_decompressor: Option<tokio::process::Child>,
+    decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
+    raw_written_progress_rx: mpsc::UnboundedReceiver<u64>,
+}
+
+/// Processing handles for coordination functions
+struct ProcessingHandles {
+    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
+    error_processor: tokio::task::JoinHandle<()>,
+    tar_extractor_handle: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+/// Components returned by external decompressor pipeline setup
+struct ExternalDecompressorPipeline {
+    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    decompressor: tokio::process::Child,
+}
+
+/// Components returned by pipeline setup
+struct TarPipelineComponents {
+    http_tx: mpsc::Sender<bytes::Bytes>,
+    http_rx: mpsc::Receiver<bytes::Bytes>,
+    tar_tx: mpsc::Sender<Vec<u8>>,
+    decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
+    written_progress_rx: mpsc::UnboundedReceiver<u64>,
+    decompressor_written_progress_rx: mpsc::UnboundedReceiver<u64>,
+    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
+    error_processor: tokio::task::JoinHandle<()>,
+    decompressor: tokio::process::Child,
+    decompressor_name: &'static str,
+}
+
+/// Resolve the manifest, handling multi-platform manifest indexes
+async fn resolve_manifest(
+    client: &mut RegistryClient,
+) -> Result<Manifest, Box<dyn std::error::Error>> {
     println!("Fetching manifest...");
     let manifest = client.fetch_manifest().await?;
 
@@ -63,113 +105,18 @@ pub async fn flash_from_oci(
         m => m,
     };
 
-    // Get the layer to download
-    let layer = manifest.get_single_layer()?;
-    let layer_size = layer.size;
-    let compression = layer.compression();
+    Ok(manifest)
+}
 
-    println!("Layer digest: {}", layer.digest);
-    println!(
-        "Layer size: {} bytes ({:.2} MB)",
-        layer_size,
-        layer_size as f64 / (1024.0 * 1024.0)
-    );
-    println!("Layer media type: {}", layer.media_type);
-    println!("Layer compression: {:?}", compression);
-
-    // Validate compression - we only support gzip for now
-    if compression == LayerCompression::Zstd {
-        return Err("Zstd-compressed layers are not yet supported".into());
-    }
-
-    // Start blob download
-    println!("\nStarting download...");
-    let response = client.get_blob_stream(&layer.digest).await?;
-    let content_length = response.content_length();
-
-    // We'll detect actual compression from the data stream since
-    // some registries don't set the media type correctly
-
-    // First, do a small download to detect content type before setting up pipeline
-    println!("\nDetecting content type...");
-    let mut content_detection_buffer = Vec::new();
-    let detection_size = 2 * 1024 * 1024; // 2MB should be enough for detection
-
-    let mut stream = response.bytes_stream();
-    while content_detection_buffer.len() < detection_size {
-        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-            Ok(Some(chunk_result)) => match chunk_result {
-                Ok(chunk) => {
-                    content_detection_buffer.extend_from_slice(&chunk);
-                }
-                Err(e) => {
-                    return Err(format!("Download error during detection: {}", e).into());
-                }
-            },
-            Ok(None) => break, // Stream ended early
-            Err(_) => return Err("Detection timeout".into()),
-        }
-    }
-
-    // Detect content and compression type
-    let (content_type, compression_type) =
-        detect_content_and_compression(&content_detection_buffer, options.common.debug)?;
-
-    if options.common.debug {
-        eprintln!(
-            "[DEBUG] Detected content: {:?}, compression: {:?}",
-            content_type, compression_type
-        );
-    }
-
-    // Handle raw disk images with a separate, simpler pipeline
-    if content_type == ContentType::RawDiskImage {
-        return flash_raw_disk_image_directly(
-            content_detection_buffer,
-            stream,
-            compression_type,
-            options,
-            layer_size,
-        )
-        .await;
-    }
-
-    // Handle XZ-compressed tar archives - bypass tar extraction and pass directly to main pipeline
-    if compression_type == Compression::Xz {
-        if options.common.debug {
-            eprintln!("[DEBUG] XZ-compressed layer detected - bypassing tar extraction, passing directly to main pipeline");
-        }
-        return flash_raw_disk_image_directly(
-            content_detection_buffer,
-            stream,
-            compression_type,
-            options,
-            layer_size,
-        )
-        .await;
-    }
-
-    // For tar archives, continue with the complex pipeline
-    println!("Processing tar archive...");
-
-    // Set up the streaming pipeline
-    // Channel for HTTP chunks -> blocking tar extractor
-    let buffer_size_mb = options.common.buffer_size_mb;
-    let avg_chunk_size_kb = 16;
-    let mut buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
-    buffer_capacity = buffer_capacity.max(1000);
-
-    // For compressed layers, use much larger buffering to ensure gzip decoder gets enough data
-    if compression != LayerCompression::None {
-        buffer_capacity = buffer_capacity.max(10000); // Ensure substantial buffering for compression
-        if options.common.debug {
-            eprintln!(
-                "[DEBUG] Using enhanced buffering for compressed layer: {} chunks",
-                buffer_capacity
-            );
-        }
-    }
-
+/// Setup the tar processing pipeline with channels, decompressor, and async tasks
+async fn setup_tar_processing_pipeline(
+    content_type: ContentType,
+    compression: LayerCompression,
+    compression_type: Compression,
+    options: &OciOptions,
+    buffer_size_mb: usize,
+    buffer_capacity: usize,
+) -> Result<TarPipelineComponents, Box<dyn std::error::Error>> {
     println!(
         "Using download buffer: {} MB (capacity: {} chunks)",
         buffer_size_mb, buffer_capacity
@@ -181,11 +128,11 @@ pub async fn flash_from_oci(
     let (tar_tx, mut tar_rx) = mpsc::channel::<Vec<u8>>(16); // 16 * 8MB = 128MB buffer
 
     // Channels for progress tracking
-    let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
+    let (decompressed_progress_tx, decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-    let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
+    let (written_progress_tx, written_progress_rx) = mpsc::unbounded_channel::<u64>();
     // Channel for tracking bytes actually written to decompressor (for progress bar)
-    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
+    let (decompressor_written_progress_tx, decompressor_written_progress_rx) =
         mpsc::unbounded_channel::<u64>();
 
     // Choose decompressor based on content type and compression detection
@@ -279,39 +226,51 @@ pub async fn flash_from_oci(
         Ok::<(), String>(())
     });
 
+    Ok(TarPipelineComponents {
+        http_tx,
+        http_rx,
+        tar_tx,
+        decompressed_progress_rx,
+        written_progress_rx,
+        decompressor_written_progress_rx,
+        writer_handle,
+        decompressor_writer_handle,
+        error_processor,
+        decompressor,
+        decompressor_name,
+    })
+}
+
+/// Coordinate the download process with progress tracking and cleanup
+async fn coordinate_download_and_processing(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    context: DownloadContext,
+    mut params: DownloadCoordinationParams,
+    handles: ProcessingHandles,
+    mut decompressor: tokio::process::Child,
+    options: &OciOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Get the buffer size before moving it
-    let detection_buffer_size = content_detection_buffer.len() as u64;
+    let detection_buffer_size = context.content_detection_buffer.len() as u64;
 
     // Send the already-downloaded detection buffer first
-    if http_tx
-        .send(bytes::Bytes::from(content_detection_buffer))
+    if params
+        .http_tx
+        .send(bytes::Bytes::from(context.content_detection_buffer))
         .await
         .is_err()
     {
         return Err("Failed to send detection buffer to tar extractor".into());
     }
 
-    // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
-    let file_pattern = options.file_pattern.clone();
-    let debug = options.common.debug;
-    let tar_extractor_handle = tokio::task::spawn_blocking(move || {
-        extract_tar_archive_from_stream(
-            http_rx,
-            tar_tx,
-            file_pattern.as_deref(),
-            compression,
-            compression_type,
-            debug,
-        )
-    });
-
     // Main download loop
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
-    progress.set_content_length(content_length);
-    progress.set_is_compressed(decompressor_name != "cat");
+    progress.set_content_length(context.content_length);
+    progress.set_is_compressed(context.decompressor_name != "cat");
     progress.bytes_received = detection_buffer_size; // Account for detection buffer
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
+    let debug = options.common.debug;
 
     // Download and send chunks (using stream from earlier)
     let mut chunk_count = 0;
@@ -333,7 +292,7 @@ pub async fn flash_from_oci(
                             );
                         }
 
-                        if http_tx.send(chunk).await.is_err() {
+                        if params.http_tx.send(chunk).await.is_err() {
                             eprintln!("\nTar extractor channel closed");
                             if debug {
                                 eprintln!(
@@ -345,19 +304,21 @@ pub async fn flash_from_oci(
                         }
 
                         // Update progress
-                        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+                        while let Ok(byte_count) = params.decompressed_progress_rx.try_recv() {
                             progress.bytes_decompressed += byte_count;
                         }
                         // Track bytes actually written to decompressor (for progress bar)
-                        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+                        while let Ok(written_len) =
+                            params.decompressor_written_progress_rx.try_recv()
+                        {
                             progress.bytes_sent_to_decompressor += written_len;
                         }
-                        while let Ok(written_bytes) = written_progress_rx.try_recv() {
+                        while let Ok(written_bytes) = params.written_progress_rx.try_recv() {
                             progress.bytes_written = written_bytes;
                         }
 
                         if let Err(e) =
-                            progress.update_progress(content_length, update_interval, false)
+                            progress.update_progress(context.content_length, update_interval, false)
                         {
                             eprintln!();
                             return Err(e);
@@ -379,7 +340,7 @@ pub async fn flash_from_oci(
     }
 
     // Close HTTP channel to signal download complete
-    drop(http_tx);
+    drop(params.http_tx);
 
     if debug {
         eprintln!(
@@ -389,22 +350,22 @@ pub async fn flash_from_oci(
     }
 
     // Wait for tar extractor (now only handles tar archives)
-    let tar_result = tar_extractor_handle.await?;
+    let tar_result = handles.tar_extractor_handle.await?;
     if let Err(e) = tar_result {
         return Err(format!("Tar extraction failed: {}", e).into());
     }
 
     // Wait for decompressor writer
-    if let Err(e) = decompressor_writer_handle.await? {
+    if let Err(e) = handles.decompressor_writer_handle.await? {
         return Err(format!("Decompressor write failed: {}", e).into());
     }
 
     // Wait for decompressor process
     loop {
-        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+        while let Ok(byte_count) = params.decompressed_progress_rx.try_recv() {
             progress.bytes_decompressed += byte_count;
         }
-        while let Ok(written_bytes) = written_progress_rx.try_recv() {
+        while let Ok(written_bytes) = params.written_progress_rx.try_recv() {
             progress.bytes_written = written_bytes;
         }
         let _ = progress.update_progress(None, update_interval, false);
@@ -414,7 +375,7 @@ pub async fn flash_from_oci(
                 if !status.success() {
                     return Err(format!(
                         "{} failed with status: {:?}",
-                        decompressor_name,
+                        context.decompressor_name,
                         status.code()
                     )
                     .into());
@@ -430,22 +391,22 @@ pub async fn flash_from_oci(
 
     // Wait for block writer
     loop {
-        while let Ok(written_bytes) = written_progress_rx.try_recv() {
+        while let Ok(written_bytes) = params.written_progress_rx.try_recv() {
             progress.bytes_written = written_bytes;
         }
         let _ = progress.update_progress(None, update_interval, false);
 
-        if writer_handle.is_finished() {
+        if handles.writer_handle.is_finished() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    match writer_handle.await {
+    match handles.writer_handle.await {
         Ok(Ok(final_bytes)) => {
             progress.bytes_written = final_bytes;
         }
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) => return Err(Box::new(e)),
         Err(e) => return Err(e.into()),
     }
 
@@ -453,12 +414,500 @@ pub async fn flash_from_oci(
     let _ = progress.update_progress(None, update_interval, true);
 
     // Wait for error processor
-    let _ = tokio::time::timeout(Duration::from_secs(2), error_processor).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), handles.error_processor).await;
 
     // Print final stats
     progress.print_final_stats();
 
     Ok(())
+}
+
+/// Setup external decompressor pipeline for XZ compression
+async fn setup_external_decompressor_pipeline(
+    http_rx: mpsc::Receiver<bytes::Bytes>,
+    block_writer: AsyncBlockWriter,
+    decompressed_progress_tx: mpsc::UnboundedSender<u64>,
+) -> Result<ExternalDecompressorPipeline, Box<dyn std::error::Error>> {
+    // XZ: Use external xzcat process
+    let (mut decompressor, decompressor_name) = start_decompressor_process("disk.img.xz").await?;
+
+    let decompressor_stdin = decompressor.stdin.take().unwrap();
+    let decompressor_stdout = decompressor.stdout.take().unwrap();
+    let decompressor_stderr = decompressor.stderr.take().unwrap();
+
+    let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
+
+    // Spawn stderr reader
+    tokio::spawn(spawn_stderr_reader(
+        decompressor_stderr,
+        error_tx.clone(),
+        decompressor_name,
+    ));
+
+    // Spawn error processor
+    tokio::spawn(process_error_messages(error_rx));
+
+    // Spawn blocking task: read from channel and write to xzcat stdin
+    // First, create a sync file handle from the async stdin
+    #[cfg(unix)]
+    let stdin_fd = {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let raw_fd = decompressor_stdin.as_raw_fd();
+        // Duplicate the fd so we can use it in blocking context
+        let dup_fd = unsafe { libc::dup(raw_fd) };
+        if dup_fd == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: dup_fd is a valid file descriptor (we checked above)
+        unsafe { std::fs::File::from_raw_fd(dup_fd) }
+    };
+    #[cfg(not(unix))]
+    let stdin_fd: std::fs::File = {
+        return Err("XZ streaming decompression is not supported on non-unix platforms".into());
+    };
+
+    // Drop the original async stdin (the dup'd fd still points to the pipe)
+    drop(decompressor_stdin);
+
+    let stdin_writer_handle = {
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+            let reader = ChannelReader::new(http_rx);
+            let mut reader = reader;
+            let mut stdin = stdin_fd;
+            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        if let Err(e) = stdin.write_all(&buffer[..n]) {
+                            return Err(format!("Error writing to xzcat: {}", e));
+                        }
+                    }
+                    Err(e) => return Err(format!("Error reading stream: {}", e)),
+                }
+            }
+
+            drop(stdin);
+            Ok::<(), String>(())
+        })
+    };
+
+    // Spawn task: xzcat stdout -> block writer
+    let writer = block_writer;
+    let progress_tx = decompressed_progress_tx;
+    let writer_handle = tokio::spawn(async move {
+        let mut stdout = decompressor_stdout;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
+
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let data = buffer[..n].to_vec();
+                    let _ = progress_tx.send(n as u64);
+                    writer.write(data).await?
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Wait for stdin writer to finish
+        let _ = stdin_writer_handle.await;
+
+        writer.close().await
+    });
+
+    Ok(ExternalDecompressorPipeline {
+        writer_handle,
+        decompressor,
+    })
+}
+
+/// Setup in-process decompression pipeline for Gzip or None compression
+async fn setup_inprocess_decompression_pipeline(
+    http_rx: mpsc::Receiver<bytes::Bytes>,
+    block_writer: AsyncBlockWriter,
+    decompressed_progress_tx: mpsc::UnboundedSender<u64>,
+    compression_type: Compression,
+    debug: bool,
+) -> Result<tokio::task::JoinHandle<Result<u64, std::io::Error>>, Box<dyn std::error::Error>> {
+    // Gzip or None: decompress in-process and write directly to block writer
+    let writer = block_writer;
+    let progress_tx = decompressed_progress_tx;
+
+    // Create an async channel for decompressed data
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
+
+    // Capture the runtime handle before entering the blocking task
+    let rt = tokio::runtime::Handle::current();
+
+    // Spawn blocking task: read, decompress, send to async channel
+    let reader_handle = tokio::task::spawn_blocking(move || {
+        let reader = ChannelReader::new(http_rx);
+
+        // Apply in-process gzip decompression if needed
+        let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
+            Compression::Gzip => {
+                if debug {
+                    eprintln!("[DEBUG] Applying in-process gzip decompression");
+                }
+                Box::new(flate2::read::GzDecoder::new(reader))
+            }
+            _ => Box::new(reader),
+        };
+
+        let mut reader = processed_reader;
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    // Send to async channel using block_on
+                    if rt.block_on(data_tx.send(buffer[..n].to_vec())).is_err() {
+                        return Err("Data channel closed".to_string());
+                    }
+                }
+                Err(e) => return Err(format!("Error reading/decompressing: {}", e)),
+            }
+        }
+
+        Ok::<(), String>(())
+    });
+
+    // Spawn async task: receive from channel and write to block writer
+    let handle = tokio::spawn(async move {
+        while let Some(data) = data_rx.recv().await {
+            let len = data.len() as u64;
+            let _ = progress_tx.send(len);
+            writer.write(data).await?
+        }
+
+        let _ = reader_handle.await;
+        writer.close().await
+    });
+
+    Ok(handle)
+}
+
+/// Coordinate raw disk image download with progress tracking and cleanup
+async fn coordinate_raw_disk_download(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    initial_buffer: Vec<u8>,
+    layer_size: u64,
+    mut params: RawDiskDownloadParams,
+    options: &OciOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create progress tracking
+    let mut progress =
+        ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
+    progress.set_content_length(Some(layer_size));
+    progress.set_is_compressed(params.external_decompressor.is_some());
+    progress.bytes_received = initial_buffer.len() as u64;
+    let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
+
+    // Send the already-downloaded detection buffer first
+    if params
+        .http_tx
+        .send(bytes::Bytes::from(initial_buffer))
+        .await
+        .is_err()
+    {
+        return Err("Failed to send detection buffer to streaming pipeline".into());
+    }
+
+    // Main download loop - stream chunks to processing pipeline
+    let mut chunk_count = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(chunk_result)) => {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let chunk_len = chunk.len() as u64;
+                        progress.bytes_received += chunk_len;
+                        chunk_count += 1;
+
+                        if options.common.debug && chunk_count <= 5 {
+                            eprintln!(
+                                "[DEBUG] Received chunk {}: {} bytes (total: {} MB)",
+                                chunk_count,
+                                chunk_len,
+                                progress.bytes_received / (1024 * 1024)
+                            );
+                        }
+
+                        if params.http_tx.send(chunk).await.is_err() {
+                            eprintln!("\nStreaming pipeline closed");
+                            break;
+                        }
+
+                        // Update progress
+                        while let Ok(byte_count) = params.decompressed_progress_rx.try_recv() {
+                            progress.bytes_decompressed += byte_count;
+                        }
+                        while let Ok(written_bytes) = params.raw_written_progress_rx.try_recv() {
+                            progress.bytes_written = written_bytes;
+                        }
+                        // For raw disk images, bytes_sent_to_decompressor tracks bytes_received
+                        // since data is immediately forwarded to the decompression pipeline
+                        progress.bytes_sent_to_decompressor = progress.bytes_received;
+
+                        if let Err(e) =
+                            progress.update_progress(Some(layer_size), update_interval, false)
+                        {
+                            eprintln!();
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("Download error: {}", e).into());
+                    }
+                }
+            }
+            Ok(None) => {
+                // Stream ended
+                break;
+            }
+            Err(_) => {
+                return Err("Download timeout".into());
+            }
+        }
+    }
+
+    // Close HTTP channel to signal download complete
+    drop(params.http_tx);
+
+    if options.common.debug {
+        eprintln!(
+            "[DEBUG] Download completed, {} bytes received",
+            progress.bytes_received
+        );
+    }
+
+    // Wait for the processing pipeline to complete
+    loop {
+        // Update progress from decompression and writes
+        while let Ok(byte_count) = params.decompressed_progress_rx.try_recv() {
+            progress.bytes_decompressed += byte_count;
+        }
+        while let Ok(written_bytes) = params.raw_written_progress_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+        }
+        let _ = progress.update_progress(Some(layer_size), update_interval, false);
+
+        if params.writer_handle.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Get final result
+    match params.writer_handle.await {
+        Ok(Ok(final_bytes)) => {
+            progress.bytes_written = final_bytes;
+            progress.bytes_decompressed = final_bytes;
+        }
+        Ok(Err(e)) => return Err(Box::new(e)),
+        Err(e) => return Err(e.into()),
+    }
+
+    // Final progress update
+    let _ = progress.update_progress(Some(layer_size), update_interval, true);
+
+    // Print final stats
+    progress.print_final_stats();
+
+    Ok(())
+}
+
+/// Flash a block device from an OCI image
+pub async fn flash_from_oci(
+    image: &str,
+    options: OciOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse image reference
+    let image_ref = ImageReference::parse(image)?;
+    println!("Pulling image: {}", image_ref);
+
+    // Create registry client and authenticate
+    let mut client = RegistryClient::new(image_ref.clone(), &options).await?;
+    println!("Connecting to registry: {}", image_ref.registry);
+    client.authenticate().await?;
+
+    // Resolve manifest (handling multi-platform indexes)
+    let manifest = resolve_manifest(&mut client).await?;
+
+    // Get the layer to download
+    let layer = manifest.get_single_layer()?;
+    let layer_size = layer.size;
+    let compression = layer.compression();
+
+    println!("Layer digest: {}", layer.digest);
+    println!(
+        "Layer size: {} bytes ({:.2} MB)",
+        layer_size,
+        layer_size as f64 / (1024.0 * 1024.0)
+    );
+    println!("Layer media type: {}", layer.media_type);
+    println!("Layer compression: {:?}", compression);
+
+    // Validate compression - we only support gzip for now
+    if compression == LayerCompression::Zstd {
+        return Err("Zstd-compressed layers are not yet supported".into());
+    }
+
+    // Start blob download
+    println!("\nStarting download...");
+    let response = client.get_blob_stream(&layer.digest).await?;
+    let content_length = response.content_length();
+
+    // We'll detect actual compression from the data stream since
+    // some registries don't set the media type correctly
+
+    // First, do a small download to detect content type before setting up pipeline
+    println!("\nDetecting content type...");
+    let mut content_detection_buffer = Vec::new();
+    let detection_size = 2 * 1024 * 1024; // 2MB should be enough for detection
+
+    let mut stream = response.bytes_stream();
+    while content_detection_buffer.len() < detection_size {
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(chunk_result)) => match chunk_result {
+                Ok(chunk) => {
+                    content_detection_buffer.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    return Err(format!("Download error during detection: {}", e).into());
+                }
+            },
+            Ok(None) => break, // Stream ended early
+            Err(_) => return Err("Detection timeout".into()),
+        }
+    }
+
+    // Detect content and compression type
+    let (content_type, compression_type) =
+        detect_content_and_compression(&content_detection_buffer, options.common.debug)?;
+
+    if options.common.debug {
+        eprintln!(
+            "[DEBUG] Detected content: {:?}, compression: {:?}",
+            content_type, compression_type
+        );
+    }
+
+    // Handle raw disk images with a separate, simpler pipeline
+    if content_type == ContentType::RawDiskImage {
+        return flash_raw_disk_image_directly(
+            content_detection_buffer,
+            stream,
+            compression_type,
+            options,
+            layer_size,
+        )
+        .await;
+    }
+
+    // Handle XZ-compressed tar archives - bypass tar extraction and pass directly to main pipeline
+    if compression_type == Compression::Xz {
+        if options.common.debug {
+            eprintln!("[DEBUG] XZ-compressed layer detected - bypassing tar extraction, passing directly to main pipeline");
+        }
+        return flash_raw_disk_image_directly(
+            content_detection_buffer,
+            stream,
+            compression_type,
+            options,
+            layer_size,
+        )
+        .await;
+    }
+
+    // For tar archives, continue with the complex pipeline
+    println!("Processing tar archive...");
+
+    // Set up buffer capacity for the streaming pipeline
+    let buffer_size_mb = options.common.buffer_size_mb;
+    let avg_chunk_size_kb = 16;
+    let mut buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
+    buffer_capacity = buffer_capacity.max(1000);
+
+    // For compressed layers, use much larger buffering to ensure gzip decoder gets enough data
+    if compression != LayerCompression::None {
+        buffer_capacity = buffer_capacity.max(10000); // Ensure substantial buffering for compression
+        if options.common.debug {
+            eprintln!(
+                "[DEBUG] Using enhanced buffering for compressed layer: {} chunks",
+                buffer_capacity
+            );
+        }
+    }
+
+    // Setup the complete tar processing pipeline
+    let pipeline = setup_tar_processing_pipeline(
+        content_type.clone(),
+        compression,
+        compression_type,
+        &options,
+        buffer_size_mb,
+        buffer_capacity,
+    )
+    .await?;
+
+    // Extract components for use in the download loop
+    let TarPipelineComponents {
+        http_tx,
+        http_rx,
+        tar_tx,
+        decompressed_progress_rx,
+        written_progress_rx,
+        decompressor_written_progress_rx,
+        writer_handle,
+        decompressor_writer_handle,
+        error_processor,
+        decompressor,
+        decompressor_name,
+    } = pipeline;
+
+    // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
+    let file_pattern = options.file_pattern.clone();
+    let debug = options.common.debug;
+    let tar_extractor_handle = tokio::task::spawn_blocking(move || {
+        extract_tar_archive_from_stream(
+            http_rx,
+            tar_tx,
+            file_pattern.as_deref(),
+            compression,
+            compression_type,
+            debug,
+        )
+    });
+
+    // Coordinate download processing and cleanup
+    let context = DownloadContext {
+        content_detection_buffer,
+        content_length,
+        decompressor_name,
+    };
+
+    let params = DownloadCoordinationParams {
+        http_tx,
+        decompressed_progress_rx,
+        written_progress_rx,
+        decompressor_written_progress_rx,
+    };
+
+    let handles = ProcessingHandles {
+        writer_handle,
+        decompressor_writer_handle,
+        error_processor,
+        tar_extractor_handle,
+    };
+
+    coordinate_download_and_processing(stream, context, params, handles, decompressor, &options)
+        .await
 }
 
 /// Common implementation for tar stream extraction
@@ -943,7 +1392,7 @@ impl<R: Read> Read for DebugReader<R> {
 /// Flash raw disk image directly without tar extraction
 async fn flash_raw_disk_image_directly(
     initial_buffer: Vec<u8>,
-    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
     compression_type: Compression,
     options: OciOptions,
     layer_size: u64,
@@ -953,19 +1402,18 @@ async fn flash_raw_disk_image_directly(
     println!("Opening device: {}", options.common.device);
 
     // Create progress tracking
-    let mut progress =
+    let mut _progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
-    progress.set_content_length(Some(layer_size));
-    progress.set_is_compressed(compression_type != Compression::None);
-    progress.bytes_received = initial_buffer.len() as u64;
-    let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
+    _progress.set_content_length(Some(layer_size));
+    _progress.set_is_compressed(compression_type != Compression::None);
+    let _update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
 
     // Set up single-purpose block writer with its own progress channel
-    let (raw_written_progress_tx, mut raw_written_progress_rx) = mpsc::unbounded_channel::<u64>();
+    let (raw_written_progress_tx, raw_written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
-        options.common.device,
+        options.common.device.clone(),
         raw_written_progress_tx,
         options.common.debug,
         options.common.o_direct,
@@ -977,7 +1425,7 @@ async fn flash_raw_disk_image_directly(
     let buffer_capacity = ((buffer_size_mb * 1024) / 16).max(1000); // 16KB average chunk size
 
     let (http_tx, http_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
-    let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
+    let (decompressed_progress_tx, decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // For gzip and none, we can decompress in-process and write directly to block writer
     // For XZ, we need the external xzcat process
@@ -991,271 +1439,37 @@ async fn flash_raw_disk_image_directly(
     }
 
     // Spawn the processing pipeline based on compression type
-    let writer_handle = if needs_external_decompressor {
+    let (writer_handle, external_decompressor) = if needs_external_decompressor {
         // XZ: Use external xzcat process
-        let (mut decompressor, decompressor_name) =
-            start_decompressor_process("disk.img.xz").await?;
+        let pipeline =
+            setup_external_decompressor_pipeline(http_rx, block_writer, decompressed_progress_tx)
+                .await?;
 
-        let decompressor_stdin = decompressor.stdin.take().unwrap();
-        let decompressor_stdout = decompressor.stdout.take().unwrap();
-        let decompressor_stderr = decompressor.stderr.take().unwrap();
-
-        let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-
-        // Spawn stderr reader
-        tokio::spawn(spawn_stderr_reader(
-            decompressor_stderr,
-            error_tx.clone(),
-            decompressor_name,
-        ));
-
-        // Spawn error processor
-        tokio::spawn(process_error_messages(error_rx));
-
-        // Spawn blocking task: read from channel and write to xzcat stdin
-        // First, create a sync file handle from the async stdin
-        #[cfg(unix)]
-        let stdin_fd = {
-            use std::os::unix::io::{AsRawFd, FromRawFd};
-            let raw_fd = decompressor_stdin.as_raw_fd();
-            // Duplicate the fd so we can use it in blocking context
-            let dup_fd = unsafe { libc::dup(raw_fd) };
-            if dup_fd == -1 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // SAFETY: dup_fd is a valid file descriptor (we checked above)
-            unsafe { std::fs::File::from_raw_fd(dup_fd) }
-        };
-        #[cfg(not(unix))]
-        let stdin_fd: std::fs::File = {
-            return Err("XZ streaming decompression is not supported on non-unix platforms".into());
-        };
-
-        // Drop the original async stdin (the dup'd fd still points to the pipe)
-        drop(decompressor_stdin);
-
-        let stdin_writer_handle = {
-            tokio::task::spawn_blocking(move || {
-                use std::io::Write as _;
-                let reader = ChannelReader::new(http_rx);
-                let mut reader = reader;
-                let mut stdin = stdin_fd;
-                let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
-
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            if let Err(e) = stdin.write_all(&buffer[..n]) {
-                                return Err(format!("Error writing to xzcat: {}", e));
-                            }
-                        }
-                        Err(e) => return Err(format!("Error reading stream: {}", e)),
-                    }
-                }
-
-                drop(stdin);
-                Ok::<(), String>(())
-            })
-        };
-
-        // Spawn task: xzcat stdout -> block writer
-        let writer = block_writer;
-        let progress_tx = decompressed_progress_tx;
-        tokio::spawn(async move {
-            let mut stdout = decompressor_stdout;
-            let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let data = buffer[..n].to_vec();
-                        let _ = progress_tx.send(n as u64);
-                        writer.write(data).await?
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-
-            // Wait for stdin writer to finish
-            let _ = stdin_writer_handle.await;
-
-            // Wait for decompressor to finish
-            let _ = decompressor.wait().await;
-
-            writer.close().await
-        })
+        (pipeline.writer_handle, Some(pipeline.decompressor))
     } else {
         // Gzip or None: decompress in-process and write directly to block writer
-        let writer = block_writer;
-        let progress_tx = decompressed_progress_tx;
-        let debug = options.common.debug;
+        let handle = setup_inprocess_decompression_pipeline(
+            http_rx,
+            block_writer,
+            decompressed_progress_tx,
+            compression_type,
+            options.common.debug,
+        )
+        .await?;
 
-        // Create an async channel for decompressed data
-        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
-
-        // Capture the runtime handle before entering the blocking task
-        let rt = tokio::runtime::Handle::current();
-
-        // Spawn blocking task: read, decompress, send to async channel
-        let reader_handle = tokio::task::spawn_blocking(move || {
-            let reader = ChannelReader::new(http_rx);
-
-            // Apply in-process gzip decompression if needed
-            let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
-                Compression::Gzip => {
-                    if debug {
-                        eprintln!("[DEBUG] Applying in-process gzip decompression");
-                    }
-                    Box::new(flate2::read::GzDecoder::new(reader))
-                }
-                _ => Box::new(reader),
-            };
-
-            let mut reader = processed_reader;
-            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
-
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        // Send to async channel using block_on
-                        if rt.block_on(data_tx.send(buffer[..n].to_vec())).is_err() {
-                            return Err("Data channel closed".to_string());
-                        }
-                    }
-                    Err(e) => return Err(format!("Error reading/decompressing: {}", e)),
-                }
-            }
-
-            Ok::<(), String>(())
-        });
-
-        // Spawn async task: receive from channel and write to block writer
-        tokio::spawn(async move {
-            while let Some(data) = data_rx.recv().await {
-                let len = data.len() as u64;
-                let _ = progress_tx.send(len);
-                writer.write(data).await?
-            }
-
-            let _ = reader_handle.await;
-            writer.close().await
-        })
+        (handle, None)
     };
 
-    // Send the already-downloaded detection buffer first
-    if http_tx
-        .send(bytes::Bytes::from(initial_buffer))
-        .await
-        .is_err()
-    {
-        return Err("Failed to send detection buffer to streaming pipeline".into());
-    }
+    // Coordinate download and processing
+    let params = RawDiskDownloadParams {
+        http_tx,
+        writer_handle,
+        external_decompressor,
+        decompressed_progress_rx,
+        raw_written_progress_rx,
+    };
 
-    // Main download loop - stream chunks to processing pipeline
-    let mut chunk_count = 0;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-            Ok(Some(chunk_result)) => {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let chunk_len = chunk.len() as u64;
-                        progress.bytes_received += chunk_len;
-                        chunk_count += 1;
-
-                        if options.common.debug && chunk_count <= 5 {
-                            eprintln!(
-                                "[DEBUG] Received chunk {}: {} bytes (total: {} MB)",
-                                chunk_count,
-                                chunk_len,
-                                progress.bytes_received / (1024 * 1024)
-                            );
-                        }
-
-                        if http_tx.send(chunk).await.is_err() {
-                            eprintln!("\nStreaming pipeline closed");
-                            break;
-                        }
-
-                        // Update progress
-                        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-                            progress.bytes_decompressed += byte_count;
-                        }
-                        while let Ok(written_bytes) = raw_written_progress_rx.try_recv() {
-                            progress.bytes_written = written_bytes;
-                        }
-                        // For raw disk images, bytes_sent_to_decompressor tracks bytes_received
-                        // since data is immediately forwarded to the decompression pipeline
-                        progress.bytes_sent_to_decompressor = progress.bytes_received;
-
-                        if let Err(e) =
-                            progress.update_progress(Some(layer_size), update_interval, false)
-                        {
-                            eprintln!();
-                            return Err(e);
-                        }
-                    }
-                    Err(e) => {
-                        return Err(format!("Download error: {}", e).into());
-                    }
-                }
-            }
-            Ok(None) => {
-                // Stream ended
-                break;
-            }
-            Err(_) => {
-                return Err("Download timeout".into());
-            }
-        }
-    }
-
-    // Close HTTP channel to signal download complete
-    drop(http_tx);
-
-    if options.common.debug {
-        eprintln!(
-            "[DEBUG] Download completed, {} bytes received",
-            progress.bytes_received
-        );
-    }
-
-    // Wait for the processing pipeline to complete
-    loop {
-        // Update progress from decompression and writes
-        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-            progress.bytes_decompressed += byte_count;
-        }
-        while let Ok(written_bytes) = raw_written_progress_rx.try_recv() {
-            progress.bytes_written = written_bytes;
-        }
-        let _ = progress.update_progress(Some(layer_size), update_interval, false);
-
-        if writer_handle.is_finished() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Get final result
-    match writer_handle.await {
-        Ok(Ok(final_bytes)) => {
-            progress.bytes_written = final_bytes;
-            progress.bytes_decompressed = final_bytes;
-        }
-        Ok(Err(e)) => return Err(e.into()),
-        Err(e) => return Err(e.into()),
-    }
-
-    // Final progress update
-    let _ = progress.update_progress(Some(layer_size), update_interval, true);
-
-    // Print final stats
-    progress.print_final_stats();
-
-    Ok(())
+    coordinate_raw_disk_download(stream, initial_buffer, layer_size, params, &options).await
 }
 
 /// Simple tar archive extraction without the complex buffering logic
