@@ -19,9 +19,11 @@ use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
+use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
 use crate::fls::magic_bytes::{detect_content_and_compression, ContentType};
 use crate::fls::options::OciOptions;
 use crate::fls::progress::ProgressTracker;
+use crate::fls::simg::{SparseParser, WriteCommand};
 use crate::fls::stream_utils::ChannelReader;
 
 /// Parameters for download coordination functions
@@ -75,6 +77,166 @@ struct TarPipelineComponents {
     error_processor: tokio::task::JoinHandle<()>,
     decompressor: tokio::process::Child,
     decompressor_name: &'static str,
+}
+
+/// Execute a sequence of write commands on the block writer
+async fn execute_write_commands(
+    commands: Vec<WriteCommand>,
+    writer: &AsyncBlockWriter,
+    debug: bool,
+) -> std::io::Result<()> {
+    for cmd in commands {
+        match cmd {
+            WriteCommand::Write(data) => writer.write(data).await?,
+            WriteCommand::Seek(offset) => {
+                if debug {
+                    eprintln!("[DEBUG] Sparse: seeking to offset {}", offset);
+                }
+                writer.seek(offset).await?;
+            }
+            WriteCommand::Fill { pattern, bytes } => {
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Sparse: fill pattern {:02x}{:02x}{:02x}{:02x} for {} bytes",
+                        pattern[0], pattern[1], pattern[2], pattern[3], bytes
+                    );
+                }
+                writer.fill(pattern, bytes).await?;
+            }
+            WriteCommand::Complete { expected_size } => {
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Sparse: complete, expected output size {} bytes",
+                        expected_size
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Process data through sparse parser and execute resulting write commands
+async fn process_sparse_data(
+    parser: &mut SparseParser,
+    data: &[u8],
+    writer: &AsyncBlockWriter,
+    debug: bool,
+) -> std::io::Result<()> {
+    let (commands, _consumed) = parser.process(data).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Sparse image parse error: {}", e),
+        )
+    })?;
+    execute_write_commands(commands, writer, debug).await
+}
+
+/// Handle detected format: process initial data and return parser if sparse
+async fn handle_detected_format(
+    format: FileFormat,
+    consumed_bytes: Vec<u8>,
+    remaining_data: &[u8],
+    writer: &AsyncBlockWriter,
+    debug: bool,
+) -> std::io::Result<Option<SparseParser>> {
+    match format {
+        FileFormat::SparseImage => {
+            if debug {
+                eprintln!("[DEBUG] Auto-detect: Detected sparse image format");
+            }
+            let mut parser = SparseParser::new();
+
+            // Process the accumulated detection data
+            process_sparse_data(&mut parser, &consumed_bytes, writer, debug).await?;
+
+            // Process any remaining data in current buffer
+            if !remaining_data.is_empty() {
+                process_sparse_data(&mut parser, remaining_data, writer, debug).await?;
+            }
+
+            Ok(Some(parser))
+        }
+        FileFormat::Regular => {
+            if debug {
+                eprintln!("[DEBUG] Auto-detect: Detected regular file format");
+            }
+            // Write the accumulated detection data
+            writer.write(consumed_bytes).await?;
+
+            // Write any remaining data
+            if !remaining_data.is_empty() {
+                writer.write(remaining_data.to_vec()).await?;
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+/// Process a single buffer through format detection and writing
+///
+/// This is the core logic for handling incoming data in the write pipeline.
+/// It handles format detection (sparse vs regular), and once determined,
+/// routes data appropriately to either the sparse parser or direct write.
+async fn process_buffer_with_format_detection(
+    buffer: &[u8],
+    n: usize,
+    detector: &mut FormatDetector,
+    parser: &mut Option<SparseParser>,
+    format_determined: &mut bool,
+    writer: &AsyncBlockWriter,
+    debug: bool,
+) -> std::io::Result<()> {
+    if !*format_determined {
+        match detector.process(&buffer[..n]) {
+            DetectionResult::NeedMoreData => {
+                if debug {
+                    eprintln!("[DEBUG] Auto-detect: Need more data for format detection");
+                }
+                return Ok(());
+            }
+            DetectionResult::Detected {
+                format,
+                consumed_bytes,
+                consumed_from_input,
+            } => {
+                let remaining = &buffer[consumed_from_input..n];
+                *parser = handle_detected_format(format, consumed_bytes, remaining, writer, debug)
+                    .await?;
+                *format_determined = true;
+            }
+            DetectionResult::Error(msg) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+            }
+        }
+    } else if let Some(ref mut p) = parser {
+        process_sparse_data(p, &buffer[..n], writer, debug).await?;
+    } else {
+        writer.write(buffer[..n].to_vec()).await?;
+    }
+    Ok(())
+}
+
+/// Handle EOF when format detection is incomplete
+async fn finalize_format_at_eof(
+    detector: &mut FormatDetector,
+    format_determined: bool,
+    writer: &AsyncBlockWriter,
+    debug: bool,
+) -> std::io::Result<()> {
+    if !format_determined {
+        if let Some(buffered_data) = detector.finalize_at_eof() {
+            if debug {
+                eprintln!(
+                    "[DEBUG] EOF before format detection complete, writing {} buffered bytes as regular data",
+                    buffered_data.len()
+                );
+            }
+            writer.write(buffered_data).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the manifest, handling multi-platform manifest indexes
@@ -170,33 +332,53 @@ async fn setup_tar_processing_pipeline(
         options.common.write_buffer_size_mb,
     )?;
 
-    // Spawn task: decompressor stdout -> block writer
+    // Spawn task: decompressor stdout -> block writer with sparse image detection
     let error_tx_clone = error_tx.clone();
+    let debug = options.common.debug;
     let writer_handle = {
         let writer = block_writer;
         tokio::spawn(async move {
             let mut stdout = decompressor_stdout;
             let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
 
+            // Auto-detect sparse image format from initial data
+            let mut detector = FormatDetector::new();
+            let mut parser: Option<SparseParser> = None;
+            let mut format_determined = false;
+
             loop {
-                match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let data = buffer[..n].to_vec();
-                        if decompressed_progress_tx.send(n as u64).is_err() {
-                            break;
-                        }
-                        if let Err(e) = writer.write(data).await {
-                            let _ = error_tx_clone.send(format!("Error writing to device: {}", e));
-                            return Err(e);
-                        }
+                let n = match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
+                    Ok(0) => {
+                        finalize_format_at_eof(&mut detector, format_determined, &writer, debug)
+                            .await?;
+                        break;
                     }
+                    Ok(n) => n,
                     Err(e) => {
                         let _ =
                             error_tx_clone.send(format!("Error reading from decompressor: {}", e));
                         return Err(e);
                     }
+                };
+
+                if decompressed_progress_tx.send(n as u64).is_err() {
+                    break;
                 }
+
+                process_buffer_with_format_detection(
+                    &buffer,
+                    n,
+                    &mut detector,
+                    &mut parser,
+                    &mut format_determined,
+                    &writer,
+                    debug,
+                )
+                .await
+                .map_err(|e| {
+                    let _ = error_tx_clone.send(format!("Write pipeline error: {}", e));
+                    e
+                })?;
             }
             writer.close().await
         })
@@ -428,6 +610,7 @@ async fn setup_external_decompressor_pipeline(
     http_rx: mpsc::Receiver<bytes::Bytes>,
     block_writer: AsyncBlockWriter,
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
+    debug: bool,
 ) -> Result<ExternalDecompressorPipeline, Box<dyn std::error::Error>> {
     // XZ: Use external xzcat process
     let (mut decompressor, decompressor_name) = start_decompressor_process("disk.img.xz").await?;
@@ -495,23 +678,41 @@ async fn setup_external_decompressor_pipeline(
         })
     };
 
-    // Spawn task: xzcat stdout -> block writer
+    // Spawn task: xzcat stdout -> block writer with sparse detection
     let writer = block_writer;
     let progress_tx = decompressed_progress_tx;
     let writer_handle = tokio::spawn(async move {
         let mut stdout = decompressor_stdout;
         let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
 
+        // Auto-detect sparse image format from initial data
+        let mut detector = FormatDetector::new();
+        let mut parser: Option<SparseParser> = None;
+        let mut format_determined = false;
+
         loop {
-            match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    let data = buffer[..n].to_vec();
-                    let _ = progress_tx.send(n as u64);
-                    writer.write(data).await?
+            let n = match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
+                Ok(0) => {
+                    finalize_format_at_eof(&mut detector, format_determined, &writer, debug)
+                        .await?;
+                    break;
                 }
+                Ok(n) => n,
                 Err(e) => return Err(e),
-            }
+            };
+
+            let _ = progress_tx.send(n as u64);
+
+            process_buffer_with_format_detection(
+                &buffer,
+                n,
+                &mut detector,
+                &mut parser,
+                &mut format_determined,
+                &writer,
+                debug,
+            )
+            .await?;
         }
 
         // Wait for stdin writer to finish and propagate any errors
@@ -580,13 +781,31 @@ async fn setup_inprocess_decompression_pipeline(
         Ok::<(), String>(())
     });
 
-    // Spawn async task: receive from channel and write to block writer
+    // Spawn async task: receive from channel and write to block writer with sparse detection
     let handle = tokio::spawn(async move {
+        // Auto-detect sparse image format from initial data
+        let mut detector = FormatDetector::new();
+        let mut parser: Option<SparseParser> = None;
+        let mut format_determined = false;
+
         while let Some(data) = data_rx.recv().await {
-            let len = data.len() as u64;
-            let _ = progress_tx.send(len);
-            writer.write(data).await?
+            let len = data.len();
+            let _ = progress_tx.send(len as u64);
+
+            process_buffer_with_format_detection(
+                &data,
+                len,
+                &mut detector,
+                &mut parser,
+                &mut format_determined,
+                &writer,
+                debug,
+            )
+            .await?;
         }
+
+        // Handle EOF with incomplete format detection
+        finalize_format_at_eof(&mut detector, format_determined, &writer, debug).await?;
 
         // Wait for reader and propagate any errors
         match reader_handle.await {
@@ -1476,9 +1695,13 @@ async fn flash_raw_disk_image_directly(
     // Spawn the processing pipeline based on compression type
     let (writer_handle, external_decompressor) = if needs_external_decompressor {
         // XZ: Use external xzcat process
-        let pipeline =
-            setup_external_decompressor_pipeline(http_rx, block_writer, decompressed_progress_tx)
-                .await?;
+        let pipeline = setup_external_decompressor_pipeline(
+            http_rx,
+            block_writer,
+            decompressed_progress_tx,
+            options.common.debug,
+        )
+        .await?;
 
         (pipeline.writer_handle, Some(pipeline.decompressor))
     } else {

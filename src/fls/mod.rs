@@ -4,6 +4,7 @@ pub(crate) mod compression;
 mod decompress;
 mod download_error;
 mod error_handling;
+mod format_detector;
 mod from_url;
 pub(crate) mod http;
 mod magic_bytes;
@@ -11,6 +12,7 @@ mod memory;
 pub mod oci;
 mod options;
 mod progress;
+mod simg;
 mod stream_utils;
 
 // Public re-exports
