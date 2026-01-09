@@ -221,50 +221,26 @@ impl ProgressTracker {
     }
 
     pub(crate) fn final_stats(&self) -> FinalStats {
-        let final_mb_received = self.bytes_received as f64 / (1024.0 * 1024.0);
-        let final_mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
-        let final_mb_written = self.bytes_written as f64 / (1024.0 * 1024.0);
+        let mb_received = self.bytes_received as f64 / (1024.0 * 1024.0);
+        let mb_decompressed = self.bytes_decompressed as f64 / (1024.0 * 1024.0);
+        let mb_written = self.bytes_written as f64 / (1024.0 * 1024.0);
 
-        // Calculate total runtime from start to now
         let total_secs = self.start_time.elapsed().as_secs_f64();
 
-        // Use the stored durations for each phase
-        let download_secs = self
-            .download_duration
-            .unwrap_or_else(|| Duration::from_secs(0))
-            .as_secs_f64();
-        let decompress_secs = self
-            .decompress_duration
-            .unwrap_or_else(|| Duration::from_secs(0))
-            .as_secs_f64();
-        let write_secs = self
-            .write_duration
-            .unwrap_or_else(|| Duration::from_secs(0))
-            .as_secs_f64();
+        let download_secs = self.download_duration.unwrap_or_default().as_secs_f64();
+        let decompress_secs = self.decompress_duration.unwrap_or_default().as_secs_f64();
+        let write_secs = self.write_duration.unwrap_or_default().as_secs_f64();
 
-        let final_download_rate = if download_secs > 0.0 {
-            final_mb_received / download_secs
-        } else {
-            0.0
-        };
-        let final_decompress_rate = if decompress_secs > 0.0 {
-            final_mb_decompressed / decompress_secs
-        } else {
-            0.0
-        };
-        let final_written_rate = if write_secs > 0.0 {
-            final_mb_written / write_secs
-        } else {
-            0.0
-        };
+        // Helper to calculate rate, avoiding division by zero
+        let rate = |mb: f64, secs: f64| if secs > 0.0 { mb / secs } else { 0.0 };
 
         FinalStats {
-            mb_received: final_mb_received,
-            mb_decompressed: final_mb_decompressed,
-            mb_written: final_mb_written,
-            download_rate: final_download_rate,
-            decompress_rate: final_decompress_rate,
-            write_rate: final_written_rate,
+            mb_received,
+            mb_decompressed,
+            mb_written,
+            download_rate: rate(mb_received, download_secs),
+            decompress_rate: rate(mb_decompressed, decompress_secs),
+            write_rate: rate(mb_written, write_secs),
             download_secs,
             decompress_secs,
             write_secs,
@@ -277,30 +253,16 @@ impl ProgressTracker {
     /// This consolidates the common stats printing pattern used by both
     /// URL and OCI flash operations.
     pub(crate) fn print_final_stats(&self) {
-        let stats = self.final_stats();
-        println!(
-            "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
-            stats.mb_received,
-            stats.download_time_formatted(),
-            stats.download_rate
-        );
-        println!(
-            "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
-            stats.mb_decompressed,
-            stats.decompress_time_formatted(),
-            stats.decompress_rate
-        );
-        println!(
-            "Write complete: {:.2} MB in {} ({:.2} MB/s)",
-            stats.mb_written,
-            stats.write_time_formatted(),
-            stats.write_rate
-        );
-        println!("Total flash runtime: {}", stats.total_time_formatted());
+        self.print_stats(false);
     }
 
     /// Print final statistics including compression ratio (for URL flash)
     pub(crate) fn print_final_stats_with_ratio(&self) {
+        self.print_stats(true);
+    }
+
+    /// Internal helper to print stats with optional compression ratio
+    fn print_stats(&self, include_compression_ratio: bool) {
         let stats = self.final_stats();
         println!(
             "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
@@ -320,7 +282,7 @@ impl ProgressTracker {
             stats.write_time_formatted(),
             stats.write_rate
         );
-        if stats.mb_received > 0.0 {
+        if include_compression_ratio && stats.mb_received > 0.0 {
             println!(
                 "Compression ratio: {:.2}x",
                 stats.mb_decompressed / stats.mb_received

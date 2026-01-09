@@ -63,7 +63,24 @@ impl ImageReference {
         let (name_part, reference) = if let Some(at_pos) = input.rfind('@') {
             let digest = &input[at_pos + 1..];
             validate_digest(digest)?;
-            (&input[..at_pos], Reference::Digest(digest.to_string()))
+            let name_part = &input[..at_pos];
+
+            // Disallow tag mixed with digest (e.g. repo:tag@sha256:...)
+            // but allow registry ports (e.g. registry:5000/repo@sha256:...)
+            if let Some(last_colon) = name_part.rfind(':') {
+                if let Some(last_slash) = name_part.rfind('/') {
+                    // If colon comes after the last slash, it's a tag (invalid with digest)
+                    if last_colon > last_slash {
+                        return Err("Invalid reference: cannot combine tag and digest".to_string());
+                    }
+                } else {
+                    // No slash at all means the colon would be a tag, not a port
+                    // (e.g., "repo:tag@sha256:...")
+                    return Err("Invalid reference: cannot combine tag and digest".to_string());
+                }
+            }
+
+            (name_part, Reference::Digest(digest.to_string()))
         } else {
             // Split by : for tag, but be careful about registry port
             let (name, tag) = split_name_and_tag(input)?;
@@ -149,25 +166,7 @@ fn validate_digest(digest: &str) -> Result<(), String> {
 
 /// Check if a string looks like a hostname (contains dot, is localhost, or is IP literal)
 fn looks_like_hostname(authority: &str) -> bool {
-    // Contains a dot (e.g., registry.example.com)
-    if authority.contains('.') {
-        return true;
-    }
-
-    // Is localhost
-    if authority == "localhost" {
-        return true;
-    }
-
-    // Is an IPv6 literal (starts with '[')
-    if authority.starts_with('[') {
-        return true;
-    }
-
-    // Could add IPv4 detection here if needed, but most practical
-    // IPv4 addresses would contain dots anyway
-
-    false
+    authority.contains('.') || authority == "localhost" || authority.starts_with('[')
 }
 
 /// Split image name and tag, handling registry ports correctly
@@ -336,5 +335,29 @@ mod tests {
         let result = ImageReference::parse("ghcr.io/org/repo@md5:d41d8cd98f00b204e9800998ecf8427e");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported digest algorithm"));
+    }
+
+    #[test]
+    fn test_invalid_tag_with_digest() {
+        // Tag + digest is not allowed
+        let result = ImageReference::parse(
+            "ghcr.io/org/repo:tag@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot combine tag and digest"));
+    }
+
+    #[test]
+    fn test_valid_registry_port_with_digest() {
+        // Registry port + digest should be allowed
+        let r = ImageReference::parse(
+            "registry:5000/repo@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        assert_eq!(r.registry, "registry:5000");
+        assert_eq!(r.repository, "repo");
+        assert!(matches!(r.reference, Reference::Digest(_)));
     }
 }

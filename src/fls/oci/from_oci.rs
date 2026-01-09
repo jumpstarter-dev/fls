@@ -10,6 +10,7 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use xz2::read::XzDecoder;
 
 use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
@@ -513,8 +514,11 @@ async fn setup_external_decompressor_pipeline(
             }
         }
 
-        // Wait for stdin writer to finish
-        let _ = stdin_writer_handle.await;
+        // Wait for stdin writer to finish and propagate any errors
+        stdin_writer_handle
+            .await
+            .map_err(|e| std::io::Error::other(format!("Stdin writer task failed: {}", e)))?
+            .map_err(|e| std::io::Error::other(format!("Stdin writer error: {}", e)))?;
 
         writer.close().await
     });
@@ -540,9 +544,6 @@ async fn setup_inprocess_decompression_pipeline(
     // Create an async channel for decompressed data
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
 
-    // Capture the runtime handle before entering the blocking task
-    let rt = tokio::runtime::Handle::current();
-
     // Spawn blocking task: read, decompress, send to async channel
     let reader_handle = tokio::task::spawn_blocking(move || {
         let reader = ChannelReader::new(http_rx);
@@ -565,10 +566,12 @@ async fn setup_inprocess_decompression_pipeline(
             match reader.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    // Send to async channel using block_on
-                    if rt.block_on(data_tx.send(buffer[..n].to_vec())).is_err() {
-                        return Err("Data channel closed".to_string());
-                    }
+                    // Use blocking_send for proper backpressure handling
+                    // This blocks the thread until space is available, avoiding deadlocks
+                    // that could occur with block_on, while still providing backpressure
+                    data_tx
+                        .blocking_send(buffer[..n].to_vec())
+                        .map_err(|_| "Data channel closed")?;
                 }
                 Err(e) => return Err(format!("Error reading/decompressing: {}", e)),
             }
@@ -585,7 +588,20 @@ async fn setup_inprocess_decompression_pipeline(
             writer.write(data).await?
         }
 
-        let _ = reader_handle.await;
+        // Wait for reader and propagate any errors
+        match reader_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(std::io::Error::other(format!(
+                    "Reader/decompression error: {}",
+                    e
+                )));
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!("Reader task failed: {}", e)));
+            }
+        }
+
         writer.close().await
     });
 
@@ -713,6 +729,24 @@ async fn coordinate_raw_disk_download(
         Err(e) => return Err(e.into()),
     }
 
+    // Wait for external decompressor process and check exit status
+    if let Some(mut decompressor) = params.external_decompressor {
+        match decompressor.wait().await {
+            Ok(status) => {
+                if !status.success() {
+                    return Err(format!(
+                        "Decompressor process failed with exit code: {:?}",
+                        status.code()
+                    )
+                    .into());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to wait for decompressor process: {}", e).into());
+            }
+        }
+    }
+
     // Final progress update
     let _ = progress.update_progress(Some(layer_size), update_interval, true);
 
@@ -810,8 +844,8 @@ pub async fn flash_from_oci(
         .await;
     }
 
-    // Handle XZ-compressed tar archives - bypass tar extraction and pass directly to main pipeline
-    if compression_type == Compression::Xz {
+    // Handle XZ-compressed data that is NOT a tar archive - bypass tar extraction
+    if compression_type == Compression::Xz && content_type != ContentType::TarArchive {
         if options.common.debug {
             eprintln!("[DEBUG] XZ-compressed layer detected - bypassing tar extraction, passing directly to main pipeline");
         }
@@ -950,11 +984,11 @@ fn extract_tar_stream_impl<R: Read + Send>(
         }
     } else if is_xz {
         if debug {
-            eprintln!("[DEBUG] Auto-detected XZ compression from magic bytes - passing raw XZ data to main pipeline");
+            eprintln!("[DEBUG] Auto-detected XZ compression from magic bytes - decompressing for tar extraction");
         }
-        // Don't decompress XZ internally - let the main pipeline's external xzcat handle it
-        // Pass the raw XZ data through as-is
-        Box::new(magic_reader)
+        // Decompress XZ before tar extraction (like gzip)
+        let xz_decoder = XzDecoder::new(magic_reader);
+        Box::new(xz_decoder)
     } else {
         if debug {
             eprintln!("[DEBUG] No compression detected, treating as raw tar");
@@ -1020,39 +1054,49 @@ fn extract_tar_stream_impl<R: Read + Send>(
 /// Determine the appropriate decompressor hint based on content and compression types.
 ///
 /// Returns a file pattern string that `start_decompressor_process` uses to select
-/// the appropriate decompressor command (e.g., "disk.img" → cat, "disk.img.xz" → xzcat).
+/// the appropriate decompressor command (e.g., "disk.img" -> cat, "disk.img.xz" -> xzcat).
 fn get_decompressor_hint(
     content_type: ContentType,
-    layer_compression: LayerCompression,
+    _layer_compression: LayerCompression,
     content_compression: Compression,
     file_pattern: Option<&str>,
 ) -> &'static str {
-    match (content_type, layer_compression, content_compression) {
-        // Layer is compressed per manifest (gzip/zstd) - we decompress before tar extraction,
-        // so external decompressor for extracted files should be "cat"
-        (ContentType::TarArchive, LayerCompression::Gzip | LayerCompression::Zstd, _) => "disk.img",
-        // Layer is uncompressed per manifest but content detection found gzip
-        (ContentType::TarArchive, LayerCompression::None, Compression::Gzip) => "disk.img",
-        // Layer is uncompressed per manifest but content detection found XZ
-        (ContentType::TarArchive, LayerCompression::None, Compression::Xz) => "disk.img.xz",
-        // Default: use file pattern or assume XZ compressed disk image
-        _ => match file_pattern {
-            Some(p) if p.ends_with(".xz") => "disk.img.xz",
-            Some(p) if p.ends_with(".gz") => "disk.img.gz",
-            Some(_) => "disk.img",
-            None => "disk.img.xz",
-        },
+    // Priority 1: If user specified a file pattern, use its extension
+    // This handles cases like gzip-compressed tar containing xz-compressed disk images
+    if let Some(p) = file_pattern {
+        if p.ends_with(".xz") {
+            return "disk.img.xz";
+        }
+        if p.ends_with(".gz") {
+            return "disk.img.gz";
+        }
+        // Pattern specified but no compression extension - assume uncompressed
+        return "disk.img";
     }
+
+    // Priority 2: For tar archives, use content compression to determine
+    // what decompressor the extracted file needs
+    if content_type == ContentType::TarArchive {
+        return match content_compression {
+            Compression::Xz => "disk.img.xz",
+            Compression::Gzip => "disk.img.gz",
+            Compression::Zstd => "disk.img", // Zstd not supported for file-level decompression
+            Compression::None => "disk.img",
+        };
+    }
+
+    // Default: assume XZ compressed disk image (conservative choice)
+    "disk.img.xz"
 }
 
 /// Check if a path matches a disk image
 fn is_disk_image(path: &Path, pattern: Option<&str>) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let Some(os_name) = path.file_name() else {
+        return false;
+    };
+    let name = os_name.to_string_lossy();
 
-    // Skip hidden files and directories
+    // Skip hidden files
     if name.starts_with('.') {
         return false;
     }
@@ -1063,32 +1107,23 @@ fn is_disk_image(path: &Path, pattern: Option<&str>) -> bool {
     }
 
     // Default: look for common disk image extensions
-    let extensions = [
+    const DISK_IMAGE_EXTENSIONS: &[&str] = &[
         ".img.xz", ".img.gz", ".img.bz2", ".raw.xz", ".raw.gz", ".raw.bz2", ".xz", ".gz", ".bz2",
         ".img", ".raw",
     ];
 
-    extensions.iter().any(|ext| name.ends_with(ext))
+    DISK_IMAGE_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
 }
 
-/// Simple glob pattern matching
+/// Simple glob pattern matching supporting `*.ext`, `prefix*`, or exact match.
 ///
-/// Supports limited glob patterns:
-/// - `*.ext` - matches any file ending with `.ext`
-/// - `prefix*` - matches any file starting with `prefix`
-/// - `exact` - exact string match
-///
-/// **Limitations**: Does not support wildcards in the middle of patterns
-/// (e.g., `disk*.img` or `*.img.*` won't work as expected)
+/// Does not support wildcards in the middle of patterns (e.g., `disk*.img`).
 fn matches_pattern(name: &str, pattern: &str) -> bool {
-    if pattern.starts_with('*') && pattern.len() > 1 {
-        // *.ext pattern
-        name.ends_with(&pattern[1..])
-    } else if pattern.ends_with('*') && pattern.len() > 1 {
-        // prefix* pattern
-        name.starts_with(&pattern[..pattern.len() - 1])
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
     } else {
-        // Exact match
         name == pattern
     }
 }
@@ -1506,10 +1541,9 @@ fn extract_tar_archive_from_stream(
                 }
                 Compression::Xz => {
                     if debug {
-                        eprintln!("[DEBUG] Content is XZ compressed layer (detected), passing raw XZ data to main pipeline");
+                        eprintln!("[DEBUG] Content is XZ compressed layer (detected), will be decompressed during tar extraction");
                     }
-                    // Don't decompress XZ here - let the main pipeline's external xzcat handle it
-                    // Just pass the raw XZ data through
+                    // XZ decompression happens in extract_tar_stream_impl via magic byte detection
                     Box::new(reader)
                 }
                 Compression::None => {

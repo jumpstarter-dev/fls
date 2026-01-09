@@ -101,15 +101,18 @@ async fn main() {
 
             if is_oci {
                 // OCI image - strip scheme prefix
-                let image_ref = url.strip_prefix("oci://").unwrap();
+                let image_ref = url
+                    .strip_prefix("oci://")
+                    .expect("URL should start with 'oci://' as verified above");
 
                 println!("OCI flash command:");
                 println!("  Image: {}", image_ref);
                 println!("  Device: {}", device);
-                if username.is_some() {
-                    println!("  Auth: Using provided credentials");
-                } else {
-                    println!("  Auth: Anonymous");
+                match (&username, &password) {
+                    (Some(_), Some(_)) => println!("  Auth: Using provided credentials"),
+                    (Some(_), None) => println!("  Auth: Username provided but password missing"),
+                    (None, Some(_)) => println!("  Auth: Password provided but username missing"),
+                    (None, None) => println!("  Auth: Anonymous"),
                 }
                 if let Some(ref pattern) = file_pattern {
                     println!("  File pattern: {}", pattern);
@@ -173,24 +176,21 @@ async fn main() {
                 let parsed_headers: Vec<(String, String)> = headers
                     .iter()
                     .filter_map(|h| {
-                        let parts: Vec<&str> = h.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let header_name = parts[0].trim().to_string();
-                            let header_value = parts[1].trim().to_string();
-
-                            if header_name.is_empty() {
-                                eprintln!("Warning: Ignoring header with empty name: {}", h);
-                                None
-                            } else if header_value.is_empty() {
-                                eprintln!("Warning: Header '{}' has empty value", header_name);
-                                Some((header_name, header_value))
-                            } else {
-                                Some((header_name, header_value))
-                            }
-                        } else {
+                        let Some((name, value)) = h.split_once(':') else {
                             eprintln!("Warning: Ignoring invalid header format: {}", h);
-                            None
+                            return None;
+                        };
+                        let name = name.trim().to_string();
+                        let value = value.trim().to_string();
+
+                        if name.is_empty() {
+                            eprintln!("Warning: Ignoring header with empty name: {}", h);
+                            return None;
                         }
+                        if value.is_empty() {
+                            eprintln!("Warning: Header '{}' has empty value", name);
+                        }
+                        Some((name, value))
                     })
                     .collect();
 

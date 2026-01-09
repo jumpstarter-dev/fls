@@ -4,43 +4,38 @@
 /// from magic bytes (file signatures).
 use crate::fls::compression::Compression;
 
+/// Magic byte signatures for compression formats
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const XZ_MAGIC: [u8; 6] = *b"\xfd7zXZ\x00";
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
 /// Detect compression type from magic bytes
 ///
 /// Examines the first few bytes of data to determine the compression format.
 /// Returns `Compression::None` if no recognized compression signature is found.
 pub fn detect_compression(data: &[u8]) -> Compression {
-    if data.len() < 2 {
-        return Compression::None;
+    if data.starts_with(&GZIP_MAGIC) {
+        Compression::Gzip
+    } else if data.starts_with(&XZ_MAGIC) {
+        Compression::Xz
+    } else if data.starts_with(&ZSTD_MAGIC) {
+        Compression::Zstd
+    } else {
+        Compression::None
     }
-
-    // Gzip: 1f 8b
-    if data[0] == 0x1f && data[1] == 0x8b {
-        return Compression::Gzip;
-    }
-
-    // XZ: fd 37 7a 58 5a 00 (0xFD + "7zXZ" + 0x00)
-    if data.len() >= 6 && &data[0..6] == b"\xfd7zXZ\x00" {
-        return Compression::Xz;
-    }
-
-    // Zstd: 28 b5 2f fd
-    if data.len() >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd {
-        return Compression::Zstd;
-    }
-
-    Compression::None
 }
+
+/// Offset and magic bytes for tar archive detection
+const TAR_MAGIC_OFFSET: usize = 257;
+const TAR_MAGIC_USTAR: &[u8] = b"ustar\0";
 
 /// Check if data appears to be a tar archive
 ///
-/// Tar archives have "ustar" or "posix" magic at offset 257.
+/// Tar archives have "ustar\0" magic at offset 257 (POSIX ustar format).
 pub fn is_tar_archive(data: &[u8]) -> bool {
-    if data.len() < 262 {
-        return false;
-    }
-
-    let magic = &data[257..262];
-    magic == b"ustar" || magic == b"posix"
+    data.get(TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + 6)
+        .map(|magic| magic == TAR_MAGIC_USTAR)
+        .unwrap_or(false)
 }
 
 /// Content type for OCI layer detection
@@ -90,14 +85,21 @@ pub fn detect_content_and_compression(
             }
         }
         Compression::Xz => {
-            // For XZ, assume tar archive (common pattern)
-            if debug {
-                eprintln!("[DEBUG] XZ detected, assuming tar archive");
+            // Try to decompress first few KB to analyze content
+            match decompress_xz_sample(data) {
+                Ok(decompressed) => decompressed,
+                Err(e) => {
+                    if debug {
+                        eprintln!("[DEBUG] Failed to decompress XZ sample: {}", e);
+                    }
+                    // Fall back to assuming it's a tar if we can't decompress
+                    return Ok((ContentType::TarArchive, compression));
+                }
             }
-            return Ok((ContentType::TarArchive, compression));
         }
         Compression::Zstd => {
-            // For Zstd, assume tar archive
+            // Zstd sample decompression not implemented - assume tar archive
+            // (Zstd layers are rejected by from_oci.rs anyway)
             if debug {
                 eprintln!("[DEBUG] Zstd detected, assuming tar archive");
             }
@@ -139,6 +141,23 @@ fn decompress_gzip_sample(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Decompress a sample of XZ data to analyze content type
+fn decompress_xz_sample(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use xz2::read::XzDecoder;
+
+    let mut decoder = XzDecoder::new(data);
+    let mut buffer = vec![0u8; 8192]; // Decompress up to 8KB
+
+    match decoder.read(&mut buffer) {
+        Ok(n) => {
+            buffer.truncate(n);
+            Ok(buffer)
+        }
+        Err(e) => Err(format!("XZ decompression failed: {}", e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,7 +189,7 @@ mod tests {
     #[test]
     fn test_is_tar() {
         let mut tar_data = vec![0u8; 512];
-        tar_data[257..262].copy_from_slice(b"ustar");
+        tar_data[257..263].copy_from_slice(b"ustar\0");
         assert!(is_tar_archive(&tar_data));
     }
 }
