@@ -7,14 +7,15 @@ use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::http::{setup_http_client, start_download};
-use crate::fls::options::BlockFlashOptions;
+use crate::fls::options::{BlockFlashOptions, HttpClientOptions};
 use crate::fls::progress::ProgressTracker;
 
 pub async fn flash_from_url(
     url: &str,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = setup_http_client(&options).await?;
+    let http_options: HttpClientOptions = (&options).into();
+    let client = setup_http_client(&http_options).await?;
 
     let (mut decompressor, decompressor_name) = start_decompressor_process(url).await?;
 
@@ -28,15 +29,18 @@ pub async fn flash_from_url(
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
-    println!("Opening block device for writing: {}", options.device);
+    println!(
+        "Opening block device for writing: {}",
+        options.common.device
+    );
 
     // Create block writer
     let block_writer = AsyncBlockWriter::new(
-        options.device.clone(),
+        options.common.device.clone(),
         written_progress_tx,
-        options.debug,
-        options.o_direct,
-        options.write_buffer_size_mb,
+        options.common.debug,
+        options.common.o_direct,
+        options.common.write_buffer_size_mb,
     )?;
 
     // Spawn background task to read from decompressor and write to block device
@@ -85,18 +89,19 @@ pub async fn flash_from_url(
     let error_processor = tokio::spawn(process_error_messages(error_rx));
 
     // Main download loop with retry logic
-    let mut progress = ProgressTracker::new(options.newline_progress, options.show_memory);
+    let mut progress =
+        ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     // Set whether we're actually decompressing (not using cat for uncompressed files)
     progress.set_is_compressed(decompressor_name != "cat");
-    let update_interval = Duration::from_secs_f64(options.progress_interval_secs);
+    let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
     let mut bytes_sent_to_decompressor: u64 = 0;
     let mut retry_count = 0;
-    let debug = options.debug;
+    let debug = options.common.debug;
 
     use futures_util::StreamExt;
 
     // Calculate buffer capacity (shared across all retry attempts)
-    let buffer_size_mb = options.buffer_size_mb;
+    let buffer_size_mb = options.common.buffer_size_mb;
     // HTTP chunks from reqwest are typically 8-32 KB, not 64 KB
     // To ensure we get the full buffer size, use a conservative estimate
     let avg_chunk_size_kb = 16; // From common obvervation: 16kb
@@ -159,42 +164,43 @@ pub async fn flash_from_url(
         };
 
         // Start or resume download
-        let response = match start_download(url, &client, resume_from, &options.headers, options.debug).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Check if this is a permanent error that shouldn't be retried
-                if !e.is_retryable() {
+        let response =
+            match start_download(url, &client, resume_from, &options.headers, debug).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Check if this is a permanent error that shouldn't be retried
+                    if !e.is_retryable() {
+                        eprintln!(
+                            "\nDownload failed with non-retryable error: {}",
+                            e.format_error()
+                        );
+                        return Err(e.into());
+                    }
+
+                    if retry_count >= options.max_retries {
+                        eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
+                        eprintln!("Last error: {}", e.format_error());
+                        return Err(e.into());
+                    }
+
+                    // Use suggested retry delay if available (e.g., for rate limiting)
+                    let retry_delay = e
+                        .suggested_retry_delay()
+                        .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
+                    let retry_delay_secs = retry_delay.as_secs();
+
+                    eprintln!("\nDownload failed: {}", e.format_error());
                     eprintln!(
-                        "\nDownload failed with non-retryable error: {}",
-                        e.format_error()
+                        "Retrying in {} seconds... (attempt {}/{})",
+                        retry_delay_secs,
+                        retry_count + 1,
+                        options.max_retries
                     );
-                    return Err(e.into());
+                    tokio::time::sleep(retry_delay).await;
+                    retry_count += 1;
+                    continue;
                 }
-
-                if retry_count >= options.max_retries {
-                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                    eprintln!("Last error: {}", e.format_error());
-                    return Err(e.into());
-                }
-
-                // Use suggested retry delay if available (e.g., for rate limiting)
-                let retry_delay = e
-                    .suggested_retry_delay()
-                    .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
-                let retry_delay_secs = retry_delay.as_secs();
-
-                eprintln!("\nDownload failed: {}", e.format_error());
-                eprintln!(
-                    "Retrying in {} seconds... (attempt {}/{})",
-                    retry_delay_secs,
-                    retry_count + 1,
-                    options.max_retries
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_count += 1;
-                continue;
-            }
-        };
+            };
 
         let content_length = if let Some(offset) = resume_from {
             // For resumed downloads, we need to add the offset to partial content length
@@ -401,7 +407,6 @@ pub async fn flash_from_url(
         let mut updated = false;
 
         while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
-            bytes_sent_to_decompressor += written_len;
             progress.bytes_sent_to_decompressor += written_len;
             updated = true;
         }
@@ -585,30 +590,7 @@ pub async fn flash_from_url(
     let timeout_duration = Duration::from_secs(2);
     let _ = tokio::time::timeout(timeout_duration, error_processor).await;
 
-    let stats = progress.final_stats();
-    println!(
-        "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_received,
-        stats.download_time_formatted(),
-        stats.download_rate
-    );
-    println!(
-        "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_decompressed,
-        stats.decompress_time_formatted(),
-        stats.decompress_rate
-    );
-    println!(
-        "Write complete: {:.2} MB in {} ({:.2} MB/s)",
-        stats.mb_written,
-        stats.write_time_formatted(),
-        stats.write_rate
-    );
-    println!(
-        "Compression ratio: {:.2}x",
-        stats.mb_decompressed / stats.mb_received
-    );
-    println!("Total flash runtime: {}", stats.total_time_formatted());
+    progress.print_final_stats_with_ratio();
 
     Ok(())
 }

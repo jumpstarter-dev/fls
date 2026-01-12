@@ -1,10 +1,45 @@
 // Integration tests for flash_from_url function
 mod common;
 
-use fls::{flash_from_url, BlockFlashOptions};
+use fls::{flash_from_url, BlockFlashOptions, FlashOptions};
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Helper to create BlockFlashOptions with common test defaults
+fn test_options(device: String) -> BlockFlashOptions {
+    BlockFlashOptions {
+        common: FlashOptions {
+            device,
+            o_direct: false,
+            debug: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Helper to create BlockFlashOptions with custom settings
+fn test_options_with(
+    device: String,
+    o_direct: bool,
+    debug: bool,
+    insecure_tls: bool,
+    cacert: Option<PathBuf>,
+) -> BlockFlashOptions {
+    BlockFlashOptions {
+        common: FlashOptions {
+            device,
+            o_direct,
+            debug,
+            insecure_tls,
+            cacert,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 #[tokio::test]
 async fn test_flash_uncompressed_file() {
@@ -26,12 +61,7 @@ async fn test_flash_uncompressed_file() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false, // Must be false for regular files
-        debug: false,
-        ..Default::default()
-    };
+    let options = test_options(device_path.clone());
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
@@ -90,12 +120,7 @@ async fn test_flash_xz_compressed_file() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false, // Must be false for regular files
-        debug: false,
-        ..Default::default()
-    };
+    let options = test_options(device_path.clone());
 
     // Execute the flash operation
     let url = format!("{}/test.img.xz", mock_server.uri());
@@ -155,12 +180,7 @@ async fn test_flash_gz_compressed_file() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false, // Must be false for regular files
-        debug: false,
-        ..Default::default()
-    };
+    let options = test_options(device_path.clone());
 
     // Execute the flash operation
     let url = format!("{}/test.img.gz", mock_server.uri());
@@ -224,14 +244,9 @@ async fn test_resume_after_connection_failure() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        retry_delay_secs: 0, // No delay for faster testing
-        max_retries: 5,
-        ..Default::default()
-    };
+    let mut options = test_options(device_path.clone());
+    options.retry_delay_secs = 0; // No delay for faster testing
+    options.max_retries = 5;
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
@@ -300,14 +315,9 @@ async fn test_resume_compressed_file() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        retry_delay_secs: 0, // No delay for faster testing
-        max_retries: 5,
-        ..Default::default()
-    };
+    let mut options = test_options(device_path.clone());
+    options.retry_delay_secs = 0; // No delay for faster testing
+    options.max_retries = 5;
 
     // Execute the flash operation
     let url = format!("{}/test.img.xz", mock_server.uri());
@@ -381,14 +391,9 @@ async fn test_multiple_connection_failures() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        retry_delay_secs: 0, // No delay for faster testing
-        max_retries: 5,
-        ..Default::default()
-    };
+    let mut options = test_options(device_path.clone());
+    options.retry_delay_secs = 0; // No delay for faster testing
+    options.max_retries = 5;
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
@@ -585,14 +590,9 @@ async fn test_real_partial_transfer_with_resume() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options for flashing
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        retry_delay_secs: 0, // No delay for faster testing
-        max_retries: 5,
-        ..Default::default()
-    };
+    let mut options = test_options(device_path.clone());
+    options.retry_delay_secs = 0; // No delay for faster testing
+    options.max_retries = 5;
 
     // Execute the flash operation
     let result = flash_from_url(&server_url, options).await;
@@ -762,15 +762,14 @@ async fn test_https_with_custom_ca_certificate() {
 
     // Configure options with custom CA certificate
     let ca_cert_path = cert_dir.join("ca-cert.pem");
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: true, // Enable debug to see more details
-        insecure_tls: false,
-        cacert: Some(ca_cert_path.clone()),
-        max_retries: 3, // Allow more retries for debugging
-        ..Default::default()
-    };
+    let mut options = test_options_with(
+        device_path.clone(),
+        false,
+        true,
+        false,
+        Some(ca_cert_path.clone()),
+    );
+    options.max_retries = 3; // Allow more retries for debugging
 
     println!("  Using CA certificate: {}", ca_cert_path.display());
 
@@ -934,14 +933,8 @@ async fn test_https_with_insecure_flag() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options - allow insecure TLS
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        insecure_tls: true, // Accept any certificate
-        max_retries: 1,     // Limit retries since server handles only one connection
-        ..Default::default()
-    };
+    let mut options = test_options_with(device_path.clone(), false, false, true, None);
+    options.max_retries = 1; // Limit retries since server handles only one connection
 
     // Execute the flash operation
     let result = flash_from_url(&server_url, options).await;
@@ -1037,15 +1030,8 @@ async fn test_https_certificate_validation_fails() {
     let device_path = temp_file.path().to_string_lossy().to_string();
 
     // Configure options - DO NOT allow insecure TLS and DON'T provide CA cert
-    let options = BlockFlashOptions {
-        device: device_path.clone(),
-        o_direct: false,
-        debug: false,
-        insecure_tls: false, // Validate certificates
-        cacert: None,        // No CA cert - should fail
-        max_retries: 1,      // Limit retries since server handles only one connection
-        ..Default::default()
-    };
+    let mut options = test_options_with(device_path.clone(), false, false, false, None);
+    options.max_retries = 1; // Limit retries since server handles only one connection
 
     // Execute the flash operation
     let result = flash_from_url(&server_url, options).await;

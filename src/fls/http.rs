@@ -1,10 +1,10 @@
 use crate::fls::download_error::DownloadError;
-use crate::fls::options::BlockFlashOptions;
+use crate::fls::options::HttpClientOptions;
 use reqwest::Client;
 use std::time::Duration;
 
 pub(crate) async fn setup_http_client(
-    options: &BlockFlashOptions,
+    options: &HttpClientOptions,
 ) -> Result<Client, Box<dyn std::error::Error>> {
     if options.debug {
         eprintln!("\n[DEBUG] Initializing HTTP Client:");
@@ -44,7 +44,10 @@ pub(crate) async fn setup_http_client(
     if let Some(ca_cert_path) = &options.cacert {
         println!("Loading CA certificate from: {}", ca_cert_path.display());
         if options.debug {
-            eprintln!("[DEBUG]   Custom CA Certificate: {}", ca_cert_path.display());
+            eprintln!(
+                "[DEBUG]   Custom CA Certificate: {}",
+                ca_cert_path.display()
+            );
         }
         let cert_bytes = std::fs::read(ca_cert_path)
             .map_err(|e| format!("Failed to read CA certificate file: {}", e))?;
@@ -122,7 +125,11 @@ pub(crate) async fn start_download(
     // Debug: Log response details
     if debug {
         eprintln!("\n[DEBUG] HTTP Response:");
-        eprintln!("[DEBUG]   Status: {} {}", response.status().as_u16(), response.status().canonical_reason().unwrap_or(""));
+        eprintln!(
+            "[DEBUG]   Status: {} {}",
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("")
+        );
         eprintln!("[DEBUG]   Version: {:?}", response.version());
         eprintln!("[DEBUG]   Headers:");
         for (name, value) in response.headers() {
