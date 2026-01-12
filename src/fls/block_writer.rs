@@ -1,6 +1,6 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::ptr::NonNull;
 use tokio::sync::mpsc;
@@ -71,6 +71,51 @@ impl Drop for AlignedBuffer {
 // Safety: AlignedBuffer owns its data and the pointer is valid for the lifetime of the struct
 unsafe impl Send for AlignedBuffer {}
 
+/// Opens a file for a device (block or character) - read+write, no create/truncate
+fn open_for_device(path: &str) -> io::Result<std::fs::File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+/// Opens a file for a regular file - write, create, truncate
+fn open_for_regular_file(path: &str) -> io::Result<std::fs::File> {
+    if path.starts_with("/dev/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Regular file path cannot be under /dev/; ensure the device path is correctly spelled",
+        ));
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Opens a file for a device with custom flags
+fn open_for_device_with_flags(path: &str, flags: libc::c_int) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
+/// Opens a file for a regular file with custom flags
+fn open_for_regular_file_with_flags(path: &str, flags: libc::c_int) -> io::Result<std::fs::File> {
+    if path.starts_with("/dev/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Regular file path cannot be under /dev/; ensure the device path is correctly spelled",
+        ));
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
 /// BlockWriter handles writing data to a block device with direct I/O
 pub(crate) struct BlockWriter {
     file: std::fs::File,
@@ -101,29 +146,26 @@ impl BlockWriter {
             use std::os::unix::fs::FileTypeExt;
 
             // Check if this is a block device
-            let is_block_dev = std::fs::metadata(device)
-                .map(|m| m.file_type().is_block_device())
-                .unwrap_or(false);
+            // Handle non-existent files (they'll be created as regular files)
+            let is_block_dev = match std::fs::metadata(device) {
+                Ok(m) => m.file_type().is_block_device(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+
+            // Helper to open file with appropriate method based on device type
+            let open_file = |flags: Option<libc::c_int>| -> io::Result<std::fs::File> {
+                match flags {
+                    Some(f) if is_block_dev => open_for_device_with_flags(device, f),
+                    Some(f) => open_for_regular_file_with_flags(device, f),
+                    None if is_block_dev => open_for_device(device),
+                    None => open_for_regular_file(device),
+                }
+            };
 
             if o_direct {
                 // Try O_DIRECT without O_SYNC first (some devices have issues with both)
-                let result1 = if is_block_dev {
-                    // For block devices, open with read+write (required by some drivers)
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .custom_flags(libc::O_DIRECT)
-                        .open(device)
-                } else {
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .custom_flags(libc::O_DIRECT)
-                        .open(device)
-                };
-
-                match result1 {
+                match open_file(Some(libc::O_DIRECT)) {
                     Ok(f) => {
                         if debug {
                             eprintln!(
@@ -135,23 +177,7 @@ impl BlockWriter {
                     }
                     Err(e1) => {
                         // Try O_DIRECT with O_SYNC
-                        let result2 = if is_block_dev {
-                            // For block devices, open with read+write (required by some drivers)
-                            OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .custom_flags(libc::O_DIRECT | libc::O_SYNC)
-                                .open(device)
-                        } else {
-                            OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .custom_flags(libc::O_DIRECT | libc::O_SYNC)
-                                .open(device)
-                        };
-
-                        match result2 {
+                        match open_file(Some(libc::O_DIRECT | libc::O_SYNC)) {
                             Ok(f) => {
                                 if debug {
                                     eprintln!(
@@ -162,7 +188,6 @@ impl BlockWriter {
                                 (f, true)
                             }
                             Err(e2) => {
-                                // Fail if O_DIRECT was explicitly requested but not available
                                 return Err(io::Error::new(
                                     io::ErrorKind::Unsupported,
                                     format!(
@@ -175,24 +200,13 @@ impl BlockWriter {
                     }
                 }
             } else {
-                // Use buffered I/O when O_DIRECT is not requested
                 if debug {
                     eprintln!(
                         "[DEBUG] Opened {} with buffered I/O (O_DIRECT not requested)",
                         device
                     );
                 }
-                let f = if is_block_dev {
-                    // For block devices, open with read+write (required by some drivers)
-                    OpenOptions::new().read(true).write(true).open(device)?
-                } else {
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(device)?
-                };
-                (f, false)
+                (open_file(None)?, false)
             }
         };
 
@@ -202,27 +216,32 @@ impl BlockWriter {
             use std::os::unix::io::AsRawFd;
 
             // Check if this is a block device or character device (raw disk)
-            let (is_block_dev, is_char_dev) = if let Ok(metadata) = std::fs::metadata(device) {
-                let file_type = metadata.file_type();
-                (file_type.is_block_device(), file_type.is_char_device())
-            } else {
-                // File doesn't exist yet - not a device
-                (false, false)
-            };
-            let is_device = is_block_dev || is_char_dev;
+            // Handle non-existent files (they'll be created as regular files)
+            let (is_block_dev, is_char_dev, is_device, file_exists) =
+                match std::fs::metadata(device) {
+                    Ok(metadata) => {
+                        let file_type = metadata.file_type();
+                        let is_block = file_type.is_block_device();
+                        let is_char = file_type.is_char_device();
+                        (is_block, is_char, is_block || is_char, true)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => (false, false, false, false),
+                    Err(e) => return Err(e),
+                };
 
             if debug {
                 eprintln!("[DEBUG] Device type check for {}:", device);
+                eprintln!("[DEBUG]   File exists: {}", file_exists);
                 eprintln!("[DEBUG]   Block device: {}", is_block_dev);
                 eprintln!("[DEBUG]   Character device (raw): {}", is_char_dev);
-                eprintln!("[DEBUG]   Regular file: {}", !is_device);
+                eprintln!("[DEBUG]   Regular file: {}", file_exists && !is_device);
             }
 
             // On macOS, strongly warn if using /dev/diskN instead of /dev/rdiskN
             // Buffered block devices often fail with ioctl errors when writing raw data
             if is_block_dev && device.starts_with("/dev/disk") && !device.starts_with("/dev/rdisk")
             {
-                eprintln!("\n⚠️  WARNING: You are using buffered device {}", device);
+                eprintln!("\nWARNING: You are using buffered device {}", device);
                 eprintln!("   On macOS, buffered block devices (/dev/diskN) often fail with 'Inappropriate ioctl' errors");
                 eprintln!(
                     "   when writing raw disk images, especially if the disk has partitions."
@@ -232,66 +251,43 @@ impl BlockWriter {
                 eprintln!();
             }
 
+            // Helper to open file with appropriate method based on device type
+            let open_file = |flags: Option<libc::c_int>| -> io::Result<std::fs::File> {
+                match flags {
+                    Some(f) if is_device => open_for_device_with_flags(device, f),
+                    Some(f) => open_for_regular_file_with_flags(device, f),
+                    None if is_device => open_for_device(device),
+                    None => open_for_regular_file(device),
+                }
+            };
+
             if o_direct {
                 // macOS uses F_NOCACHE instead of O_DIRECT
-                let f = if is_device {
-                    // For devices (block or character), don't use create/truncate
-                    // On macOS, raw devices often require read+write access even for write-only operations
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .custom_flags(libc::O_SYNC)
-                        .open(device)?
-                } else {
-                    // For regular files, use create/truncate
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .custom_flags(libc::O_SYNC)
-                        .open(device)?
-                };
-
+                let f = open_file(Some(libc::O_SYNC))?;
                 let fd = f.as_raw_fd();
-                let direct_io = unsafe {
-                    // Enable F_NOCACHE to bypass filesystem cache
-                    if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "F_NOCACHE not supported on this device",
-                        ));
-                    } else {
-                        if debug {
-                            eprintln!(
-                                "[DEBUG] Opened {} with F_NOCACHE (direct I/O enabled)",
-                                device
-                            );
-                        }
-                        true
-                    }
-                };
-                (f, direct_io)
+
+                // Enable F_NOCACHE to bypass filesystem cache
+                if unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) } == -1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "F_NOCACHE not supported on this device",
+                    ));
+                }
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Opened {} with F_NOCACHE (direct I/O enabled)",
+                        device
+                    );
+                }
+                (f, true)
             } else {
-                // Use buffered I/O when O_DIRECT is not requested
                 if debug {
                     eprintln!(
                         "[DEBUG] Opened {} with buffered I/O (O_DIRECT not requested)",
                         device
                     );
                 }
-                let f = if is_device {
-                    // For devices (block or character), don't use create/truncate
-                    // On macOS, raw devices often require read+write access even for write-only operations
-                    OpenOptions::new().read(true).write(true).open(device)?
-                } else {
-                    // For regular files, use create/truncate
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(device)?
-                };
-                (f, false)
+                (open_file(None)?, false)
             }
         };
 
@@ -344,17 +340,57 @@ impl BlockWriter {
         Ok(())
     }
 
+    /// Seek to an absolute position in the output
+    ///
+    /// This flushes any buffered data and seeks to the specified offset.
+    /// Used by sparse image support to skip over DONT_CARE regions.
+    ///
+    /// For O_DIRECT mode, the offset must be aligned to ALIGNMENT (4096 bytes).
+    pub(crate) fn seek(&mut self, offset: u64) -> io::Result<()> {
+        // For O_DIRECT, validate offset alignment
+        if self.use_direct_io && !offset.is_multiple_of(ALIGNMENT as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "O_DIRECT requires aligned seek offset: {} is not aligned to {}",
+                    offset, ALIGNMENT
+                ),
+            ));
+        }
+
+        // Flush any pending data first
+        self.flush_buffer()?;
+
+        // Seek to the new position
+        self.file.seek(io::SeekFrom::Start(offset))?;
+
+        // Update our position tracking
+        self.bytes_written = offset;
+
+        // Send progress update
+        let _ = self.written_progress_tx.send(self.bytes_written);
+
+        Ok(())
+    }
+
     /// Flush the internal buffer to disk
     fn flush_buffer(&mut self) -> io::Result<()> {
         if self.buffer_pos == 0 {
             return Ok(());
         }
 
-        let write_size = if self.use_direct_io && self.buffer_pos < BLOCK_SIZE {
+        let actual_bytes = self.buffer_pos;
+        let write_size = if self.use_direct_io && actual_bytes < BLOCK_SIZE {
             // For direct I/O, align to sector size
-            self.buffer_pos.div_ceil(ALIGNMENT) * ALIGNMENT
+            let aligned = actual_bytes.div_ceil(ALIGNMENT) * ALIGNMENT;
+            // Zero the padding region to avoid writing stale data
+            let buffer_slice = self.buffer.as_mut_slice();
+            for byte in buffer_slice[actual_bytes..aligned].iter_mut() {
+                *byte = 0;
+            }
+            aligned
         } else {
-            self.buffer_pos
+            actual_bytes
         };
 
         let write_size = write_size.min(BLOCK_SIZE);
@@ -374,7 +410,8 @@ impl BlockWriter {
                 e
             })?;
 
-        self.bytes_since_sync += write_size as u64;
+        // Track actual bytes for sync interval, not padded write size
+        self.bytes_since_sync += actual_bytes as u64;
         self.buffer_pos = 0;
 
         // For buffered I/O, sync periodically to avoid losing too much data on failure
@@ -426,9 +463,20 @@ impl BlockWriter {
     }
 }
 
+/// Command sent to the async block writer
+#[derive(Debug)]
+pub(crate) enum WriterCommand {
+    /// Write data at current position
+    Write(Vec<u8>),
+    /// Seek to absolute offset
+    Seek(u64),
+    /// Write fill pattern for specified number of bytes
+    Fill { pattern: [u8; 4], bytes: u64 },
+}
+
 /// Async wrapper for BlockWriter that runs in a blocking task
 pub(crate) struct AsyncBlockWriter {
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    writer_tx: mpsc::Sender<WriterCommand>,
     writer_handle: tokio::task::JoinHandle<io::Result<u64>>,
 }
 
@@ -455,7 +503,7 @@ impl AsyncBlockWriter {
 
         // Create bounded channel to prevent OOM when decompression outpaces disk writes
         // This provides backpressure when writing is slower than decompression
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(channel_capacity);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCommand>(channel_capacity);
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
@@ -465,9 +513,17 @@ impl AsyncBlockWriter {
                     e
                 })?;
 
-            while let Some(data) = writer_rx.blocking_recv() {
-                if let Err(e) = writer.write(&data) {
-                    eprintln!("Failed to write to device '{}': {}", device, e);
+            while let Some(cmd) = writer_rx.blocking_recv() {
+                let result = match cmd {
+                    WriterCommand::Write(data) => writer.write(&data),
+                    WriterCommand::Seek(offset) => writer.seek(offset),
+                    WriterCommand::Fill { pattern, bytes } => {
+                        write_fill_pattern(&mut writer, &pattern, bytes)
+                    }
+                };
+
+                if let Err(e) = result {
+                    eprintln!("Failed I/O operation on device '{}': {}", device, e);
                     #[cfg(target_os = "macos")]
                     {
                         // On macOS, provide helpful hints for common errors
@@ -506,7 +562,25 @@ impl AsyncBlockWriter {
     /// Write data asynchronously
     pub(crate) async fn write(&self, data: Vec<u8>) -> io::Result<()> {
         self.writer_tx
-            .send(data)
+            .send(WriterCommand::Write(data))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Writer channel closed"))?;
+        Ok(())
+    }
+
+    /// Seek to absolute offset asynchronously
+    pub(crate) async fn seek(&self, offset: u64) -> io::Result<()> {
+        self.writer_tx
+            .send(WriterCommand::Seek(offset))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Writer channel closed"))?;
+        Ok(())
+    }
+
+    /// Write fill pattern asynchronously
+    pub(crate) async fn fill(&self, pattern: [u8; 4], bytes: u64) -> io::Result<()> {
+        self.writer_tx
+            .send(WriterCommand::Fill { pattern, bytes })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Writer channel closed"))?;
         Ok(())
@@ -517,6 +591,26 @@ impl AsyncBlockWriter {
         drop(self.writer_tx);
         self.writer_handle.await.map_err(io::Error::other)?
     }
+}
+
+/// Helper to write fill pattern efficiently.
+/// Alignment for O_DIRECT is handled by BlockWriter's internal buffer and flush_buffer(),
+/// which rounds up to ALIGNMENT when flushing partial blocks.
+fn write_fill_pattern(writer: &mut BlockWriter, pattern: &[u8; 4], bytes: u64) -> io::Result<()> {
+    // Create a 4KB buffer filled with the pattern (matches ALIGNMENT)
+    const FILL_BUFFER_SIZE: usize = 4096;
+    let mut buffer = [0u8; FILL_BUFFER_SIZE];
+    for chunk in buffer.chunks_exact_mut(4) {
+        chunk.copy_from_slice(pattern);
+    }
+
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let to_write = (remaining as usize).min(FILL_BUFFER_SIZE);
+        writer.write(&buffer[..to_write])?;
+        remaining -= to_write as u64;
+    }
+    Ok(())
 }
 
 /// Check if a path is a block device

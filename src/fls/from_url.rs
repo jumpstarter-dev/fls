@@ -1,14 +1,211 @@
+use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
+use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
 use crate::fls::http::{setup_http_client, start_download};
 use crate::fls::options::{BlockFlashOptions, HttpClientOptions};
 use crate::fls::progress::ProgressTracker;
+use crate::fls::simg::{SparseParser, WriteCommand};
+
+/// Await a writer handle and return its result
+///
+/// Converts task panics into io::Error for uniform error handling.
+async fn await_writer_result(handle: JoinHandle<io::Result<u64>>) -> io::Result<u64> {
+    match handle.await {
+        Ok(result) => result,
+        Err(e) => Err(io::Error::other(format!("Writer task panicked: {}", e))),
+    }
+}
+
+/// Get error from a prematurely finished writer handle
+///
+/// Called when writer_handle.is_finished() returns true unexpectedly during download.
+/// Returns an appropriate error for the unexpected termination.
+async fn get_writer_error(handle: JoinHandle<io::Result<u64>>) -> Box<dyn std::error::Error> {
+    match await_writer_result(handle).await {
+        Ok(_) => "Writer closed unexpectedly before download completed".into(),
+        Err(e) => e.into(),
+    }
+}
+
+/// Get error from a prematurely finished decompressor writer handle
+///
+/// Called when decompressor_writer_handle.is_finished() returns true unexpectedly.
+async fn get_decompressor_error(
+    handle: JoinHandle<Result<(), String>>,
+) -> Box<dyn std::error::Error> {
+    match handle.await {
+        Ok(Ok(())) => "Decompressor stdin closed unexpectedly".into(),
+        Ok(Err(e)) => e.into(),
+        Err(e) => format!("Decompressor writer task panicked: {}", e).into(),
+    }
+}
+
+/// Handles retry logic for download errors.
+///
+/// Returns `Some(Duration)` with the delay to wait before retrying, or `None` if
+/// the error is non-retryable or max retries have been exceeded.
+fn handle_retry_error(
+    error: &DownloadError,
+    retry_count: &mut usize,
+    max_retries: usize,
+    default_retry_delay_secs: u64,
+) -> Option<Duration> {
+    if !error.is_retryable() {
+        eprintln!(
+            "\nDownload failed with non-retryable error: {}",
+            error.format_error()
+        );
+        return None;
+    }
+
+    if *retry_count >= max_retries {
+        eprintln!("\nMax retries ({}) reached, giving up", max_retries);
+        eprintln!("Last error: {}", error.format_error());
+        return None;
+    }
+
+    let retry_delay = error
+        .suggested_retry_delay()
+        .unwrap_or_else(|| Duration::from_secs(default_retry_delay_secs));
+
+    eprintln!("\nDownload failed: {}", error.format_error());
+    eprintln!(
+        "Retrying in {} seconds... (attempt {}/{})",
+        retry_delay.as_secs(),
+        *retry_count + 1,
+        max_retries
+    );
+    *retry_count += 1;
+    Some(retry_delay)
+}
+
+/// Execute a sequence of write commands on the block writer
+async fn execute_write_commands(
+    commands: Vec<WriteCommand>,
+    writer: &AsyncBlockWriter,
+    error_tx: &mpsc::UnboundedSender<String>,
+    debug: bool,
+) -> io::Result<()> {
+    for cmd in commands {
+        match cmd {
+            WriteCommand::Write(data) => {
+                writer.write(data).await.map_err(|e| {
+                    let _ = error_tx.send(format!("Error writing to device: {}", e));
+                    e
+                })?;
+            }
+            WriteCommand::Seek(offset) => {
+                if debug {
+                    eprintln!("[DEBUG] Sparse: seeking to offset {}", offset);
+                }
+                writer.seek(offset).await.map_err(|e| {
+                    let _ = error_tx.send(format!("Error seeking device: {}", e));
+                    e
+                })?;
+            }
+            WriteCommand::Fill { pattern, bytes } => {
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Sparse: fill pattern {:02x}{:02x}{:02x}{:02x} for {} bytes",
+                        pattern[0], pattern[1], pattern[2], pattern[3], bytes
+                    );
+                }
+                writer.fill(pattern, bytes).await.map_err(|e| {
+                    let _ = error_tx.send(format!("Error filling device: {}", e));
+                    e
+                })?;
+            }
+            WriteCommand::Complete { expected_size } => {
+                if debug {
+                    eprintln!(
+                        "[DEBUG] Sparse: complete, expected output size {} bytes",
+                        expected_size
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Process data through sparse parser and execute resulting write commands
+async fn process_sparse_data(
+    parser: &mut SparseParser,
+    data: &[u8],
+    writer: &AsyncBlockWriter,
+    error_tx: &mpsc::UnboundedSender<String>,
+    debug: bool,
+) -> io::Result<()> {
+    let (commands, _consumed) = parser.process(data).map_err(|e| {
+        let msg = format!("Sparse image parse error: {}", e);
+        let _ = error_tx.send(msg.clone());
+        io::Error::new(io::ErrorKind::InvalidData, msg)
+    })?;
+    execute_write_commands(commands, writer, error_tx, debug).await
+}
+
+/// Write data to the block writer with error reporting
+async fn write_regular_data(
+    data: Vec<u8>,
+    writer: &AsyncBlockWriter,
+    error_tx: &mpsc::UnboundedSender<String>,
+) -> io::Result<()> {
+    writer.write(data).await.map_err(|e| {
+        let _ = error_tx.send(format!("Error writing to device: {}", e));
+        e
+    })
+}
+
+/// Handle detected format: process initial data and return parser if sparse
+async fn handle_detected_format(
+    format: FileFormat,
+    consumed_bytes: Vec<u8>,
+    remaining_data: &[u8],
+    writer: &AsyncBlockWriter,
+    error_tx: &mpsc::UnboundedSender<String>,
+    debug: bool,
+) -> io::Result<Option<SparseParser>> {
+    match format {
+        FileFormat::SparseImage => {
+            if debug {
+                eprintln!("[DEBUG] Auto-detect: Detected sparse image format");
+            }
+            let mut parser = SparseParser::new();
+
+            // Process the accumulated detection data
+            process_sparse_data(&mut parser, &consumed_bytes, writer, error_tx, debug).await?;
+
+            // Process any remaining data in current buffer
+            if !remaining_data.is_empty() {
+                process_sparse_data(&mut parser, remaining_data, writer, error_tx, debug).await?;
+            }
+
+            Ok(Some(parser))
+        }
+        FileFormat::Regular => {
+            if debug {
+                eprintln!("[DEBUG] Auto-detect: Detected regular file format");
+            }
+            // Write the accumulated detection data
+            write_regular_data(consumed_bytes, writer, error_tx).await?;
+
+            // Write any remaining data
+            if !remaining_data.is_empty() {
+                write_regular_data(remaining_data.to_vec(), writer, error_tx).await?;
+            }
+
+            Ok(None)
+        }
+    }
+}
 
 pub async fn flash_from_url(
     url: &str,
@@ -45,32 +242,83 @@ pub async fn flash_from_url(
 
     // Spawn background task to read from decompressor and write to block device
     let error_tx_clone = error_tx.clone();
+    let debug = options.common.debug;
     let writer_handle = {
         let writer = block_writer;
         tokio::spawn(async move {
             let mut stdout = decompressor_stdout;
             let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
 
+            // Auto-detect sparse image format from initial data
+            let mut detector = FormatDetector::new();
+            let mut parser: Option<SparseParser> = None;
+            let mut format_determined = false;
+
             loop {
-                match stdout.read(&mut buffer).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let data = buffer[..n].to_vec();
-                        // Send byte count to progress tracking
-                        if decompressed_progress_tx.send(n as u64).is_err() {
-                            break;
+                let n = match stdout.read(&mut buffer).await {
+                    Ok(0) => {
+                        // EOF - check if we have incomplete format detection
+                        if !format_determined {
+                            if let Some(buffered_data) = detector.finalize_at_eof() {
+                                if debug {
+                                    eprintln!(
+                                        "[DEBUG] EOF before format detection complete, writing {} buffered bytes as regular data",
+                                        buffered_data.len()
+                                    );
+                                }
+                                write_regular_data(buffered_data, &writer, &error_tx_clone).await?;
+                            }
                         }
-                        // Write to block device
-                        if let Err(e) = writer.write(data).await {
-                            let _ = error_tx_clone.send(format!("Error writing to device: {}", e));
-                            return Err(e);
-                        }
+                        break;
                     }
+                    Ok(n) => n,
                     Err(e) => {
                         let _ = error_tx_clone
                             .send(format!("Error reading from decompressor stdout: {}", e));
                         return Err(e);
                     }
+                };
+
+                if decompressed_progress_tx.send(n as u64).is_err() {
+                    break;
+                }
+
+                if !format_determined {
+                    match detector.process(&buffer[..n]) {
+                        DetectionResult::NeedMoreData => {
+                            if debug {
+                                eprintln!(
+                                    "[DEBUG] Auto-detect: Need more data for format detection"
+                                );
+                            }
+                            continue;
+                        }
+                        DetectionResult::Detected {
+                            format,
+                            consumed_bytes,
+                            consumed_from_input,
+                        } => {
+                            let remaining = &buffer[consumed_from_input..n];
+                            parser = handle_detected_format(
+                                format,
+                                consumed_bytes,
+                                remaining,
+                                &writer,
+                                &error_tx_clone,
+                                debug,
+                            )
+                            .await?;
+                            format_determined = true;
+                        }
+                        DetectionResult::Error(msg) => {
+                            let _ = error_tx_clone.send(msg.clone());
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                        }
+                    }
+                } else if let Some(ref mut p) = parser {
+                    process_sparse_data(p, &buffer[..n], &writer, &error_tx_clone, debug).await?;
+                } else {
+                    write_regular_data(buffer[..n].to_vec(), &writer, &error_tx_clone).await?;
                 }
             }
 
@@ -135,24 +383,16 @@ pub async fn flash_from_url(
     });
 
     loop {
-        // Check if writer has failed before attempting download/retry
+        // Check if writer or decompressor has failed before attempting download/retry
         if writer_handle.is_finished() {
             eprintln!();
             eprintln!("Writer task has terminated, stopping download");
-            // Get the actual error from the writer
-            match writer_handle.await {
-                Ok(Ok(_)) => {
-                    return Err("Writer closed unexpectedly".into());
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Writer error: {}", e);
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    eprintln!("Writer task panicked: {}", e);
-                    return Err(e.into());
-                }
-            }
+            return Err(get_writer_error(writer_handle).await);
+        }
+        if decompressor_writer_handle.is_finished() {
+            eprintln!();
+            eprintln!("Decompressor writer task has terminated, stopping download");
+            return Err(get_decompressor_error(decompressor_writer_handle).await);
         }
 
         // Resume from the HTTP download position, not the decompressor write position
@@ -168,37 +408,18 @@ pub async fn flash_from_url(
             match start_download(url, &client, resume_from, &options.headers, debug).await {
                 Ok(r) => r,
                 Err(e) => {
-                    // Check if this is a permanent error that shouldn't be retried
-                    if !e.is_retryable() {
-                        eprintln!(
-                            "\nDownload failed with non-retryable error: {}",
-                            e.format_error()
-                        );
-                        return Err(e.into());
+                    match handle_retry_error(
+                        &e,
+                        &mut retry_count,
+                        options.max_retries,
+                        options.retry_delay_secs,
+                    ) {
+                        Some(delay) => {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        None => return Err(e.into()),
                     }
-
-                    if retry_count >= options.max_retries {
-                        eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                        eprintln!("Last error: {}", e.format_error());
-                        return Err(e.into());
-                    }
-
-                    // Use suggested retry delay if available (e.g., for rate limiting)
-                    let retry_delay = e
-                        .suggested_retry_delay()
-                        .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
-                    let retry_delay_secs = retry_delay.as_secs();
-
-                    eprintln!("\nDownload failed: {}", e.format_error());
-                    eprintln!(
-                        "Retrying in {} seconds... (attempt {}/{})",
-                        retry_delay_secs,
-                        retry_count + 1,
-                        options.max_retries
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                    retry_count += 1;
-                    continue;
                 }
             };
 
@@ -231,24 +452,20 @@ pub async fn flash_from_url(
                             // Send to buffer - detect if it's blocking
                             let send_start = std::time::Instant::now();
                             if buffer_tx.send(chunk).await.is_err() {
-                                // Check if writer has failed
+                                // Check if writer or decompressor has failed
                                 if writer_handle.is_finished() {
                                     eprintln!();
                                     eprintln!("Writer task has terminated unexpectedly");
-                                    // Get the actual error from the writer
-                                    match writer_handle.await {
-                                        Ok(Ok(_)) => {
-                                            return Err("Writer closed unexpectedly".into());
-                                        }
-                                        Ok(Err(e)) => {
-                                            eprintln!("Writer error: {}", e);
-                                            return Err(e.into());
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Writer task panicked: {}", e);
-                                            return Err(e.into());
-                                        }
-                                    }
+                                    return Err(get_writer_error(writer_handle).await);
+                                }
+                                if decompressor_writer_handle.is_finished() {
+                                    eprintln!();
+                                    eprintln!(
+                                        "Decompressor writer task has terminated unexpectedly"
+                                    );
+                                    return Err(
+                                        get_decompressor_error(decompressor_writer_handle).await
+                                    );
                                 }
                                 connection_error =
                                     Some(DownloadError::Other("Buffer channel closed".to_string()));
@@ -321,58 +538,32 @@ pub async fn flash_from_url(
 
         // If connection broke, retry
         if connection_broken {
-            // First check if writer has failed - if so, don't retry
+            // First check if writer or decompressor has failed - if so, don't retry
             if writer_handle.is_finished() {
                 eprintln!();
                 eprintln!("Connection interrupted and writer task has terminated");
-                // Get the actual error from the writer
-                match writer_handle.await {
-                    Ok(Ok(_)) => {
-                        return Err("Writer closed unexpectedly during download".into());
-                    }
-                    Ok(Err(e)) => {
-                        eprintln!("Writer error: {}", e);
-                        return Err(e.into());
-                    }
-                    Err(e) => {
-                        eprintln!("Writer task panicked: {}", e);
-                        return Err(e.into());
-                    }
-                }
+                return Err(get_writer_error(writer_handle).await);
+            }
+            if decompressor_writer_handle.is_finished() {
+                eprintln!();
+                eprintln!("Connection interrupted and decompressor writer task has terminated");
+                return Err(get_decompressor_error(decompressor_writer_handle).await);
             }
 
             if let Some(e) = connection_error {
-                // Check if this is a permanent error that shouldn't be retried
-                if !e.is_retryable() {
-                    eprintln!(
-                        "\nConnection failed with non-retryable error: {}",
-                        e.format_error()
-                    );
-                    return Err(e.into());
-                }
-
-                if retry_count >= options.max_retries {
-                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                    eprintln!("Last error: {}", e.format_error());
-                    return Err(e.into());
-                }
-
-                // Use suggested retry delay if available (e.g., for rate limiting)
-                let retry_delay = e
-                    .suggested_retry_delay()
-                    .unwrap_or_else(|| Duration::from_secs(options.retry_delay_secs));
-                let retry_delay_secs = retry_delay.as_secs();
-
                 eprintln!("\nConnection interrupted: {}", e.format_error());
-                eprintln!(
-                    "Resuming in {} seconds... (attempt {}/{})",
-                    retry_delay_secs,
-                    retry_count + 1,
-                    options.max_retries
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_count += 1;
-                continue;
+                match handle_retry_error(
+                    &e,
+                    &mut retry_count,
+                    options.max_retries,
+                    options.retry_delay_secs,
+                ) {
+                    Some(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    None => return Err(e.into()),
+                }
             } else {
                 // Unknown error
                 eprintln!("\nConnection interrupted with unknown error");
@@ -434,17 +625,14 @@ pub async fn flash_from_url(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Get the result from the writer task
-    match decompressor_writer_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            eprintln!();
-            return Err(e.into());
-        }
-        Err(e) => {
-            eprintln!();
-            return Err(e.into());
-        }
+    // Get the result from the decompressor writer task
+    if let Err(e) = decompressor_writer_handle
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+    {
+        eprintln!();
+        return Err(e.into());
     }
 
     // Update any remaining progress
@@ -553,9 +741,7 @@ pub async fn flash_from_url(
 
     // Get final result from writer
     match writer_handle.await {
-        Ok(Ok(final_bytes)) => {
-            progress.bytes_written = final_bytes;
-        }
+        Ok(Ok(final_bytes)) => progress.bytes_written = final_bytes,
         Ok(Err(e)) => {
             eprintln!();
             return Err(e.into());
