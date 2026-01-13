@@ -142,6 +142,7 @@ async fn handle_detected_format(
 ) -> std::io::Result<Option<SparseParser>> {
     match format {
         FileFormat::SparseImage => {
+            println!("Sparse image (simg) format detected");
             if debug {
                 eprintln!("[DEBUG] Auto-detect: Detected sparse image format");
             }
@@ -525,6 +526,8 @@ async fn coordinate_download_and_processing(
     // Close HTTP channel to signal download complete
     drop(params.http_tx);
 
+    progress.download_duration = Some(progress.start_time.elapsed());
+
     if debug {
         eprintln!(
             "[DEBUG] Download completed, {} bytes received",
@@ -572,6 +575,8 @@ async fn coordinate_download_and_processing(
         }
     }
 
+    progress.decompress_duration = Some(progress.start_time.elapsed());
+
     // Wait for block writer
     loop {
         while let Ok(written_bytes) = params.written_progress_rx.try_recv() {
@@ -592,6 +597,8 @@ async fn coordinate_download_and_processing(
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(e) => return Err(e.into()),
     }
+
+    progress.write_duration = Some(progress.start_time.elapsed());
 
     // Final progress update
     let _ = progress.update_progress(None, update_interval, true);
@@ -914,6 +921,8 @@ async fn coordinate_raw_disk_download(
     // Close HTTP channel to signal download complete
     drop(params.http_tx);
 
+    progress.download_duration = Some(progress.start_time.elapsed());
+
     if options.common.debug {
         eprintln!(
             "[DEBUG] Download completed, {} bytes received",
@@ -947,6 +956,10 @@ async fn coordinate_raw_disk_download(
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(e) => return Err(e.into()),
     }
+
+    let elapsed = progress.start_time.elapsed();
+    progress.decompress_duration = Some(elapsed);
+    progress.write_duration = Some(elapsed);
 
     // Wait for external decompressor process and check exit status
     if let Some(mut decompressor) = params.external_decompressor {
@@ -1651,7 +1664,7 @@ async fn flash_raw_disk_image_directly(
     options: OciOptions,
     layer_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Raw disk image detected - streaming directly to device");
+    println!("Disk image detected - streaming directly to device");
     println!("Compression: {:?}", compression_type);
     println!("Opening device: {}", options.common.device);
 

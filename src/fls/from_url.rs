@@ -175,6 +175,7 @@ async fn handle_detected_format(
 ) -> io::Result<Option<SparseParser>> {
     match format {
         FileFormat::SparseImage => {
+            println!("Sparse image (simg) format detected");
             if debug {
                 eprintln!("[DEBUG] Auto-detect: Detected sparse image format");
             }
