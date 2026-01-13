@@ -378,4 +378,85 @@ mod tests {
             _ => panic!("Expected cached detection result"),
         }
     }
+
+    /// Create a sparse header typical of android-image-builder (a-i-b) output
+    /// These images often have larger sizes (8GB) and many chunks
+    fn create_aib_sparse_header() -> Vec<u8> {
+        let mut header = Vec::with_capacity(28);
+        // Magic number: 0xED26FF3A (little endian)
+        header.extend_from_slice(&0xED26FF3Au32.to_le_bytes());
+        // Major version: 1
+        header.extend_from_slice(&1u16.to_le_bytes());
+        // Minor version: 0
+        header.extend_from_slice(&0u16.to_le_bytes());
+        // File header size: 28
+        header.extend_from_slice(&28u16.to_le_bytes());
+        // Chunk header size: 12
+        header.extend_from_slice(&12u16.to_le_bytes());
+        // Block size: 4096 (standard 4KB blocks)
+        header.extend_from_slice(&4096u32.to_le_bytes());
+        // Total blocks: 2097152 (8GB image = 8 * 1024 * 1024 * 1024 / 4096)
+        header.extend_from_slice(&2097152u32.to_le_bytes());
+        // Total chunks: 256 (typical for a real image with many partitions)
+        header.extend_from_slice(&256u32.to_le_bytes());
+        // Checksum: 0
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn test_detect_aib_sparse_image() {
+        let mut detector = FormatDetector::new();
+
+        // Create an AIB-style sparse header (8GB image, 256 chunks)
+        let header = create_aib_sparse_header();
+
+        match detector.process(&header) {
+            DetectionResult::Detected {
+                format,
+                consumed_bytes,
+                consumed_from_input,
+            } => {
+                assert_eq!(format, FileFormat::SparseImage);
+                assert_eq!(consumed_bytes.len(), 28);
+                assert_eq!(consumed_from_input, 28);
+                assert!(detector.is_complete());
+            }
+            DetectionResult::Error(msg) => {
+                panic!("AIB sparse header should be valid, got error: {}", msg);
+            }
+            DetectionResult::NeedMoreData => {
+                panic!("28 bytes should be enough for detection");
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_aib_sparse_image_with_trailing_data() {
+        let mut detector = FormatDetector::new();
+
+        // Create header followed by chunk data (simulating real file)
+        let mut data = create_aib_sparse_header();
+        // Append a RAW chunk header (12 bytes) + some data
+        data.extend_from_slice(&0xCAC1u16.to_le_bytes()); // CHUNK_TYPE_RAW
+        data.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        data.extend_from_slice(&1u32.to_le_bytes()); // chunk_sz (1 block)
+        data.extend_from_slice(&4108u32.to_le_bytes()); // total_sz (header + 1 block)
+        data.extend_from_slice(&[0u8; 100]); // Some raw data
+
+        match detector.process(&data) {
+            DetectionResult::Detected {
+                format,
+                consumed_bytes,
+                consumed_from_input,
+            } => {
+                assert_eq!(format, FileFormat::SparseImage);
+                // Detector buffers up to MAX_BUFFER_SIZE (64 bytes) for detection
+                // Header (28) + partial chunk header (36 more = 64 total)
+                assert_eq!(consumed_bytes.len(), FormatDetector::MAX_BUFFER_SIZE);
+                assert_eq!(consumed_from_input, FormatDetector::MAX_BUFFER_SIZE);
+            }
+            _ => panic!("Expected sparse image detection"),
+        }
+    }
 }
