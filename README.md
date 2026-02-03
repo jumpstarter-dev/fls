@@ -95,6 +95,43 @@ Write complete: 5120.00 MB in 281.23s (18.21 MB/s)
 Compression ratio: 9.80x
 ```
 
+### OCI Images
+
+`fls` can pull OCI images from registries and flash them either to a block device
+or to fastboot partitions.
+
+#### Flash an OCI image to a block device
+
+Use `from-url` with an `oci://` prefix:
+
+```bash
+fls from-url \
+  -u "$REGISTRY_USER" \
+  -p "$REGISTRY_PASS" \
+  "oci://quay.io/org/image:latest" \
+  /dev/mmcblk1
+```
+
+#### Flash an OCI image via fastboot
+
+`fls fastboot` pulls the OCI image, extracts partition images, and flashes them
+using the system `fastboot` CLI:
+
+```bash
+fls fastboot quay.io/org/image:latest
+```
+
+Provide explicit partition mappings when the OCI image contains multiple files:
+
+```bash
+fls fastboot quay.io/org/image:latest \
+  -t boot_a:boot_a.simg \
+  -t system_a:system_a.simg
+```
+
+Registry credentials can be provided with `-u/--username` and `-p/--password`
+(`FLS_REGISTRY_PASSWORD` env var is supported for the password).
+
 ## Command Options
 
 ### `fls from-url`
