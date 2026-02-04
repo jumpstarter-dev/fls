@@ -84,7 +84,7 @@ enum Commands {
     },
     /// Flash an OCI image to fastboot partitions via USB
     Fastboot {
-        /// OCI image reference to download and flash (e.g., "registry.example.com/my-image:latest")
+        /// OCI image reference to download and flash (must be prefixed with "oci://")
         image_ref: String,
         /// Device serial number (optional, will use first device if not specified)
         #[arg(short = 's', long)]
@@ -301,8 +301,20 @@ async fn main() {
             username,
             password,
         } => {
+            let image_ref_input = image_ref;
+            let image_ref = match image_ref_input.strip_prefix("oci://") {
+                Some(reference) => reference,
+                None => {
+                    eprintln!(
+                        "Error: fastboot expects an OCI image reference prefixed with 'oci://'"
+                    );
+                    eprintln!("  Example: fls fastboot oci://quay.io/org/image:latest");
+                    std::process::exit(1);
+                }
+            };
+
             println!("Fastboot flash command:");
-            println!("  Image: {}", image_ref);
+            println!("  Image: {}", image_ref_input);
             if let Some(ref serial) = serial {
                 println!("  Device serial: {}", serial);
             }
@@ -347,7 +359,7 @@ async fn main() {
                 password,
             };
 
-            match fls::flash_from_fastboot(&image_ref, options).await {
+            match fls::flash_from_fastboot(image_ref, options).await {
                 Ok(_) => {
                     println!("Result: FLASH_COMPLETED");
                     std::process::exit(0);

@@ -47,7 +47,8 @@ impl Error for FastbootError {}
 /// Main entry point for fastboot flashing
 ///
 /// Downloads an OCI image and flashes it to a fastboot device via the system fastboot CLI.
-/// The image_ref should be an OCI image reference (e.g., "registry.example.com/my-image:latest")
+/// The image_ref should be an OCI image reference without a scheme
+/// (e.g., "registry.example.com/my-image:latest").
 pub async fn flash_from_fastboot(
     image_ref: &str,
     options: FastbootOptions,

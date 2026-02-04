@@ -118,13 +118,13 @@ fls from-url \
 using the system `fastboot` CLI:
 
 ```bash
-fls fastboot quay.io/org/image:latest
+fls fastboot oci://quay.io/org/image:latest
 ```
 
 Provide explicit partition mappings when the OCI image contains multiple files:
 
 ```bash
-fls fastboot quay.io/org/image:latest \
+fls fastboot oci://quay.io/org/image:latest \
   -t boot_a:boot_a.simg \
   -t system_a:system_a.simg
 ```
