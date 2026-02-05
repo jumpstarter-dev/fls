@@ -98,15 +98,6 @@ pub async fn flash_from_fastboot(
     image_ref: &str,
     options: FastbootOptions,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    println!("Fastboot flash command:");
-    println!("  Image: {}", image_ref);
-    if let Some(ref serial) = options.device_serial {
-        println!("  Device serial: {}", serial);
-    }
-    println!("  Partition mappings: {:?}", options.partition_mappings);
-    println!("  Timeout: {} seconds", options.timeout_secs);
-    println!();
-
     let temp_dir = TempDirGuard::new("fls-fastboot")?;
     let partition_map = process_oci_image_to_dir(image_ref, &options, temp_dir.path()).await?;
 
