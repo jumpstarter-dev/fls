@@ -89,7 +89,7 @@ enum Commands {
         /// Device serial number (optional, will use first device if not specified)
         #[arg(short = 's', long)]
         serial: Option<String>,
-        /// Target partition and file (e.g., "boot_a:aboot.img", can be used multiple times)
+        /// Target partition and file override (e.g., "boot_a:boot_a.simg"), can be used multiple times
         #[arg(short = 't', long = "target", value_parser = parse_target_mapping)]
         targets: Vec<(String, String)>,
         /// Fastboot operation timeout in seconds (default: 30)
@@ -352,7 +352,6 @@ async fn main() {
                     show_memory,
                 },
                 device_serial: serial,
-                target: None, // TODO: Add target CLI argument
                 partition_mappings: targets,
                 timeout_secs: timeout,
                 username,

@@ -11,6 +11,7 @@ mod registry;
 // Public re-exports
 pub use from_oci::{
     extract_files_by_annotations, extract_files_by_annotations_to_dir,
-    extract_files_from_oci_image, extract_files_from_oci_image_to_dir, flash_from_oci,
+    extract_files_by_annotations_with_overrides_to_dir, extract_files_from_oci_image,
+    extract_files_from_oci_image_to_dir, flash_from_oci,
 };
 pub use reference::ImageReference;

@@ -66,7 +66,6 @@ pub struct OciOptions {
 pub struct FastbootOptions {
     pub common: FlashOptions,
     pub device_serial: Option<String>,
-    pub target: Option<String>, // Target platform (e.g., "ridesx4")
     pub partition_mappings: Vec<(String, String)>, // (partition_name, file_pattern) - fallback for manual mapping
     pub timeout_secs: u32,
     pub username: Option<String>,
@@ -78,7 +77,6 @@ impl Default for FastbootOptions {
         Self {
             common: FlashOptions::default(),
             device_serial: None,
-            target: None,
             partition_mappings: Vec::new(),
             timeout_secs: 30,
             username: None,

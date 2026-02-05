@@ -29,7 +29,9 @@ use crate::fls::progress::ProgressTracker;
 use crate::fls::simg::{SparseParser, WriteCommand};
 use crate::fls::stream_utils::ChannelReader;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+const OCI_TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
 /// Parameters for download coordination functions
 struct DownloadCoordinationParams {
@@ -476,7 +478,7 @@ pub async fn extract_files_from_oci_image_to_dir(
     let response = client.get_blob_stream(&layer.digest).await?;
     let stream = response.bytes_stream();
 
-    let is_tar_layer = layer.media_type.contains("tar");
+    let is_tar_layer = layer.media_type.contains("tar") || looks_like_tar_layer(layer);
     let should_use_tar = is_tar_layer || target_files.len() > 1;
 
     if should_use_tar {
@@ -534,7 +536,7 @@ pub async fn extract_files_by_annotations(
         if let Some(ref annotations) = layer.annotations {
             if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
                 let title = annotations
-                    .get("org.opencontainers.image.title")
+                    .get(OCI_TITLE_ANNOTATION)
                     .cloned()
                     .unwrap_or_else(|| format!("layer-{}", &layer.digest[0..12]));
                 ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
@@ -630,7 +632,7 @@ pub async fn extract_files_by_annotations_to_dir(
                 let sanitized_name = sanitize_partition_name(partition)
                     .map_err(|e| format!("Invalid partition annotation '{}': {}", partition, e))?;
                 let title = annotations
-                    .get("org.opencontainers.image.title")
+                    .get(OCI_TITLE_ANNOTATION)
                     .map(|s| s.as_str())
                     .unwrap_or("layer");
                 println!(
@@ -656,6 +658,230 @@ pub async fn extract_files_by_annotations_to_dir(
         partition_files.len()
     );
     Ok(partition_files)
+}
+
+fn parse_default_partitions(manifest: &Manifest) -> Result<Option<HashSet<String>>, String> {
+    let Manifest::Image(image) = manifest else {
+        return Ok(None);
+    };
+
+    let Some(ref annotations) = image.annotations else {
+        return Ok(None);
+    };
+
+    let Some(raw) = annotations.get(automotive_annotations::DEFAULT_PARTITIONS) else {
+        return Ok(None);
+    };
+
+    let mut partitions = HashSet::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let sanitized = sanitize_partition_name(trimmed)
+            .map_err(|e| format!("Invalid default partition '{}': {}", trimmed, e))?;
+        partitions.insert(sanitized);
+    }
+
+    if partitions.is_empty() {
+        return Err(format!(
+            "Default partition annotation '{}' is empty",
+            automotive_annotations::DEFAULT_PARTITIONS
+        ));
+    }
+
+    Ok(Some(partitions))
+}
+
+fn looks_like_tar_layer(layer: &super::manifest::Descriptor) -> bool {
+    if layer.media_type.contains("tar") {
+        return true;
+    }
+
+    let Some(ref annotations) = layer.annotations else {
+        return false;
+    };
+
+    let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) else {
+        return false;
+    };
+
+    let title = title.to_ascii_lowercase();
+    title.ends_with(".tar")
+        || title.ends_with(".tar.gz")
+        || title.ends_with(".tgz")
+        || title.ends_with(".tar.xz")
+        || title.ends_with(".tar.lz4")
+}
+
+/// Extract files based on layer annotations, applying optional overrides.
+///
+/// When overrides are provided, each entry maps a target partition to a layer
+/// title (org.opencontainers.image.title). Auto-detected partitions remain
+/// unless explicitly overridden. If the manifest provides default partitions,
+/// only those partitions are auto-extracted. Returns Ok(None) when no
+/// annotations exist and overrides were provided, allowing callers to fall back
+/// to pattern-based extraction.
+pub async fn extract_files_by_annotations_with_overrides_to_dir(
+    image: &str,
+    options: &OciOptions,
+    output_dir: &Path,
+    overrides: &[(String, String)],
+) -> Result<Option<HashMap<String, PathBuf>>, Box<dyn std::error::Error>> {
+    // Parse image reference
+    let image_ref = ImageReference::parse(image)?;
+    println!("Pulling OCI image: {}", image_ref);
+
+    // Create registry client and authenticate
+    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
+    println!("Connecting to registry: {}", image_ref.registry);
+    client.authenticate().await?;
+
+    // Resolve manifest (handling multi-platform indexes)
+    let manifest = resolve_manifest(&mut client).await?;
+
+    let default_partitions = parse_default_partitions(&manifest)
+        .map_err(|e| format!("Invalid default partitions annotation: {}", e))?;
+    if let Some(ref partitions) = default_partitions {
+        println!("Using default partitions from manifest: {:?}", partitions);
+    }
+
+    // Get layers and build lookup tables
+    let layers = manifest.get_layers()?;
+    let mut partition_files = HashMap::new();
+    let mut title_to_layer = HashMap::new();
+    let mut title_to_path = HashMap::new();
+    let mut has_partition_annotations = false;
+    let mut available_partitions = HashSet::new();
+    let overridden_partitions: HashSet<String> = overrides
+        .iter()
+        .map(|(partition, _)| partition.clone())
+        .collect();
+    let allowed_partitions = default_partitions.as_ref();
+    let is_single_tar_layer = layers.len() == 1 && looks_like_tar_layer(&layers[0]);
+
+    for layer in layers {
+        if let Some(ref annotations) = layer.annotations {
+            if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
+                title_to_layer.insert(title.clone(), layer);
+            }
+
+            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
+                has_partition_annotations = true;
+                available_partitions.insert(partition.clone());
+                if overridden_partitions.contains(partition) {
+                    continue;
+                }
+                if let Some(allowed) = allowed_partitions {
+                    if !allowed.contains(partition) {
+                        continue;
+                    }
+                }
+                ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+                let sanitized_name = sanitize_partition_name(partition)
+                    .map_err(|e| format!("Invalid partition annotation '{}': {}", partition, e))?;
+                let title = annotations
+                    .get(OCI_TITLE_ANNOTATION)
+                    .map(|s| s.as_str())
+                    .unwrap_or("layer");
+                println!(
+                    "Extracting {} from layer {} for partition {}",
+                    title,
+                    &layer.digest[0..12],
+                    partition
+                );
+
+                // Download this specific layer
+                let response = client.get_blob_stream(&layer.digest).await?;
+                let stream = response.bytes_stream();
+
+                let output_path = output_dir.join(format!("{}.img", sanitized_name));
+                stream_blob_to_file(stream, output_path.clone()).await?;
+                partition_files.insert(sanitized_name, output_path.clone());
+                if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
+                    title_to_path.insert(title.clone(), output_path);
+                }
+            }
+        }
+    }
+
+    if !has_partition_annotations && title_to_layer.is_empty() {
+        if overrides.is_empty() {
+            return Err(
+                "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if !has_partition_annotations && !overrides.is_empty() && is_single_tar_layer {
+        let single_title = layers[0]
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(OCI_TITLE_ANNOTATION));
+        let override_titles: HashSet<&str> = overrides
+            .iter()
+            .map(|(_, filename)| filename.as_str())
+            .collect();
+
+        if single_title
+            .map(|title| !override_titles.contains(title.as_str()))
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
+    }
+
+    // Apply overrides by layer title
+    for (partition, filename) in overrides {
+        let sanitized_partition = sanitize_partition_name(partition)
+            .map_err(|e| format!("Invalid partition mapping '{}': {}", partition, e))?;
+
+        if let Some(path) = title_to_path.get(filename) {
+            partition_files.insert(sanitized_partition, path.clone());
+            continue;
+        }
+
+        let layer = match title_to_layer.get(filename) {
+            Some(layer) => *layer,
+            None => {
+                let available: Vec<&String> = title_to_layer.keys().collect();
+                return Err(format!(
+                    "Override file '{}' not found in OCI layer titles. Available files: {:?}",
+                    filename, available
+                )
+                .into());
+            }
+        };
+
+        ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+        let output_path = output_dir.join(format!("{}.img", sanitized_partition));
+
+        let response = client.get_blob_stream(&layer.digest).await?;
+        let stream = response.bytes_stream();
+        stream_blob_to_file(stream, output_path.clone()).await?;
+
+        title_to_path.insert(filename.clone(), output_path.clone());
+        partition_files.insert(sanitized_partition, output_path);
+    }
+
+    if partition_files.is_empty() {
+        if let Some(allowed) = allowed_partitions {
+            return Err(format!(
+                "No partitions matched default partitions {:?}. Available partitions: {:?}",
+                allowed, available_partitions
+            )
+            .into());
+        }
+        return Err(
+            "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
+                .into(),
+        );
+    }
+
+    Ok(Some(partition_files))
 }
 
 fn ensure_supported_layer_compression(

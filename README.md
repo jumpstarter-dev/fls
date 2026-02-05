@@ -121,6 +121,11 @@ using the system `fastboot` CLI:
 fls fastboot oci://quay.io/org/image:latest
 ```
 
+If the OCI manifest includes
+`automotive.sdv.cloud.redhat.com/default-partitions` (comma-separated),
+`fls fastboot` flashes only those partitions by default. Otherwise it flashes
+all annotated partitions.
+
 Provide explicit partition mappings when the OCI image contains multiple files:
 
 ```bash
@@ -128,6 +133,11 @@ fls fastboot oci://quay.io/org/image:latest \
   -t boot_a:boot_a.simg \
   -t system_a:system_a.simg
 ```
+
+When `-t` is provided, `fls` applies those mappings on top of the OCI layer
+annotations and includes those partitions in the flash set (e.g., add
+`-t vbmeta_a:vbmeta_a.simg` to flash vbmeta). If the image lacks annotations,
+it falls back to looking for the specified files directly in the image.
 
 Registry credentials can be provided with `-u/--username` and `-p/--password`
 (`FLS_REGISTRY_PASSWORD` env var is supported for the password).

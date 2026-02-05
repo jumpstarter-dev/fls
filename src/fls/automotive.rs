@@ -16,6 +16,9 @@ pub mod annotations {
     pub const MULTI_LAYER: &str = "automotive.sdv.cloud.redhat.com/multi-layer";
 
     pub const PARTS: &str = "automotive.sdv.cloud.redhat.com/parts";
+
+    /// Comma-separated list of default partitions to flash
+    pub const DEFAULT_PARTITIONS: &str = "automotive.sdv.cloud.redhat.com/default-partitions";
 }
 
 pub mod targets {

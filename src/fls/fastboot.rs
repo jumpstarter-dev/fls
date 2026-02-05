@@ -226,6 +226,32 @@ async fn process_oci_image_to_dir(
         return extract_files_by_auto_detection_to_dir(image_ref, options, output_dir).await;
     }
 
+    println!("Partition mappings provided; applying overrides on top of OCI annotations");
+
+    let oci_options = crate::fls::options::OciOptions {
+        common: options.common.clone(),
+        username: options.username.clone(),
+        password: options.password.clone(),
+        file_pattern: None,
+    };
+
+    match super::oci::extract_files_by_annotations_with_overrides_to_dir(
+        image_ref,
+        &oci_options,
+        output_dir,
+        &options.partition_mappings,
+    )
+    .await
+    {
+        Ok(Some(partition_files)) => return Ok(partition_files),
+        Ok(None) => {
+            println!("No OCI annotations found, falling back to file-pattern extraction");
+        }
+        Err(e) => {
+            return Err(format!("Annotation-based extraction failed: {}", e).into());
+        }
+    }
+
     extract_files_by_patterns_to_dir(image_ref, options, output_dir).await
 }
 
@@ -246,9 +272,17 @@ async fn extract_files_by_auto_detection_to_dir(
 
     // Use annotation-aware extraction to get files from correct layers
     let partition_files =
-        super::oci::extract_files_by_annotations_to_dir(image_ref, &oci_options, output_dir)
-            .await
-            .map_err(|e| format!("Annotation-based extraction failed: {}", e))?;
+        super::oci::extract_files_by_annotations_with_overrides_to_dir(
+            image_ref,
+            &oci_options,
+            output_dir,
+            &[],
+        )
+        .await
+        .map_err(|e| format!("Annotation-based extraction failed: {}", e))?
+        .ok_or_else(|| {
+            "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations".to_string()
+        })?;
 
     if partition_files.is_empty() {
         return Err("No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations".into());
