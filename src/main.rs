@@ -73,7 +73,7 @@ enum Commands {
         #[arg(long)]
         show_memory: bool,
         /// Registry username for OCI authentication
-        #[arg(short = 'u', long)]
+        #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
         /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
         #[arg(short = 'p', long, env = "FLS_REGISTRY_PASSWORD")]
@@ -92,8 +92,8 @@ enum Commands {
         /// Target partition and file override (e.g., "boot_a:boot_a.simg"), can be used multiple times
         #[arg(short = 't', long = "target", value_parser = parse_target_mapping)]
         targets: Vec<(String, String)>,
-        /// Fastboot operation timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")]
+        /// Fastboot operation timeout in seconds (default: 1200)
+        #[arg(long, default_value = "1200")]
         timeout: u32,
         /// Path to CA certificate PEM file for TLS validation
         #[arg(long)]
@@ -104,15 +104,6 @@ enum Commands {
         /// Enable debug output
         #[arg(long)]
         debug: bool,
-        /// Progress update interval in seconds (default: 0.5, accepts float values like 1.0 or 0.5)
-        #[arg(short = 'i', long, default_value = "0.5")]
-        progress_interval: f64,
-        /// Print progress on new lines instead of clearing and rewriting the same line
-        #[arg(short = 'n', long)]
-        newline_progress: bool,
-        /// Show memory statistics in progress display
-        #[arg(long)]
-        show_memory: bool,
         /// Registry username for OCI authentication
         #[arg(short = 'u', long)]
         username: Option<String>,
@@ -163,9 +154,13 @@ async fn main() {
                 println!("  Image: {}", image_ref);
                 println!("  Device: {}", device);
                 match (&username, &password) {
+                    (Some(_), None) | (None, Some(_)) => {
+                        eprintln!(
+                            "Error: OCI authentication requires both --username and --password"
+                        );
+                        std::process::exit(1);
+                    }
                     (Some(_), Some(_)) => println!("  Auth: Using provided credentials"),
-                    (Some(_), None) => println!("  Auth: Username provided but password missing"),
-                    (None, Some(_)) => println!("  Auth: Password provided but username missing"),
                     (None, None) => println!("  Auth: Anonymous"),
                 }
                 if let Some(ref pattern) = file_pattern {
@@ -295,9 +290,6 @@ async fn main() {
             cacert,
             insecure_tls,
             debug,
-            progress_interval,
-            newline_progress,
-            show_memory,
             username,
             password,
         } => {
@@ -331,25 +323,20 @@ async fn main() {
             println!("  Timeout: {} seconds", timeout);
             println!("  Debug: {}", debug);
             match (&username, &password) {
+                (Some(_), None) | (None, Some(_)) => {
+                    eprintln!("Error: OCI authentication requires both --username and --password");
+                    std::process::exit(1);
+                }
                 (Some(_), Some(_)) => println!("  Auth: Using provided credentials"),
-                (Some(_), None) => println!("  Auth: Username provided but password missing"),
-                (None, Some(_)) => println!("  Auth: Password provided but username missing"),
                 (None, None) => println!("  Auth: Anonymous"),
             }
             println!();
 
             let options = fls::FastbootOptions {
-                common: fls::FlashOptions {
+                http: fls::HttpClientOptions {
                     insecure_tls,
                     cacert,
-                    device: "fastboot".to_string(), // Not used for fastboot
-                    buffer_size_mb: 128,            // Default values
-                    write_buffer_size_mb: 128,
                     debug,
-                    o_direct: false, // Not applicable to fastboot
-                    progress_interval_secs: progress_interval,
-                    newline_progress,
-                    show_memory,
                 },
                 device_serial: serial,
                 partition_mappings: targets,

@@ -44,6 +44,51 @@ impl fmt::Display for FastbootError {
 
 impl Error for FastbootError {}
 
+fn temp_base_dir() -> Result<PathBuf, FastbootError> {
+    let env_value = std::env::var("FLS_TMP_DIR").ok();
+    let base = match env_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(value) => PathBuf::from(value),
+        None => PathBuf::from("/var/lib/fls"),
+    };
+
+    std::fs::create_dir_all(&base).map_err(|e| {
+        let hint = if env_value.is_some() {
+            format!(
+                "Failed to create temp base directory {}: {}",
+                base.display(),
+                e
+            )
+        } else {
+            format!(
+                "Failed to create temp base directory {}: {}. Set FLS_TMP_DIR to override.",
+                base.display(),
+                e
+            )
+        };
+        FastbootError::CommandError(hint)
+    })?;
+
+    Ok(base)
+}
+
+fn build_oci_options(options: &FastbootOptions) -> crate::fls::options::OciOptions {
+    crate::fls::options::OciOptions {
+        common: crate::fls::options::FlashOptions {
+            insecure_tls: options.http.insecure_tls,
+            cacert: options.http.cacert.clone(),
+            debug: options.http.debug,
+            ..crate::fls::options::FlashOptions::default()
+        },
+        username: options.username.clone(),
+        password: options.password.clone(),
+        file_pattern: None,
+    }
+}
+
 /// Main entry point for fastboot flashing
 ///
 /// Downloads an OCI image and flashes it to a fastboot device via the system fastboot CLI.
@@ -81,7 +126,7 @@ struct TempDirGuard {
 
 impl TempDirGuard {
     fn new(prefix: &str) -> Result<Self, FastbootError> {
-        let base = std::env::temp_dir();
+        let base = temp_base_dir()?;
         let pid = std::process::id();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -228,12 +273,7 @@ async fn process_oci_image_to_dir(
 
     println!("Partition mappings provided; applying overrides on top of OCI annotations");
 
-    let oci_options = crate::fls::options::OciOptions {
-        common: options.common.clone(),
-        username: options.username.clone(),
-        password: options.password.clone(),
-        file_pattern: None,
-    };
+    let oci_options = build_oci_options(options);
 
     match super::oci::extract_files_by_annotations_with_overrides_to_dir(
         image_ref,
@@ -263,12 +303,7 @@ async fn extract_files_by_auto_detection_to_dir(
     println!("Auto-detecting partitions from OCI layer annotations...");
 
     // Create OCI options
-    let oci_options = crate::fls::options::OciOptions {
-        common: options.common.clone(),
-        username: options.username.clone(),
-        password: options.password.clone(),
-        file_pattern: None,
-    };
+    let oci_options = build_oci_options(options);
 
     // Use annotation-aware extraction to get files from correct layers
     let partition_files =
@@ -358,12 +393,7 @@ async fn extract_files_from_oci_to_dir(
 
     println!("Looking for files: {:?}", target_files);
 
-    let oci_options = crate::fls::options::OciOptions {
-        common: options.common.clone(),
-        username: options.username.clone(),
-        password: options.password.clone(),
-        file_pattern: None,
-    };
+    let oci_options = build_oci_options(options);
 
     let file_data = super::oci::extract_files_from_oci_image_to_dir(
         image_ref,
@@ -612,8 +642,12 @@ exit 0
         assert_eq!(lines, expected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_temp_dir_guard_cleans_up() {
+        let base_dir = tempdir().expect("create temp base dir");
+        let _env_guard =
+            EnvVarGuard::set("FLS_TMP_DIR", base_dir.path().to_string_lossy().to_string());
         let path = {
             let guard = TempDirGuard::new("fls-fastboot-test").expect("create temp dir guard");
             let path = guard.path().to_path_buf();

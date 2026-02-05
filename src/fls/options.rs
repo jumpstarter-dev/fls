@@ -64,7 +64,7 @@ pub struct OciOptions {
 /// Options for fastboot flash operations
 #[derive(Debug, Clone)]
 pub struct FastbootOptions {
-    pub common: FlashOptions,
+    pub http: HttpClientOptions,
     pub device_serial: Option<String>,
     pub partition_mappings: Vec<(String, String)>, // (partition_name, file_pattern) - fallback for manual mapping
     pub timeout_secs: u32,
@@ -75,7 +75,7 @@ pub struct FastbootOptions {
 impl Default for FastbootOptions {
     fn default() -> Self {
         Self {
-            common: FlashOptions::default(),
+            http: HttpClientOptions::default(),
             device_serial: None,
             partition_mappings: Vec::new(),
             timeout_secs: 30,
@@ -86,7 +86,7 @@ impl Default for FastbootOptions {
 }
 
 /// Options for HTTP client setup (subset of FlashOptions)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HttpClientOptions {
     pub insecure_tls: bool,
     pub cacert: Option<PathBuf>,
@@ -117,6 +117,6 @@ impl From<&OciOptions> for HttpClientOptions {
 
 impl From<&FastbootOptions> for HttpClientOptions {
     fn from(opts: &FastbootOptions) -> Self {
-        Self::from(&opts.common)
+        opts.http.clone()
     }
 }

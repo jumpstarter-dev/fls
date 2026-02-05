@@ -121,6 +121,9 @@ using the system `fastboot` CLI:
 fls fastboot oci://quay.io/org/image:latest
 ```
 
+To avoid using `/tmp` for fastboot extraction, set `FLS_TMP_DIR` to a directory
+on persistent storage (default is `/var/lib/fls`).
+
 If the OCI manifest includes
 `automotive.sdv.cloud.redhat.com/default-partitions` (comma-separated),
 `fls fastboot` flashes only those partitions by default. Otherwise it flashes
@@ -140,7 +143,8 @@ annotations and includes those partitions in the flash set (e.g., add
 it falls back to looking for the specified files directly in the image.
 
 Registry credentials can be provided with `-u/--username` and `-p/--password`
-(`FLS_REGISTRY_PASSWORD` env var is supported for the password).
+(`FLS_REGISTRY_PASSWORD` env var is supported for the password). Both are
+required for authenticated access.
 
 ## Command Options
 
