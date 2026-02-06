@@ -23,7 +23,7 @@ use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
-use crate::fls::magic_bytes::{detect_content_and_compression, is_tar_archive, ContentType};
+use crate::fls::magic_bytes::{detect_compression, detect_content_and_compression, ContentType};
 use crate::fls::options::OciOptions;
 use crate::fls::progress::ProgressTracker;
 use crate::fls::simg::{SparseParser, WriteCommand};
@@ -86,160 +86,23 @@ struct TarPipelineComponents {
     decompressor_name: &'static str,
 }
 
-/// Extract specific files from an OCI image and return them as a HashMap
+/// Connect to an OCI registry and resolve the image manifest.
 ///
-/// This function downloads an OCI image, extracts the tar.gz layer(s), and returns
-/// the specified files as a HashMap of filename -> file_data.
-pub async fn extract_files_from_oci_image(
+/// Handles image reference parsing, client creation, authentication, and
+/// manifest resolution (including multi-platform index negotiation).
+async fn connect_and_resolve(
     image: &str,
-    target_files: &std::collections::HashSet<String>,
     options: &OciOptions,
-) -> Result<HashMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
-    // Parse image reference
+) -> Result<(RegistryClient, Manifest), Box<dyn std::error::Error>> {
     let image_ref = ImageReference::parse(image)?;
     println!("Pulling OCI image: {}", image_ref);
 
-    // Create registry client and authenticate
     let mut client = RegistryClient::new(image_ref.clone(), options).await?;
     println!("Connecting to registry: {}", image_ref.registry);
     client.authenticate().await?;
 
-    // Resolve manifest (handling multi-platform indexes)
     let manifest = resolve_manifest(&mut client).await?;
-
-    // Get the layer to download
-    let layer = manifest.get_single_layer()?;
-    let layer_size = layer.size;
-    let compression = layer.compression();
-
-    println!("Layer digest: {}", layer.digest);
-    println!(
-        "Layer size: {} bytes ({:.2} MB)",
-        layer_size,
-        layer_size as f64 / (1024.0 * 1024.0)
-    );
-    println!("Layer compression: {:?}", compression);
-
-    ensure_supported_layer_compression(compression, &layer.media_type)?;
-
-    // Start blob download
-    println!("Starting download...");
-    let response = client.get_blob_stream(&layer.digest).await?;
-    let mut stream = response.bytes_stream();
-
-    // Extract files from tar stream
-    let mut file_map = HashMap::new();
-    let mut collected_bytes = Vec::new();
-
-    // Collect all bytes from stream first
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-        collected_bytes.extend_from_slice(&chunk);
-    }
-
-    println!(
-        "Downloaded {} bytes, extracting tar...",
-        collected_bytes.len()
-    );
-
-    // Detect compression and decompress if needed
-    let decompressed_data = if is_gzip_prefix(&collected_bytes) {
-        // Gzip compressed
-        println!("Detected gzip compression, decompressing...");
-        let mut decoder = GzDecoder::new(&collected_bytes[..]);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| format!("Gzip decompression failed: {}", e))?;
-        decompressed
-    } else if is_xz_prefix(&collected_bytes) {
-        // XZ compressed
-        println!("Detected xz compression, decompressing...");
-        let mut decoder = XzDecoder::new(&collected_bytes[..]);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| format!("XZ decompression failed: {}", e))?;
-        decompressed
-    } else {
-        // Not compressed
-        collected_bytes
-    };
-
-    // Detect tar content based on decompressed data
-    let is_tar = is_tar_archive(&decompressed_data);
-    if is_tar {
-        println!("Processing as tar archive based on content detection...");
-        // Extract files from tar
-        use std::io::Cursor;
-        use tar::Archive;
-
-        let cursor = Cursor::new(decompressed_data);
-        let mut archive = Archive::new(cursor);
-
-        for entry_result in archive.entries().map_err(|e| format!("Tar error: {}", e))? {
-            let mut entry = entry_result.map_err(|e| format!("Tar entry error: {}", e))?;
-
-            let path = entry
-                .path()
-                .map_err(|e| format!("Invalid path: {}", e))?
-                .to_path_buf();
-
-            if let Some(file_name) = path.file_name() {
-                let file_name_str = file_name.to_string_lossy().to_string();
-
-                // Check if this file is in our target list
-                if target_files.contains(&file_name_str) {
-                    println!("Found target file: {}", file_name_str);
-
-                    let mut file_data = Vec::new();
-                    std::io::copy(&mut entry, &mut file_data)
-                        .map_err(|e| format!("Failed to read file data: {}", e))?;
-
-                    println!("Extracted {} ({} bytes)", file_name_str, file_data.len());
-                    file_map.insert(file_name_str, file_data);
-
-                    // If we found all files, we can break early
-                    if file_map.len() == target_files.len() {
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        println!("Processing as direct file based on content detection...");
-        // This is a direct file (e.g., .simg compressed), not a tar archive
-        // For single file extraction, use the first (and likely only) target file
-        if target_files.len() == 1 {
-            let target_file = target_files.iter().next().unwrap().clone();
-            println!(
-                "Using single target file: {} ({} bytes)",
-                target_file,
-                decompressed_data.len()
-            );
-            file_map.insert(target_file, decompressed_data);
-        } else {
-            // For multiple targets, we need a different approach since this layer contains only one file
-            return Err("Multiple target files specified but OCI layer contains a single direct file. Use separate layers for each file.".into());
-        }
-    }
-
-    println!("Extracted {} files from OCI image", file_map.len());
-    Ok(file_map)
-}
-
-fn is_gzip_prefix(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
-}
-
-fn is_xz_prefix(data: &[u8]) -> bool {
-    data.len() >= 6
-        && data[0] == 0xfd
-        && data[1] == 0x37
-        && data[2] == 0x7a
-        && data[3] == 0x58
-        && data[4] == 0x5a
-        && data[5] == 0x00
+    Ok((client, manifest))
 }
 
 async fn stream_blob_to_file(
@@ -267,8 +130,7 @@ async fn stream_blob_to_file(
         return Err("Empty OCI layer stream".into());
     }
 
-    let is_gzip = is_gzip_prefix(&prefix);
-    let is_xz = is_xz_prefix(&prefix);
+    let blob_compression = detect_compression(&prefix);
 
     let (tx, rx) = mpsc::channel::<Bytes>(16);
     for chunk in initial_chunks {
@@ -292,18 +154,22 @@ async fn stream_blob_to_file(
         let mut file = File::create(&output_path)
             .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
 
-        if is_gzip {
-            let mut decoder = GzDecoder::new(reader);
-            std::io::copy(&mut decoder, &mut file)
-                .map_err(|e| format!("Gzip decompression failed: {}", e))?;
-        } else if is_xz {
-            let mut decoder = XzDecoder::new(reader);
-            std::io::copy(&mut decoder, &mut file)
-                .map_err(|e| format!("XZ decompression failed: {}", e))?;
-        } else {
-            let mut reader = reader;
-            std::io::copy(&mut reader, &mut file)
-                .map_err(|e| format!("Stream copy failed: {}", e))?;
+        match blob_compression {
+            Compression::Gzip => {
+                let mut decoder = GzDecoder::new(reader);
+                std::io::copy(&mut decoder, &mut file)
+                    .map_err(|e| format!("Gzip decompression failed: {}", e))?;
+            }
+            Compression::Xz => {
+                let mut decoder = XzDecoder::new(reader);
+                std::io::copy(&mut decoder, &mut file)
+                    .map_err(|e| format!("XZ decompression failed: {}", e))?;
+            }
+            _ => {
+                let mut reader = reader;
+                std::io::copy(&mut reader, &mut file)
+                    .map_err(|e| format!("Stream copy failed: {}", e))?;
+            }
         }
 
         file.flush()
@@ -311,14 +177,17 @@ async fn stream_blob_to_file(
         Ok(())
     });
 
-    forward_handle
-        .await
-        .map_err(|e| format!("Stream task failed: {}", e))?
-        .map_err(|e| format!("Stream task error: {}", e))?;
-    writer_handle
-        .await
+    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
+
+    // Prioritize writer errors — a writer failure (e.g. disk full, decompression
+    // error) drops rx, which causes the forwarder's tx.send to fail with a
+    // misleading "Reader channel closed" error.
+    writer_result
         .map_err(|e| format!("Writer task failed: {}", e))?
         .map_err(|e| format!("Writer task error: {}", e))?;
+    forward_result
+        .map_err(|e| format!("Stream task failed: {}", e))?
+        .map_err(|e| format!("Stream task error: {}", e))?;
 
     Ok(())
 }
@@ -349,8 +218,7 @@ async fn stream_blob_to_tar_files(
         return Err("Empty OCI layer stream".into());
     }
 
-    let is_gzip = is_gzip_prefix(&prefix);
-    let is_xz = is_xz_prefix(&prefix);
+    let blob_compression = detect_compression(&prefix);
 
     let (tx, rx) = mpsc::channel::<Bytes>(16);
     for chunk in initial_chunks {
@@ -372,12 +240,10 @@ async fn stream_blob_to_tar_files(
     let writer_handle =
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, PathBuf>, String> {
             let reader = ChannelReader::new(rx);
-            let reader: Box<dyn Read + Send> = if is_gzip {
-                Box::new(GzDecoder::new(reader))
-            } else if is_xz {
-                Box::new(XzDecoder::new(reader))
-            } else {
-                Box::new(reader)
+            let reader: Box<dyn Read + Send> = match blob_compression {
+                Compression::Gzip => Box::new(GzDecoder::new(reader)),
+                Compression::Xz => Box::new(XzDecoder::new(reader)),
+                _ => Box::new(reader),
             };
 
             let mut found = HashMap::new();
@@ -403,20 +269,24 @@ async fn stream_blob_to_tar_files(
                     let cursor = std::io::Cursor::new(prefix_slice.to_vec());
                     let mut combined = cursor.chain(entry);
 
-                    if is_gzip_prefix(prefix_slice) {
-                        let mut decoder = GzDecoder::new(combined);
-                        std::io::copy(&mut decoder, &mut file).map_err(|e| {
-                            format!("Failed to write {}: {}", output_path.display(), e)
-                        })?;
-                    } else if is_xz_prefix(prefix_slice) {
-                        let mut decoder = XzDecoder::new(combined);
-                        std::io::copy(&mut decoder, &mut file).map_err(|e| {
-                            format!("Failed to write {}: {}", output_path.display(), e)
-                        })?;
-                    } else {
-                        std::io::copy(&mut combined, &mut file).map_err(|e| {
-                            format!("Failed to write {}: {}", output_path.display(), e)
-                        })?;
+                    match detect_compression(prefix_slice) {
+                        Compression::Gzip => {
+                            let mut decoder = GzDecoder::new(combined);
+                            std::io::copy(&mut decoder, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
+                        Compression::Xz => {
+                            let mut decoder = XzDecoder::new(combined);
+                            std::io::copy(&mut decoder, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
+                        _ => {
+                            std::io::copy(&mut combined, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
                     }
                     found.insert(file_name, output_path);
 
@@ -429,14 +299,15 @@ async fn stream_blob_to_tar_files(
             Ok(found)
         });
 
-    forward_handle
-        .await
-        .map_err(|e| format!("Stream task failed: {}", e))?
-        .map_err(|e| format!("Stream task error: {}", e))?;
-    let found = writer_handle
-        .await
+    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
+
+    // Prioritize writer errors (see stream_blob_to_file for rationale).
+    let found = writer_result
         .map_err(|e| format!("Writer task failed: {}", e))?
         .map_err(|e| format!("Writer task error: {}", e))?;
+    forward_result
+        .map_err(|e| format!("Stream task failed: {}", e))?
+        .map_err(|e| format!("Stream task error: {}", e))?;
 
     Ok(found)
 }
@@ -448,17 +319,7 @@ pub async fn extract_files_from_oci_image_to_dir(
     options: &OciOptions,
     output_dir: &Path,
 ) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
-    // Parse image reference
-    let image_ref = ImageReference::parse(image)?;
-    println!("Pulling OCI image: {}", image_ref);
-
-    // Create registry client and authenticate
-    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
-    println!("Connecting to registry: {}", image_ref.registry);
-    client.authenticate().await?;
-
-    // Resolve manifest (handling multi-platform indexes)
-    let manifest = resolve_manifest(&mut client).await?;
+    let (client, manifest) = connect_and_resolve(image, options).await?;
 
     // Get the layer to download
     let layer = manifest.get_single_layer()?;
@@ -511,115 +372,13 @@ pub async fn extract_files_from_oci_image_to_dir(
     Ok(map)
 }
 
-/// Extract files based on layer annotations for automotive images
-pub async fn extract_files_by_annotations(
-    image: &str,
-    options: &OciOptions,
-) -> Result<HashMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
-    // Parse image reference
-    let image_ref = ImageReference::parse(image)?;
-    println!("Pulling OCI image: {}", image_ref);
-
-    // Create registry client and authenticate
-    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
-    println!("Connecting to registry: {}", image_ref.registry);
-    client.authenticate().await?;
-
-    // Resolve manifest (handling multi-platform indexes)
-    let manifest = resolve_manifest(&mut client).await?;
-
-    // Get layers and extract from each based on annotations
-    let layers = manifest.get_layers()?;
-    let mut partition_files = HashMap::new();
-
-    for layer in layers {
-        if let Some(ref annotations) = layer.annotations {
-            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
-                let title = annotations
-                    .get(OCI_TITLE_ANNOTATION)
-                    .cloned()
-                    .unwrap_or_else(|| format!("layer-{}", &layer.digest[0..12]));
-                ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
-                println!(
-                    "Extracting {} from layer {} for partition {}",
-                    title,
-                    &layer.digest[0..12],
-                    partition
-                );
-
-                // Download this specific layer
-                let response = client.get_blob_stream(&layer.digest).await?;
-                let mut stream = response.bytes_stream();
-
-                use futures_util::StreamExt;
-
-                // Collect all bytes from stream
-                let mut collected_bytes = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-                    collected_bytes.extend_from_slice(&chunk);
-                }
-
-                println!("Downloaded {} bytes for {}", collected_bytes.len(), title);
-
-                // Detect compression and decompress if needed
-                let decompressed_data = if is_gzip_prefix(&collected_bytes) {
-                    // Gzip compressed
-                    println!("Decompressing gzip data for {}...", title);
-                    let mut decoder = GzDecoder::new(&collected_bytes[..]);
-                    let mut decompressed = Vec::new();
-                    decoder
-                        .read_to_end(&mut decompressed)
-                        .map_err(|e| format!("Gzip decompression failed: {}", e))?;
-                    decompressed
-                } else if is_xz_prefix(&collected_bytes) {
-                    // XZ compressed
-                    println!("Decompressing xz data for {}...", title);
-                    let mut decoder = XzDecoder::new(&collected_bytes[..]);
-                    let mut decompressed = Vec::new();
-                    decoder
-                        .read_to_end(&mut decompressed)
-                        .map_err(|e| format!("XZ decompression failed: {}", e))?;
-                    decompressed
-                } else {
-                    // Not compressed
-                    collected_bytes
-                };
-
-                println!(
-                    "Using decompressed file: {} ({} bytes)",
-                    title,
-                    decompressed_data.len()
-                );
-                partition_files.insert(partition.clone(), decompressed_data);
-            }
-        }
-    }
-
-    println!(
-        "Extracted {} partitions by annotations",
-        partition_files.len()
-    );
-    Ok(partition_files)
-}
-
 /// Extract files based on layer annotations for automotive images and write to output_dir
 pub async fn extract_files_by_annotations_to_dir(
     image: &str,
     options: &OciOptions,
     output_dir: &Path,
 ) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
-    // Parse image reference
-    let image_ref = ImageReference::parse(image)?;
-    println!("Pulling OCI image: {}", image_ref);
-
-    // Create registry client and authenticate
-    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
-    println!("Connecting to registry: {}", image_ref.registry);
-    client.authenticate().await?;
-
-    // Resolve manifest (handling multi-platform indexes)
-    let manifest = resolve_manifest(&mut client).await?;
+    let (client, manifest) = connect_and_resolve(image, options).await?;
 
     // Get layers and extract from each based on annotations
     let layers = manifest.get_layers()?;
@@ -729,17 +488,7 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
     output_dir: &Path,
     overrides: &[(String, String)],
 ) -> Result<Option<HashMap<String, PathBuf>>, Box<dyn std::error::Error>> {
-    // Parse image reference
-    let image_ref = ImageReference::parse(image)?;
-    println!("Pulling OCI image: {}", image_ref);
-
-    // Create registry client and authenticate
-    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
-    println!("Connecting to registry: {}", image_ref.registry);
-    client.authenticate().await?;
-
-    // Resolve manifest (handling multi-platform indexes)
-    let manifest = resolve_manifest(&mut client).await?;
+    let (client, manifest) = connect_and_resolve(image, options).await?;
 
     let default_partitions = parse_default_partitions(&manifest)
         .map_err(|e| format!("Invalid default partitions annotation: {}", e))?;
@@ -750,7 +499,7 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
     // Get layers and build lookup tables
     let layers = manifest.get_layers()?;
     let mut partition_files = HashMap::new();
-    let mut title_to_layer = HashMap::new();
+    let mut title_to_layer: HashMap<String, &super::manifest::Descriptor> = HashMap::new();
     let mut title_to_path = HashMap::new();
     let mut has_partition_annotations = false;
     let mut available_partitions = HashSet::new();
@@ -764,7 +513,16 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
     for layer in layers {
         if let Some(ref annotations) = layer.annotations {
             if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
-                title_to_layer.insert(title.clone(), layer);
+                if let Some(existing) = title_to_layer.get(title) {
+                    eprintln!(
+                        "Warning: duplicate OCI title '{}': keeping layer {}, ignoring layer {}",
+                        title,
+                        &existing.digest[..12.min(existing.digest.len())],
+                        &layer.digest[..12.min(layer.digest.len())],
+                    );
+                } else {
+                    title_to_layer.insert(title.clone(), layer);
+                }
             }
 
             if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
