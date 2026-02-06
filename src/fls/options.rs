@@ -78,7 +78,7 @@ impl Default for FastbootOptions {
             http: HttpClientOptions::default(),
             device_serial: None,
             partition_mappings: Vec::new(),
-            timeout_secs: 30,
+            timeout_secs: 1200,
             username: None,
             password: None,
         }

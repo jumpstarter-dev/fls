@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_fastboot_options_default() {
         let options = FastbootOptions::default();
-        assert_eq!(options.timeout_secs, 30);
+        assert_eq!(options.timeout_secs, 1200);
         assert!(options.partition_mappings.is_empty());
         assert!(options.username.is_none());
         assert!(options.password.is_none());

@@ -46,7 +46,7 @@ pub fn extract_decompressed_size(
 
 /// Extract target platform from OCI annotations
 pub fn extract_target_from_annotations(
-    annotations: &std::collections::HashMap<String, String>,
+    manifest_annotations: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    annotations.get(annotations::TARGET).cloned()
+    manifest_annotations.get(annotations::TARGET).cloned()
 }
