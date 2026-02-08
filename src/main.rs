@@ -105,7 +105,7 @@ enum Commands {
         #[arg(long)]
         debug: bool,
         /// Registry username for OCI authentication
-        #[arg(short = 'u', long)]
+        #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
         /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
         #[arg(short = 'p', long, env = "FLS_REGISTRY_PASSWORD")]
