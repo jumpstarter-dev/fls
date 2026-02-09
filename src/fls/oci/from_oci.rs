@@ -2,10 +2,12 @@
 ///
 /// Implements the streaming pipeline:
 /// Registry blob -> gzip decompress -> tar extract -> xzcat -> block device
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -15,16 +17,21 @@ use xz2::read::XzDecoder;
 use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
 use super::registry::RegistryClient;
+use crate::fls::automotive::annotations as automotive_annotations;
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
-use crate::fls::magic_bytes::{detect_content_and_compression, ContentType};
+use crate::fls::magic_bytes::{detect_compression, detect_content_and_compression, ContentType};
 use crate::fls::options::OciOptions;
 use crate::fls::progress::ProgressTracker;
 use crate::fls::simg::{SparseParser, WriteCommand};
 use crate::fls::stream_utils::ChannelReader;
+
+use std::collections::{HashMap, HashSet};
+
+const OCI_TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
 /// Parameters for download coordination functions
 struct DownloadCoordinationParams {
@@ -77,6 +84,598 @@ struct TarPipelineComponents {
     error_processor: tokio::task::JoinHandle<()>,
     decompressor: tokio::process::Child,
     decompressor_name: &'static str,
+}
+
+/// Connect to an OCI registry and resolve the image manifest.
+///
+/// Handles image reference parsing, client creation, authentication, and
+/// manifest resolution (including multi-platform index negotiation).
+async fn connect_and_resolve(
+    image: &str,
+    options: &OciOptions,
+) -> Result<(RegistryClient, Manifest), Box<dyn std::error::Error>> {
+    let image_ref = ImageReference::parse(image)?;
+    println!("Pulling OCI image: {}", image_ref);
+
+    let mut client = RegistryClient::new(image_ref.clone(), options).await?;
+    println!("Connecting to registry: {}", image_ref.registry);
+    client.authenticate().await?;
+
+    let manifest = resolve_manifest(&mut client).await?;
+    Ok((client, manifest))
+}
+
+async fn stream_blob_to_file(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+    output_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut prefix = Vec::new();
+    let mut initial_chunks: Vec<Bytes> = Vec::new();
+    while prefix.len() < 6 {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if prefix.len() < 6 {
+                    let needed = 6 - prefix.len();
+                    let take = needed.min(chunk.len());
+                    prefix.extend_from_slice(&chunk[..take]);
+                }
+                initial_chunks.push(chunk);
+            }
+            Some(Err(e)) => return Err(format!("Stream error: {}", e).into()),
+            None => break,
+        }
+    }
+
+    if initial_chunks.is_empty() {
+        return Err("Empty OCI layer stream".into());
+    }
+
+    let blob_compression = detect_compression(&prefix);
+
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
+    for chunk in initial_chunks {
+        tx.send(chunk)
+            .await
+            .map_err(|_| "Failed to send initial chunk to reader")?;
+    }
+
+    let forward_handle = tokio::spawn(async move {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
+            tx.send(chunk)
+                .await
+                .map_err(|_| "Reader channel closed".to_string())?;
+        }
+        Ok::<(), String>(())
+    });
+
+    let writer_handle = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let reader = ChannelReader::new(rx);
+        let mut file = File::create(&output_path)
+            .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+
+        match blob_compression {
+            Compression::Gzip => {
+                let mut decoder = GzDecoder::new(reader);
+                std::io::copy(&mut decoder, &mut file)
+                    .map_err(|e| format!("Gzip decompression failed: {}", e))?;
+            }
+            Compression::Xz => {
+                let mut decoder = XzDecoder::new(reader);
+                std::io::copy(&mut decoder, &mut file)
+                    .map_err(|e| format!("XZ decompression failed: {}", e))?;
+            }
+            _ => {
+                let mut reader = reader;
+                std::io::copy(&mut reader, &mut file)
+                    .map_err(|e| format!("Stream copy failed: {}", e))?;
+            }
+        }
+
+        file.flush()
+            .map_err(|e| format!("Failed to flush {}: {}", output_path.display(), e))?;
+        Ok(())
+    });
+
+    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
+
+    // Prioritize writer errors — a writer failure (e.g. disk full, decompression
+    // error) drops rx, which causes the forwarder's tx.send to fail with a
+    // misleading "Reader channel closed" error.
+    writer_result
+        .map_err(|e| format!("Writer task failed: {}", e))?
+        .map_err(|e| format!("Writer task error: {}", e))?;
+    forward_result
+        .map_err(|e| format!("Stream task failed: {}", e))?
+        .map_err(|e| format!("Stream task error: {}", e))?;
+
+    Ok(())
+}
+
+async fn stream_blob_to_tar_files(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+    target_files: std::collections::HashSet<String>,
+    output_dir: PathBuf,
+) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
+    let mut prefix = Vec::new();
+    let mut initial_chunks: Vec<Bytes> = Vec::new();
+    while prefix.len() < 6 {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if prefix.len() < 6 {
+                    let needed = 6 - prefix.len();
+                    let take = needed.min(chunk.len());
+                    prefix.extend_from_slice(&chunk[..take]);
+                }
+                initial_chunks.push(chunk);
+            }
+            Some(Err(e)) => return Err(format!("Stream error: {}", e).into()),
+            None => break,
+        }
+    }
+
+    if initial_chunks.is_empty() {
+        return Err("Empty OCI layer stream".into());
+    }
+
+    let blob_compression = detect_compression(&prefix);
+
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
+    for chunk in initial_chunks {
+        tx.send(chunk)
+            .await
+            .map_err(|_| "Failed to send initial chunk to reader")?;
+    }
+
+    let forward_handle = tokio::spawn(async move {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
+            tx.send(chunk)
+                .await
+                .map_err(|_| "Reader channel closed".to_string())?;
+        }
+        Ok::<(), String>(())
+    });
+
+    let writer_handle =
+        tokio::task::spawn_blocking(move || -> Result<HashMap<String, PathBuf>, String> {
+            let reader = ChannelReader::new(rx);
+            let reader: Box<dyn Read + Send> = match blob_compression {
+                Compression::Gzip => Box::new(GzDecoder::new(reader)),
+                Compression::Xz => Box::new(XzDecoder::new(reader)),
+                _ => Box::new(reader),
+            };
+
+            let mut found = HashMap::new();
+            let mut archive = tar::Archive::new(reader);
+            for entry_result in archive.entries().map_err(|e| format!("Tar error: {}", e))? {
+                let mut entry = entry_result.map_err(|e| format!("Tar entry error: {}", e))?;
+                let path = entry.path().map_err(|e| format!("Invalid path: {}", e))?;
+                let file_name = match path.file_name() {
+                    Some(name) => name.to_string_lossy().to_string(),
+                    None => continue,
+                };
+
+                if target_files.contains(&file_name) {
+                    let output_path = output_dir.join(&file_name);
+                    let mut file = File::create(&output_path).map_err(|e| {
+                        format!("Failed to create {}: {}", output_path.display(), e)
+                    })?;
+                    let mut prefix = [0u8; 6];
+                    let prefix_len = entry
+                        .read(&mut prefix)
+                        .map_err(|e| format!("Failed to read {}: {}", file_name, e))?;
+                    let prefix_slice = &prefix[..prefix_len];
+                    let cursor = std::io::Cursor::new(prefix_slice.to_vec());
+                    let mut combined = cursor.chain(entry);
+
+                    match detect_compression(prefix_slice) {
+                        Compression::Gzip => {
+                            let mut decoder = GzDecoder::new(combined);
+                            std::io::copy(&mut decoder, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
+                        Compression::Xz => {
+                            let mut decoder = XzDecoder::new(combined);
+                            std::io::copy(&mut decoder, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
+                        _ => {
+                            std::io::copy(&mut combined, &mut file).map_err(|e| {
+                                format!("Failed to write {}: {}", output_path.display(), e)
+                            })?;
+                        }
+                    }
+                    found.insert(file_name, output_path);
+
+                    if found.len() == target_files.len() {
+                        break;
+                    }
+                }
+            }
+
+            Ok(found)
+        });
+
+    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
+
+    // Prioritize writer errors (see stream_blob_to_file for rationale).
+    let found = writer_result
+        .map_err(|e| format!("Writer task failed: {}", e))?
+        .map_err(|e| format!("Writer task error: {}", e))?;
+    forward_result
+        .map_err(|e| format!("Stream task failed: {}", e))?
+        .map_err(|e| format!("Stream task error: {}", e))?;
+
+    Ok(found)
+}
+
+/// Extract specific files from an OCI image and write them to output_dir
+pub async fn extract_files_from_oci_image_to_dir(
+    image: &str,
+    target_files: &std::collections::HashSet<String>,
+    options: &OciOptions,
+    output_dir: &Path,
+) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
+    let (client, manifest) = connect_and_resolve(image, options).await?;
+
+    // Get the layer to download
+    let layer = manifest.get_single_layer()?;
+    let layer_size = layer.size;
+
+    println!("Layer digest: {}", layer.digest);
+    println!(
+        "Layer size: {} bytes ({:.2} MB)",
+        layer_size,
+        layer_size as f64 / (1024.0 * 1024.0)
+    );
+
+    ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+
+    // Start blob download
+    println!("Starting download...");
+    let response = client.get_blob_stream(&layer.digest).await?;
+    let stream = response.bytes_stream();
+
+    let is_tar_layer = layer.media_type.contains("tar") || looks_like_tar_layer(layer);
+    let should_use_tar = is_tar_layer || target_files.len() > 1;
+
+    if should_use_tar {
+        if is_tar_layer {
+            println!("Processing as tar archive based on layer media type...");
+        } else {
+            println!("Processing as tar archive due to multiple target files...");
+        }
+        let file_map =
+            stream_blob_to_tar_files(stream, target_files.clone(), output_dir.to_path_buf())
+                .await?;
+        return Ok(file_map);
+    }
+
+    println!("Processing as direct file based on layer content...");
+    if target_files.len() != 1 {
+        return Err("Multiple target files specified but OCI layer contains a single direct file. Use separate layers for each file.".into());
+    }
+
+    let filename = target_files.iter().next().unwrap();
+    let basename = Path::new(filename)
+        .file_name()
+        .ok_or_else(|| format!("Invalid filename '{}'", filename))?;
+    let output_path = output_dir.join(basename);
+
+    stream_blob_to_file(stream, output_path.clone()).await?;
+
+    let mut map = HashMap::new();
+    map.insert(filename.clone(), output_path);
+    Ok(map)
+}
+
+/// Extract files based on layer annotations for automotive images and write to output_dir
+pub async fn extract_files_by_annotations_to_dir(
+    image: &str,
+    options: &OciOptions,
+    output_dir: &Path,
+) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
+    let (client, manifest) = connect_and_resolve(image, options).await?;
+
+    // Get layers and extract from each based on annotations
+    let layers = manifest.get_layers()?;
+    let mut partition_files = HashMap::new();
+
+    for layer in layers {
+        if let Some(ref annotations) = layer.annotations {
+            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
+                ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+                let sanitized_name = sanitize_partition_name(partition)
+                    .map_err(|e| format!("Invalid partition annotation '{}': {}", partition, e))?;
+                let title = annotations
+                    .get(OCI_TITLE_ANNOTATION)
+                    .map(|s| s.as_str())
+                    .unwrap_or("layer");
+                println!(
+                    "Extracting {} from layer {} for partition {}",
+                    title,
+                    &layer.digest[0..12],
+                    partition
+                );
+
+                // Download this specific layer
+                let response = client.get_blob_stream(&layer.digest).await?;
+                let stream = response.bytes_stream();
+
+                let output_path = output_dir.join(format!("{}.img", sanitized_name));
+                stream_blob_to_file(stream, output_path.clone()).await?;
+                partition_files.insert(sanitized_name, output_path);
+            }
+        }
+    }
+
+    println!(
+        "Extracted {} partitions by annotations",
+        partition_files.len()
+    );
+    Ok(partition_files)
+}
+
+fn parse_default_partitions(manifest: &Manifest) -> Result<Option<HashSet<String>>, String> {
+    let Manifest::Image(image) = manifest else {
+        return Ok(None);
+    };
+
+    let Some(ref annotations) = image.annotations else {
+        return Ok(None);
+    };
+
+    let Some(raw) = annotations.get(automotive_annotations::DEFAULT_PARTITIONS) else {
+        return Ok(None);
+    };
+
+    let mut partitions = HashSet::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let sanitized = sanitize_partition_name(trimmed)
+            .map_err(|e| format!("Invalid default partition '{}': {}", trimmed, e))?;
+        partitions.insert(sanitized);
+    }
+
+    if partitions.is_empty() {
+        return Err(format!(
+            "Default partition annotation '{}' is empty",
+            automotive_annotations::DEFAULT_PARTITIONS
+        ));
+    }
+
+    Ok(Some(partitions))
+}
+
+fn looks_like_tar_layer(layer: &super::manifest::Descriptor) -> bool {
+    if layer.media_type.contains("tar") {
+        return true;
+    }
+
+    let Some(ref annotations) = layer.annotations else {
+        return false;
+    };
+
+    let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) else {
+        return false;
+    };
+
+    let title = title.to_ascii_lowercase();
+    title.ends_with(".tar")
+        || title.ends_with(".tar.gz")
+        || title.ends_with(".tgz")
+        || title.ends_with(".tar.xz")
+        || title.ends_with(".tar.lz4")
+}
+
+/// Extract files based on layer annotations, applying optional overrides.
+///
+/// When overrides are provided, each entry maps a target partition to a layer
+/// title (org.opencontainers.image.title). Auto-detected partitions remain
+/// unless explicitly overridden. If the manifest provides default partitions,
+/// only those partitions are auto-extracted. Returns Ok(None) when no
+/// annotations exist and overrides were provided, allowing callers to fall back
+/// to pattern-based extraction.
+pub async fn extract_files_by_annotations_with_overrides_to_dir(
+    image: &str,
+    options: &OciOptions,
+    output_dir: &Path,
+    overrides: &[(String, String)],
+) -> Result<Option<HashMap<String, PathBuf>>, Box<dyn std::error::Error>> {
+    let (client, manifest) = connect_and_resolve(image, options).await?;
+
+    let default_partitions = parse_default_partitions(&manifest)
+        .map_err(|e| format!("Invalid default partitions annotation: {}", e))?;
+    if let Some(ref partitions) = default_partitions {
+        println!("Using default partitions from manifest: {:?}", partitions);
+    }
+
+    // Get layers and build lookup tables
+    let layers = manifest.get_layers()?;
+    let mut partition_files = HashMap::new();
+    let mut title_to_layer: HashMap<String, &super::manifest::Descriptor> = HashMap::new();
+    let mut title_to_path = HashMap::new();
+    let mut has_partition_annotations = false;
+    let mut available_partitions = HashSet::new();
+    let overridden_partitions: HashSet<String> = overrides
+        .iter()
+        .map(|(partition, _)| partition.clone())
+        .collect();
+    let allowed_partitions = default_partitions.as_ref();
+    let is_single_tar_layer = layers.len() == 1 && looks_like_tar_layer(&layers[0]);
+
+    for layer in layers {
+        if let Some(ref annotations) = layer.annotations {
+            if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
+                if let Some(existing) = title_to_layer.get(title) {
+                    eprintln!(
+                        "Warning: duplicate OCI title '{}': keeping layer {}, ignoring layer {}",
+                        title,
+                        &existing.digest[..12.min(existing.digest.len())],
+                        &layer.digest[..12.min(layer.digest.len())],
+                    );
+                } else {
+                    title_to_layer.insert(title.clone(), layer);
+                }
+            }
+
+            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
+                has_partition_annotations = true;
+                available_partitions.insert(partition.clone());
+                if overridden_partitions.contains(partition) {
+                    continue;
+                }
+                if let Some(allowed) = allowed_partitions {
+                    if !allowed.contains(partition) {
+                        continue;
+                    }
+                }
+                ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+                let sanitized_name = sanitize_partition_name(partition)
+                    .map_err(|e| format!("Invalid partition annotation '{}': {}", partition, e))?;
+                let title = annotations
+                    .get(OCI_TITLE_ANNOTATION)
+                    .map(|s| s.as_str())
+                    .unwrap_or("layer");
+                println!(
+                    "Extracting {} from layer {} for partition {}",
+                    title,
+                    &layer.digest[0..12],
+                    partition
+                );
+
+                // Download this specific layer
+                let response = client.get_blob_stream(&layer.digest).await?;
+                let stream = response.bytes_stream();
+
+                let output_path = output_dir.join(format!("{}.img", sanitized_name));
+                stream_blob_to_file(stream, output_path.clone()).await?;
+                partition_files.insert(sanitized_name, output_path.clone());
+                if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
+                    title_to_path.insert(title.clone(), output_path);
+                }
+            }
+        }
+    }
+
+    if !has_partition_annotations && title_to_layer.is_empty() {
+        if overrides.is_empty() {
+            return Err(
+                "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if !has_partition_annotations && !overrides.is_empty() && is_single_tar_layer {
+        let single_title = layers[0]
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(OCI_TITLE_ANNOTATION));
+        let override_titles: HashSet<&str> = overrides
+            .iter()
+            .map(|(_, filename)| filename.as_str())
+            .collect();
+
+        if single_title
+            .map(|title| !override_titles.contains(title.as_str()))
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
+    }
+
+    // Apply overrides by layer title
+    for (partition, filename) in overrides {
+        let sanitized_partition = sanitize_partition_name(partition)
+            .map_err(|e| format!("Invalid partition mapping '{}': {}", partition, e))?;
+
+        if let Some(path) = title_to_path.get(filename) {
+            partition_files.insert(sanitized_partition, path.clone());
+            continue;
+        }
+
+        let layer = match title_to_layer.get(filename) {
+            Some(layer) => *layer,
+            None => {
+                let available: Vec<&String> = title_to_layer.keys().collect();
+                return Err(format!(
+                    "Override file '{}' not found in OCI layer titles. Available files: {:?}",
+                    filename, available
+                )
+                .into());
+            }
+        };
+
+        ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
+        let output_path = output_dir.join(format!("{}.img", sanitized_partition));
+
+        let response = client.get_blob_stream(&layer.digest).await?;
+        let stream = response.bytes_stream();
+        stream_blob_to_file(stream, output_path.clone()).await?;
+
+        title_to_path.insert(filename.clone(), output_path.clone());
+        partition_files.insert(sanitized_partition, output_path);
+    }
+
+    if partition_files.is_empty() {
+        if let Some(allowed) = allowed_partitions {
+            return Err(format!(
+                "No partitions matched default partitions {:?}. Available partitions: {:?}",
+                allowed, available_partitions
+            )
+            .into());
+        }
+        return Err(
+            "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
+                .into(),
+        );
+    }
+
+    Ok(Some(partition_files))
+}
+
+fn ensure_supported_layer_compression(
+    compression: LayerCompression,
+    media_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match compression {
+        LayerCompression::None | LayerCompression::Gzip => Ok(()),
+        other => Err(format!(
+            "Unsupported OCI layer compression {:?} (media type: {}). Supported: uncompressed, gzip",
+            other, media_type
+        )
+        .into()),
+    }
+}
+
+fn sanitize_partition_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("partition name is empty".to_string());
+    }
+    if std::path::Path::new(name).is_absolute() {
+        return Err("partition name is an absolute path".to_string());
+    }
+    if name.contains("..") {
+        return Err("partition name contains '..'".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("partition name contains path separators".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("partition name contains invalid characters".to_string());
+    }
+    Ok(name.to_string())
 }
 
 /// Execute a sequence of write commands on the block writer
@@ -1019,10 +1618,7 @@ pub async fn flash_from_oci(
     println!("Layer media type: {}", layer.media_type);
     println!("Layer compression: {:?}", compression);
 
-    // Validate compression - we only support gzip for now
-    if compression == LayerCompression::Zstd {
-        return Err("Zstd-compressed layers are not yet supported".into());
-    }
+    ensure_supported_layer_compression(compression, &layer.media_type)?;
 
     // Start blob download
     println!("\nStarting download...");
@@ -1796,4 +2392,53 @@ fn extract_tar_archive_from_stream(
     };
 
     extract_tar_stream_impl(decompressed_reader, tar_tx, file_pattern, debug)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_partition_name;
+
+    #[test]
+    fn sanitize_partition_name_accepts_valid() {
+        let valid = ["boot_a", "system-a", "slot_1", "boot_a.1", "A1-b_c.2"];
+        for name in valid {
+            assert_eq!(sanitize_partition_name(name).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn sanitize_partition_name_rejects_empty() {
+        let err = sanitize_partition_name("").unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn sanitize_partition_name_rejects_path_separators() {
+        for name in ["boot/a", "boot\\a"] {
+            let err = sanitize_partition_name(name).unwrap_err();
+            assert!(err.contains("path separators"));
+        }
+    }
+
+    #[test]
+    fn sanitize_partition_name_rejects_parent_traversal() {
+        for name in ["..", "../boot", "boot/..", "boot.."] {
+            let err = sanitize_partition_name(name).unwrap_err();
+            assert!(err.contains(".."));
+        }
+    }
+
+    #[test]
+    fn sanitize_partition_name_rejects_absolute_path() {
+        let err = sanitize_partition_name("/tmp/boot").unwrap_err();
+        assert!(err.contains("absolute path"));
+    }
+
+    #[test]
+    fn sanitize_partition_name_rejects_invalid_chars() {
+        for name in ["boot:1", "boot a", "boot@a"] {
+            let err = sanitize_partition_name(name).unwrap_err();
+            assert!(err.contains("invalid characters"));
+        }
+    }
 }

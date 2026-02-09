@@ -4,6 +4,22 @@ use std::path::PathBuf;
 // Use the library module
 use fls::fls;
 
+/// Parse target argument in the format "partition:filename"
+fn parse_target_mapping(s: &str) -> Result<(String, String), String> {
+    match s.split_once(':') {
+        Some((partition, filename)) => {
+            if partition.is_empty() {
+                Err("Partition name cannot be empty".to_string())
+            } else if filename.is_empty() {
+                Err("Filename cannot be empty".to_string())
+            } else {
+                Ok((partition.to_string(), filename.to_string()))
+            }
+        }
+        None => Err("Format should be 'partition:filename' (e.g., 'boot_a:aboot.img')".to_string()),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "fls")]
 #[command(about = "A small Rust utility for flashing devices")]
@@ -57,7 +73,7 @@ enum Commands {
         #[arg(long)]
         show_memory: bool,
         /// Registry username for OCI authentication
-        #[arg(short = 'u', long)]
+        #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
         /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
         #[arg(short = 'p', long, env = "FLS_REGISTRY_PASSWORD")]
@@ -65,6 +81,35 @@ enum Commands {
         /// Glob pattern to match disk image file inside OCI layer tar (e.g., "*.img.xz")
         #[arg(long)]
         file_pattern: Option<String>,
+    },
+    /// Flash an OCI image to fastboot partitions via USB
+    Fastboot {
+        /// OCI image reference to download and flash (must be prefixed with "oci://")
+        image_ref: String,
+        /// Device serial number (optional, will use first device if not specified)
+        #[arg(short = 's', long)]
+        serial: Option<String>,
+        /// Target partition and file override (e.g., "boot_a:boot_a.simg"), can be used multiple times
+        #[arg(short = 't', long = "target", value_parser = parse_target_mapping)]
+        targets: Vec<(String, String)>,
+        /// Fastboot operation timeout in seconds (default: 1200)
+        #[arg(long, default_value = "1200")]
+        timeout: u32,
+        /// Path to CA certificate PEM file for TLS validation
+        #[arg(long)]
+        cacert: Option<PathBuf>,
+        /// Ignore SSL certificate verification
+        #[arg(short = 'k', long = "insecure-tls")]
+        insecure_tls: bool,
+        /// Enable debug output
+        #[arg(long)]
+        debug: bool,
+        /// Registry username for OCI authentication
+        #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
+        username: Option<String>,
+        /// Registry password for OCI authentication (or use FLS_REGISTRY_PASSWORD env)
+        #[arg(short = 'p', long, env = "FLS_REGISTRY_PASSWORD")]
+        password: Option<String>,
     },
 }
 
@@ -109,9 +154,13 @@ async fn main() {
                 println!("  Image: {}", image_ref);
                 println!("  Device: {}", device);
                 match (&username, &password) {
+                    (Some(_), None) | (None, Some(_)) => {
+                        eprintln!(
+                            "Error: OCI authentication requires both --username and --password"
+                        );
+                        std::process::exit(1);
+                    }
                     (Some(_), Some(_)) => println!("  Auth: Using provided credentials"),
-                    (Some(_), None) => println!("  Auth: Username provided but password missing"),
-                    (None, Some(_)) => println!("  Auth: Password provided but username missing"),
                     (None, None) => println!("  Auth: Anonymous"),
                 }
                 if let Some(ref pattern) = file_pattern {
@@ -230,6 +279,81 @@ async fn main() {
                         println!("Result: FLASH_FAILED");
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+        Commands::Fastboot {
+            image_ref,
+            serial,
+            targets,
+            timeout,
+            cacert,
+            insecure_tls,
+            debug,
+            username,
+            password,
+        } => {
+            let image_ref_input = image_ref;
+            let image_ref = match image_ref_input.strip_prefix("oci://") {
+                Some(reference) => reference,
+                None => {
+                    eprintln!(
+                        "Error: fastboot expects an OCI image reference prefixed with 'oci://'"
+                    );
+                    eprintln!("  Example: fls fastboot oci://quay.io/org/image:latest");
+                    std::process::exit(1);
+                }
+            };
+
+            println!("Fastboot flash command:");
+            println!("  Image: {}", image_ref_input);
+            if let Some(ref serial) = serial {
+                println!("  Device serial: {}", serial);
+            }
+            if !targets.is_empty() {
+                println!("  Target partitions:");
+                for (partition, filename) in &targets {
+                    println!("    {} → {}", partition, filename);
+                }
+            }
+            if let Some(ref cert_path) = cacert {
+                println!("  CA Certificate: {}", cert_path.display());
+            }
+            println!("  Ignore certificates: {}", insecure_tls);
+            println!("  Timeout: {} seconds", timeout);
+            println!("  Debug: {}", debug);
+            match (&username, &password) {
+                (Some(_), None) | (None, Some(_)) => {
+                    eprintln!("Error: OCI authentication requires both --username and --password");
+                    std::process::exit(1);
+                }
+                (Some(_), Some(_)) => println!("  Auth: Using provided credentials"),
+                (None, None) => println!("  Auth: Anonymous"),
+            }
+            println!();
+
+            let options = fls::FastbootOptions {
+                http: fls::HttpClientOptions {
+                    insecure_tls,
+                    cacert,
+                    debug,
+                },
+                device_serial: serial,
+                partition_mappings: targets,
+                timeout_secs: timeout,
+                username,
+                password,
+            };
+
+            match fls::flash_from_fastboot(image_ref, options).await {
+                Ok(_) => {
+                    println!("Result: FLASH_COMPLETED");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    println!("Result: FLASH_FAILED");
+                    std::process::exit(1);
                 }
             }
         }
