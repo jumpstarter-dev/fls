@@ -14,6 +14,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use xz2::read::XzDecoder;
 
+use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBoundedSender};
+
 use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
 use super::registry::RegistryClient;
@@ -35,7 +37,7 @@ const OCI_TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
 /// Parameters for download coordination functions
 struct DownloadCoordinationParams {
-    http_tx: mpsc::Sender<bytes::Bytes>,
+    http_tx: ByteBoundedSender<bytes::Bytes>,
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
     written_progress_rx: mpsc::UnboundedReceiver<u64>,
     decompressor_written_progress_rx: mpsc::UnboundedReceiver<u64>,
@@ -50,7 +52,7 @@ struct DownloadContext {
 
 /// Parameters for raw disk download coordination
 struct RawDiskDownloadParams {
-    http_tx: mpsc::Sender<bytes::Bytes>,
+    http_tx: ByteBoundedSender<bytes::Bytes>,
     writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
     external_decompressor: Option<tokio::process::Child>,
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
@@ -73,8 +75,8 @@ struct ExternalDecompressorPipeline {
 
 /// Components returned by pipeline setup
 struct TarPipelineComponents {
-    http_tx: mpsc::Sender<bytes::Bytes>,
-    http_rx: mpsc::Receiver<bytes::Bytes>,
+    http_tx: ByteBoundedSender<bytes::Bytes>,
+    http_rx: ByteBoundedReceiver<bytes::Bytes>,
     tar_tx: mpsc::Sender<Vec<u8>>,
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
     written_progress_rx: mpsc::UnboundedReceiver<u64>,
@@ -880,12 +882,14 @@ async fn setup_tar_processing_pipeline(
     buffer_size_mb: usize,
     buffer_capacity: usize,
 ) -> Result<TarPipelineComponents, Box<dyn std::error::Error>> {
+    let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
     println!(
-        "Using download buffer: {} MB (capacity: {} chunks)",
-        buffer_size_mb, buffer_capacity
+        "Using download buffer: {} MB (byte-bounded)",
+        buffer_size_mb
     );
 
-    let (http_tx, http_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    let (http_tx, http_rx) =
+        byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, buffer_capacity);
 
     // Channel for tar entry data -> decompressor stdin
     let (tar_tx, mut tar_rx) = mpsc::channel::<Vec<u8>>(16); // 16 * 8MB = 128MB buffer
@@ -1213,7 +1217,7 @@ async fn coordinate_download_and_processing(
 
 /// Setup external decompressor pipeline for XZ compression
 async fn setup_external_decompressor_pipeline(
-    http_rx: mpsc::Receiver<bytes::Bytes>,
+    http_rx: ByteBoundedReceiver<bytes::Bytes>,
     block_writer: AsyncBlockWriter,
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
     debug: bool,
@@ -1262,7 +1266,7 @@ async fn setup_external_decompressor_pipeline(
     let stdin_writer_handle = {
         tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
-            let reader = ChannelReader::new(http_rx);
+            let reader = ChannelReader::new_byte_bounded(http_rx);
             let mut reader = reader;
             let mut stdin = stdin_fd;
             let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
@@ -1338,7 +1342,7 @@ async fn setup_external_decompressor_pipeline(
 
 /// Setup in-process decompression pipeline for Gzip or None compression
 async fn setup_inprocess_decompression_pipeline(
-    http_rx: mpsc::Receiver<bytes::Bytes>,
+    http_rx: ByteBoundedReceiver<bytes::Bytes>,
     block_writer: AsyncBlockWriter,
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
     compression_type: Compression,
@@ -1353,7 +1357,7 @@ async fn setup_inprocess_decompression_pipeline(
 
     // Spawn blocking task: read, decompress, send to async channel
     let reader_handle = tokio::task::spawn_blocking(move || {
-        let reader = ChannelReader::new(http_rx);
+        let reader = ChannelReader::new_byte_bounded(http_rx);
 
         // Apply in-process gzip decompression if needed
         let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
@@ -2283,11 +2287,13 @@ async fn flash_raw_disk_image_directly(
         options.common.write_buffer_size_mb,
     )?;
 
-    // Set up streaming pipeline using channels
+    // Set up byte-bounded streaming pipeline
     let buffer_size_mb = options.common.buffer_size_mb;
-    let buffer_capacity = ((buffer_size_mb * 1024) / 16).max(1000); // 16KB average chunk size
+    let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
+    let buffer_capacity = ((buffer_size_mb * 1024) / 16).max(1000); // item cap for mpsc
 
-    let (http_tx, http_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    let (http_tx, http_rx) =
+        byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, buffer_capacity);
     let (decompressed_progress_tx, decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // For gzip and none, we can decompress in-process and write directly to block writer
@@ -2341,14 +2347,14 @@ async fn flash_raw_disk_image_directly(
 
 /// Simple tar archive extraction without the complex buffering logic
 fn extract_tar_archive_from_stream(
-    http_rx: mpsc::Receiver<bytes::Bytes>,
+    http_rx: ByteBoundedReceiver<bytes::Bytes>,
     tar_tx: mpsc::Sender<Vec<u8>>,
     file_pattern: Option<&str>,
     compression: LayerCompression,
     compression_type: Compression,
     debug: bool,
 ) -> Result<(), String> {
-    let reader = ChannelReader::new(http_rx);
+    let reader = ChannelReader::new_byte_bounded(http_rx);
 
     // Handle layer compression before tar extraction
     // Use both manifest compression and content-detected compression
