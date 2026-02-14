@@ -5,6 +5,7 @@ use std::io::Write;
 use xz2::write::XzEncoder;
 
 /// Generate deterministic test data of a given size
+#[allow(dead_code)]
 pub fn create_test_data(size: usize) -> Vec<u8> {
     // Create a repeating pattern for easier debugging
     let pattern = b"TESTDATA";
@@ -28,6 +29,7 @@ pub fn compress_xz(data: &[u8]) -> Vec<u8> {
 }
 
 /// Compress data using gzip compression
+#[allow(dead_code)]
 pub fn compress_gz(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
