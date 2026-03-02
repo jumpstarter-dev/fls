@@ -1,6 +1,7 @@
 // Module declarations
 pub mod automotive;
 mod block_writer;
+pub mod byte_channel;
 pub(crate) mod compression;
 mod decompress;
 mod download_error;

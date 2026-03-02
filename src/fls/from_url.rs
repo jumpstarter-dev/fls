@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::byte_channel::byte_bounded_channel;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
@@ -349,21 +350,18 @@ pub async fn flash_from_url(
 
     use futures_util::StreamExt;
 
-    // Calculate buffer capacity (shared across all retry attempts)
+    // Create byte-bounded download buffer (shared across all retry attempts)
     let buffer_size_mb = options.common.buffer_size_mb;
-    // HTTP chunks from reqwest are typically 8-32 KB, not 64 KB
-    // To ensure we get the full buffer size, use a conservative estimate
-    let avg_chunk_size_kb = 16; // From common obvervation: 16kb
-    let buffer_capacity = (buffer_size_mb * 1024) / avg_chunk_size_kb;
-    let buffer_capacity = buffer_capacity.max(1000); // At least 1000 chunks
+    let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
 
     println!(
-        "Using download buffer: {} MB (capacity: {} chunks, ~{} KB per chunk)",
-        buffer_size_mb, buffer_capacity, avg_chunk_size_kb
+        "Using download buffer: {} MB (byte-bounded)",
+        buffer_size_mb
     );
 
-    // Create persistent bounded channel for download buffering (lives across retries)
-    let (buffer_tx, mut buffer_rx) = mpsc::channel::<bytes::Bytes>(buffer_capacity);
+    // Create persistent byte-bounded channel for download buffering (lives across retries)
+    // max_items=4096 prevents unbounded item queuing; byte budget is the real bound
+    let (buffer_tx, mut buffer_rx) = byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, 4096);
 
     // Channels for tracking bytes actually written to decompressor
     let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
