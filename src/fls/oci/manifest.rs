@@ -64,6 +64,10 @@ pub struct ImageManifest {
     #[serde(default)]
     pub media_type: Option<String>,
 
+    /// Artifact type (OCI v1.1) - indicates the primary content type
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+
     /// Config blob descriptor
     pub config: Descriptor,
 
@@ -135,14 +139,33 @@ impl Manifest {
         match self {
             Manifest::Image(ref m) => {
                 if m.layers.is_empty() {
-                    Err("Manifest has no layers".to_string())
-                } else if m.layers.len() > 1 {
-                    // For multi-layer images, we take the last layer
-                    // which typically contains the actual content
-                    Ok(m.layers.last().unwrap())
-                } else {
-                    Ok(&m.layers[0])
+                    return Err("Manifest has no layers".to_string());
                 }
+
+                if m.layers.len() == 1 {
+                    return Ok(&m.layers[0]);
+                }
+
+                // If artifactType is set, find the layer matching it
+                if let Some(ref artifact_type) = m.artifact_type {
+                    if let Some(layer) = m.layers.iter().find(|l| l.media_type == *artifact_type) {
+                        return Ok(layer);
+                    }
+                }
+
+                // Fall back to the first disk image layer
+                if let Some(layer) = m
+                    .layers
+                    .iter()
+                    .find(|l| l.media_type.starts_with("application/vnd.automotive.disk"))
+                {
+                    return Ok(layer);
+                }
+
+                Err(format!(
+                    "No disk image layer found among {} layers",
+                    m.layers.len()
+                ))
             }
             Manifest::Index(_) => Err(
                 "Cannot get layer from manifest index - need to resolve platform first".to_string(),
