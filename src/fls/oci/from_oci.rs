@@ -1811,6 +1811,19 @@ pub async fn flash_from_oci(
 
     // Get the layer to download
     let layer = manifest.get_single_layer()?;
+
+    // Validate that the selected layer is a flashable disk image
+    if !layer
+        .media_type
+        .starts_with("application/vnd.automotive.disk")
+    {
+        return Err(format!(
+            "Layer media type '{}' is not a flashable disk image",
+            layer.media_type
+        )
+        .into());
+    }
+
     let layer_size = layer.size;
     let compression = layer.compression();
 
