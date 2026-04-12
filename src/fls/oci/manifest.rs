@@ -134,7 +134,11 @@ impl Manifest {
     }
 
     /// Get the single layer from an image manifest
-    /// Returns error if there are no layers or multiple layers
+    ///
+    /// Returns:
+    /// - the only layer for single-layer manifests
+    /// - for multi-layer manifests: artifactType match first, otherwise first automotive disk layer
+    /// - error when no suitable layer is found
     pub fn get_single_layer(&self) -> Result<&Descriptor, String> {
         match self {
             Manifest::Image(ref m) => {
@@ -328,9 +332,40 @@ mod tests {
 
     #[test]
     fn test_artifact_type_selection() {
+        // Two flashable layers: artifactType must pick the qcow2 layer,
+        // NOT the raw layer which appears first (and would be chosen by the fallback).
         let json = r#"{
             "schemaVersion": 2,
-            "artifactType": "application/vnd.automotive.disk.raw",
+            "artifactType": "application/vnd.automotive.disk.qcow2",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.automotive.disk.raw",
+                    "digest": "sha256:disk_raw",
+                    "size": 1000
+                },
+                {
+                    "mediaType": "application/vnd.automotive.disk.qcow2",
+                    "digest": "sha256:disk_qcow2",
+                    "size": 9999
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let layer = manifest.get_single_layer().unwrap();
+        assert_eq!(layer.digest, "sha256:disk_qcow2");
+    }
+
+    #[test]
+    fn test_artifact_type_no_match_falls_back_to_disk_layer() {
+        // artifactType doesn't match any layer — should fall back to the first disk layer
+        let json = r#"{
+            "schemaVersion": 2,
+            "artifactType": "application/vnd.unknown.type",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",
                 "digest": "sha256:config123",
@@ -339,7 +374,7 @@ mod tests {
             "layers": [
                 {
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                    "digest": "sha256:layer1",
+                    "digest": "sha256:tar_layer",
                     "size": 1000
                 },
                 {
