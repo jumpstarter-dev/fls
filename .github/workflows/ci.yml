@@ -137,27 +137,10 @@ jobs:
         if: matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin' && matrix.target != 'aarch64-apple-darwin'
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Install UPX
-        run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            # Download and install UPX for Linux
-            curl -L https://github.com/upx/upx/releases/download/v4.2.1/upx-4.2.1-amd64_linux.tar.xz | tar xJ
-            sudo mv upx-4.2.1-amd64_linux/upx /usr/local/bin/
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            # Install UPX via Homebrew on macOS
-            brew install upx
-          fi
-        shell: bash
-
-      - name: Rename and compress binary
+      - name: Rename binary
         run: |
           if [ -f "target/${{ matrix.target }}/release/fls" ]; then
             cp "target/${{ matrix.target }}/release/fls" "${{ matrix.artifact_name }}"
-            echo "Original size:"
-            ls -lh "${{ matrix.artifact_name }}"
-            # Compress with UPX
-            upx --best --lzma "${{ matrix.artifact_name }}" || echo "UPX compression failed, using uncompressed binary"
-            echo "Compressed size:"
             ls -lh "${{ matrix.artifact_name }}"
           fi
         shell: bash

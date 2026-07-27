@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y \
     make \
     perl \
     file \
-    upx-ucl \
     && rm -rf /var/lib/apt/lists/*
 
 # Add ARM64 glibc target
@@ -50,12 +49,5 @@ COPY src src
 # Build the actual project (dependencies are already cached)
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
-# Compress the binary with UPX for smaller size
-# Using --best for maximum compression, --lzma for best algorithm
-# UPX compresses in-place, so the original binary will be compressed
-RUN cd target/aarch64-unknown-linux-gnu/release && \
-    upx --best --lzma fls || \
-    echo "UPX compression failed, using uncompressed binary"
-
-# The compressed binary will be in target/aarch64-unknown-linux-gnu/release/fls
+# The binary will be in target/aarch64-unknown-linux-gnu/release/fls
 

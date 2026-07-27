@@ -78,41 +78,12 @@ jobs:
         if: matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin' && matrix.target != 'aarch64-apple-darwin'
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Install UPX
-        run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            # Download and install UPX for Linux
-            curl -L https://github.com/upx/upx/releases/download/v4.2.1/upx-4.2.1-amd64_linux.tar.xz | tar xJ
-            sudo mv upx-4.2.1-amd64_linux/upx /usr/local/bin/
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            # Install UPX via Homebrew on macOS
-            brew install upx
-          fi
-          upx --version
-        shell: bash
-
-      - name: Prepare and compress binary
+      - name: Prepare binary
         run: |
           if [ -f "target/${{ matrix.target }}/release/fls" ]; then
             cp "target/${{ matrix.target }}/release/fls" "${{ matrix.artifact_name }}"
-            
-            echo "📦 Original binary size:"
             ls -lh "${{ matrix.artifact_name }}"
-            original_size=$(stat -f%z "${{ matrix.artifact_name }}" 2>/dev/null || stat -c%s "${{ matrix.artifact_name }}")
-            
-            # Compress with UPX
-            echo "🗜️  Compressing with UPX --best --lzma..."
-            if upx --best --lzma "${{ matrix.artifact_name }}"; then
-              echo "✅ Compression successful!"
-              ls -lh "${{ matrix.artifact_name }}"
-              compressed_size=$(stat -f%z "${{ matrix.artifact_name }}" 2>/dev/null || stat -c%s "${{ matrix.artifact_name }}")
-              ratio=$(awk "BEGIN {printf \"%.1f\", ($original_size - $compressed_size) * 100 / $original_size}")
-              echo "📉 Size reduction: ${ratio}%"
-            else
-              echo "⚠️  UPX compression failed, using uncompressed binary"
-            fi
-            
-            # Create checksum
+
             if command -v sha256sum &> /dev/null; then
               sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
             else
