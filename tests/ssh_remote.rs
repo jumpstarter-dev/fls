@@ -1,3 +1,5 @@
+mod common;
+
 use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -99,6 +101,10 @@ exec "$@"
         .mount(&server)
         .await;
 
+    // Local compressed source: same image, xz-compressed on disk.
+    let local_xz = dir.path().join("local.img.xz");
+    std::fs::write(&local_xz, common::compress_xz(&image)).unwrap();
+
     for auth in [
         "key",
         "env",
@@ -111,6 +117,7 @@ exec "$@"
         "strict-env",
         "strict-file",
         "strict-unknown-key",
+        "local-xz",
     ] {
         let device = dir.path().join(format!("block '{auth};device"));
         let file = std::fs::File::create(&device).unwrap();
@@ -122,11 +129,21 @@ exec "$@"
         .unwrap();
         let log = dir.path().join(format!("{auth}.log"));
         let upload = dir.path().join(format!("{auth}.uploaded"));
+        let source_arg = if auth == "local-xz" {
+            local_xz.display().to_string()
+        } else {
+            format!("{}/image.img.gz", server.uri())
+        };
+        let requests_before = if auth == "local-xz" {
+            server.received_requests().await.unwrap().len()
+        } else {
+            0
+        };
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"));
         command
             .args([
-                "from-url",
-                &format!("{}/image.img.gz", server.uri()),
+                "from",
+                &source_arg,
                 &format!("root@fake-host:{}", device.display()),
                 "--ssh-compress",
                 "--wh-bin",
@@ -223,6 +240,16 @@ exec "$@"
             std::fs::read(upload).unwrap(),
             std::fs::read(&native).unwrap()
         );
+        if auth == "local-xz" {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("Read:"), "{auth}: {stdout}");
+            assert!(!stdout.contains("Download:"), "{auth}: {stdout}");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                requests_before,
+                "{auth}: local source must not hit the mock server"
+            );
+        }
         let log = std::fs::read_to_string(log).unwrap();
         assert_eq!(log.matches("compression").count(), 3);
         assert_eq!(
