@@ -111,6 +111,11 @@ fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Comm
     if let Some(port) = options.ssh_port {
         command.arg("-p").arg(port.to_string());
     }
+    // Streaming stdin belongs to the protocol; terminal prompts would stall it.
+    command.args(["-o", "StrictHostKeyChecking=yes"]);
+    if command.get_program() == "ssh" {
+        command.args(["-o", "BatchMode=yes"]);
+    }
     command.args(["-T", "--", host, remote_command]);
     command
 }
@@ -124,9 +129,14 @@ fn detect_target(host: &str, options: &FlashOptions) -> io::Result<(String, Stri
         .stderr(Stdio::inherit())
         .output()?;
     if !output.status.success() {
+        let port = options
+            .ssh_port
+            .map(|port| format!(" -p {port}"))
+            .unwrap_or_default();
         return Err(io::Error::other(format!(
-            "Remote platform detection failed: {}",
-            output.status
+            "Remote platform detection failed: {}. Run `ssh{port} {}` to verify the host key and authentication, then retry",
+            output.status,
+            shell_quote(host)
         )));
     }
     let text = std::str::from_utf8(&output.stdout)
@@ -787,6 +797,8 @@ mod tests {
                 "-C",
                 "-p",
                 "11223",
+                "-o",
+                "StrictHostKeyChecking=yes",
                 "-T",
                 "--",
                 "board",

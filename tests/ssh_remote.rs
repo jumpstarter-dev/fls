@@ -28,6 +28,16 @@ if [ "$1" = -p ]; then
   echo port >> "$SSH_LOG"
   shift 2
 fi
+[ "$1" = -o ] && [ "$2" = StrictHostKeyChecking=yes ] || exit 49
+shift 2
+if [ "$1" = -o ]; then
+  [ "$2" = BatchMode=yes ] || exit 50
+  [ -z "$SSHPASS$FLS_SSH_PASS_FILE" ] || exit 51
+  echo batch >> "$SSH_LOG"
+  shift 2
+else
+  [ -n "$SSHPASS$FLS_SSH_PASS_FILE" ] || exit 52
+fi
 [ "$1" = -T ] || exit 40
 shift
 [ "$1" = -- ] || exit 41
@@ -38,6 +48,10 @@ case "$1" in
   *"uname -s"*)
     echo probe >> "$SSH_LOG"
     [ "$PROBE_FAIL" != 1 ] || exit 47
+    if [ "$HOST_KEY_UNKNOWN" = 1 ]; then
+      echo 'Host key verification failed.' >&2
+      exit 255
+    fi
     printf '%s\n' Linux x86_64 6.1.0 ;;
   PATH=*) cat > "$WH_UPLOAD" && chmod +x "$WH_UPLOAD" ;;
   /tmp/fls-wh\ *) command=${1#/tmp/fls-wh}; exec sh -c "\"$WH_UPLOAD\"$command" ;;
@@ -81,6 +95,7 @@ exec "$@"
         "config-port",
         "oversize",
         "probe-fail",
+        "unknown-key",
     ] {
         let device = dir.path().join(format!("block '{auth};device"));
         let file = std::fs::File::create(&device).unwrap();
@@ -117,6 +132,7 @@ exec "$@"
             .env_remove("FLS_SSH_PASS_FILE")
             .env_remove("FLS_WH_BIN")
             .env_remove("PROBE_FAIL")
+            .env_remove("HOST_KEY_UNKNOWN")
             .kill_on_drop(true);
         if auth != "config-port" {
             command.args(["--ssh-port", "11223"]);
@@ -136,17 +152,29 @@ exec "$@"
                     .env("PROBE_FAIL", "1")
                     .args(["--write-buffer-size", "8"]);
             }
+            "unknown-key" => {
+                command.env("HOST_KEY_UNKNOWN", "1");
+            }
             _ => {}
         }
         let output = tokio::time::timeout(Duration::from_secs(30), command.output())
             .await
             .unwrap()
             .unwrap();
-        if auth == "probe-fail" {
+        if matches!(auth, "probe-fail" | "unknown-key") {
             assert!(!output.status.success());
             assert!(!upload.exists(), "Platform detection must precede upload");
             assert!(String::from_utf8_lossy(&output.stderr)
                 .contains("Remote platform detection failed"));
+            if auth == "unknown-key" {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("Host key verification failed"));
+                assert!(stderr.contains("ssh -p 11223 'root@fake-host'"));
+                assert!(std::fs::read(&device)
+                    .unwrap()
+                    .iter()
+                    .all(|&byte| byte == 0));
+            }
             continue;
         }
         if auth == "oversize" {
@@ -173,6 +201,10 @@ exec "$@"
             if auth == "config-port" { 0 } else { 3 }
         );
         assert_eq!(log.matches("probe").count(), 1);
+        assert_eq!(
+            log.matches("batch").count(),
+            if matches!(auth, "file" | "env") { 0 } else { 3 }
+        );
         assert_eq!(
             log.matches("file").count(),
             if auth == "file" { 3 } else { 0 }
