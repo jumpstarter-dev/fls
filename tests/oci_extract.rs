@@ -147,6 +147,94 @@ fn default_options(cert_dir: &Path) -> OciOptions {
 }
 
 #[tokio::test]
+async fn oci_cli_reports_ssh_connection_failures_without_mixing_progress() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let blob_bytes = common::compress_gz(&common::create_test_data(4 * 1024 * 1024));
+    let blob_digest = "sha256:layer";
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:config",
+            "size": 2
+        },
+        "layers": [{
+            "mediaType": "application/vnd.automotive.disk.simg+gzip",
+            "digest": blob_digest,
+            "size": blob_bytes.len()
+        }]
+    });
+    let (address, server) = spawn_oci_server(
+        format!("/v2/{REPO}/manifests/{TAG}"),
+        format!("/v2/{REPO}/blobs/{blob_digest}"),
+        manifest.to_string().into_bytes(),
+        blob_bytes,
+    )
+    .await;
+    let dir = tempdir().unwrap();
+    let ssh = dir.path().join("ssh");
+    let device = dir.path().join("device");
+    fs::write(&device, [0; 1024]).unwrap();
+    for reason in ["No route to host", "Connection refused"] {
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nsleep 0.1\necho 'ssh: connect to host fake-host port 11223: {reason}' >&2\nexit 255\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"));
+        command
+            .args([
+                "from-url",
+                &format!("oci://{address}/{REPO}:{TAG}"),
+                &format!("root@fake-host:{}", device.display()),
+                "--ssh-port",
+                "11223",
+                "--progress-interval",
+                "0",
+                "--insecure-tls",
+                "--wh-bin",
+            ])
+            .arg(&ssh)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env_remove("SSHPASS")
+            .env_remove("FLS_SSH_PASS_FILE")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("Error: SSH to root@fake-host failed"),
+            "{stderr}"
+        );
+        assert_eq!(stderr.matches(reason).count(), 1, "{stderr}");
+        assert!(stderr.contains("port 11223"));
+        assert!(stdout.contains("\r\x1b[KDownload:"), "{stdout}");
+        assert_eq!(stdout.lines().last(), Some("Result: FLASH_FAILED"));
+        assert!(!stderr.contains("Streaming pipeline closed"));
+        assert!(!stdout.contains("Download complete"));
+        assert_eq!(fs::read(&device).unwrap(), [0; 1024]);
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn test_extract_files_from_oci_image_to_dir_tar_layer() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 

@@ -37,6 +37,58 @@ sudo cp target/release/fls /usr/local/bin/
 
 ## Usage
 
+### Remote devices over SSH
+
+Use `[user@]host:/absolute/device` as the destination for HTTP/HTTPS or OCI images:
+
+```bash
+fls from-url "https://example.com/image.img.xz" root@board:/dev/emmc0
+fls from-url "oci://quay.io/org/image:latest" root@board:/dev/emmc0
+```
+
+`fls` uploads its embedded aarch64-QNX write head over SSH, then streams framed
+commands. For another target architecture/OS, build the appropriate write head
+and use `--wh-bin /path/to/flswh`. When building from source, run
+`make remote-wh` before `cargo build` to embed the QNX binary; local-only builds
+work without it. See [remote/README.md](remote/README.md) for build instructions.
+
+SSH keys, agents, ports, and aliases use the system `ssh` and your
+`~/.ssh/config`. `--ssh-port <port>` overrides the port for platform detection,
+upload, and flashing; without it the SSH configuration is used. `-p` remains
+the registry-password option. Password authentication uses `sshpass` with
+`--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
+the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;
+`--wh-bin` can also be supplied through `FLS_WH_BIN`.
+By default, all SSH connections use `StrictHostKeyChecking=no`,
+`UserKnownHostsFile=/dev/null`, and `LogLevel=ERROR`: host keys are not verified
+or saved to your user known-hosts file. `--strict-ssh-host-key-checking` instead
+uses `StrictHostKeyChecking=yes` with your configured known-hosts files and log
+level. In strict mode, connect once with `ssh root@board` (or
+`ssh -p <port> root@board`) to verify the key before flashing; unknown or changed
+keys fail promptly. Key/agent authentication remains non-interactive unless
+`sshpass` is selected.
+
+Before uploading, `fls` queries the remote OS, CPU architecture, and release
+using `uname` (`-p` for the QNX processor, `-m` elsewhere). The embedded binary
+is selected only for aarch64 QNX 7. Other platforms require `--wh-bin` with a
+compatible write head; automatic Linux/macOS binary embedding can be added
+when those artifacts are available.
+
+Remote zero fills use ZERO rather than transferring their contents. Adjacent
+DATA writes are coalesced into frames of up to 8 MiB, flushing before SEEK,
+FILL, and final SYNC so sparse-image fragments do not each require an ACK.
+DATA, ZERO, and SEEK frames are pipelined in order while a separate reader
+consumes progress and ACKs. `--write-buffer-size` also limits unacknowledged
+DATA bytes (default: 128 MiB); smaller windows reduce the maximum frame size.
+Small-command metadata is bounded to 1024 outstanding requests. Closing drains
+the ACKs before SYNC/QUIT, and remote errors stop the pipeline.
+The writer checks write, fill, and seek ranges against remote device capacity, and waits
+for successful SYNC and QUIT before reporting completion. `--o-direct` applies
+to local devices; remote durability uses SYNC. One flash session per host is
+supported because uploads share `/tmp/fls-wh`.
+The reported Written count is the logical device position, including sparse
+skips, matching local flashing; DONE still validates only actual written bytes.
+
 ### Basic Example
 
 Flash a compressed image from a URL to a block device:
@@ -164,6 +216,7 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - `-k, --insecure-tls` - Ignore SSL certificate verification
 - `--cacert <CACERT>` - Path to CA certificate PEM file for TLS validation
 - `--buffer-size <SIZE>` - Buffer size in MB for download buffering (default: 1024)
+- `--write-buffer-size <SIZE>` - Write queue and remote unacknowledged DATA limit (default: 128 MiB)
 - `--max-retries <NUM>` - Maximum number of retry attempts (default: 10)
 - `--retry-delay <SECONDS>` - Delay in seconds between retry attempts (default: 2)
 - `--debug` - Enable debug output
@@ -180,5 +233,3 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - Ensure the target device is not mounted
 - Verify the device path to avoid data loss
 - Use `lsblk` or `fdisk -l` to identify the correct device before flashing
-
-
