@@ -1587,7 +1587,6 @@ async fn coordinate_raw_disk_download(
                         }
 
                         if params.http_tx.send(chunk).await.is_err() {
-                            eprintln!("\nStreaming pipeline closed");
                             break;
                         }
 

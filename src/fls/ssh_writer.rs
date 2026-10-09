@@ -137,15 +137,20 @@ fn detect_target(host: &str, options: &FlashOptions) -> io::Result<(String, Stri
         if [ \"$os\" = QNX ]; then uname -p; else uname -m; fi || exit; uname -r";
     let output = ssh_command(host, command, options)
         .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
         .output()?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = if stderr.trim().is_empty() {
+            "remote platform probe failed without diagnostic output"
+        } else {
+            stderr.trim()
+        };
         let port = options
             .ssh_port
             .map(|port| format!(" -p {port}"))
             .unwrap_or_default();
         return Err(io::Error::other(format!(
-            "Remote platform detection failed: {}. Run `ssh{port} {}` to verify the host key and authentication, then retry",
+            "SSH to {host} failed ({}): {reason}\nCheck the connection with `ssh{port} {}`",
             output.status,
             shell_quote(host)
         )));
