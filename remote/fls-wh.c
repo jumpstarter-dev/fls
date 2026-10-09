@@ -27,20 +27,21 @@
  * it to resync after any corruption.
  *
  * Requests:  DATA(0x01) SKIP(0x02) SEEK(0x03) SYNC(0x04) QUIT(0x05)
- *            READ(0x06) ZERO(0x09)           [implemented]
+ *            READ(0x06) ZERO(0x09) SIZE(0x0a) [implemented]
  *            AUTH(0x07) HELLO(0x08)          [reserved, spec only]
  * Responses: READY(0x81) OK(0x82) PROG(0x83) ERR(0x84) DONE(0x85)
- *            READ_DATA(0x86)                 [implemented]
+ *            READ_DATA(0x86) SIZE(0x89)      [implemented]
  *            AUTH_RESULT(0x87) HELLO(0x88)   [reserved]
  *
  * DATA payload:  size:u32 + content[size] + crc:u32 (CRC32-IEEE of content)
  * SKIP payload:  len:u64
  * SEEK payload:  offset:u64
- * SYNC/QUIT:     (no payload)
+ * SYNC/QUIT/SIZE: (no payload)
  * READ payload:  len:u64  (read len bytes from the current offset, advance it;
  *                len must be <= 1 MiB)
  *
  * READY payload: version:u8 + size:u64
+ * SIZE payload:  size:u64 (total bytes measured at open; cursor unchanged)
  * OK payload:    op:1 + offset:u64 + bytes:u64
  * PROG payload:  offset:u64 + bytes_done:u64   (every 1 MiB of a DATA)
  * ERR payload:   code:1 + op:1 + errno:u32 + offset:u64
@@ -58,8 +59,10 @@ enum {
     OP_DATA = 0x01, OP_SKIP = 0x02, OP_SEEK = 0x03, OP_SYNC = 0x04,
     OP_QUIT = 0x05,
     OP_READ = 0x06, OP_AUTH = 0x07, OP_HELLO = 0x08, OP_ZERO = 0x09,
+    OP_SIZE = 0x0a,
     R_READY = 0x81, R_ACK = 0x82, R_PROG = 0x83, R_ERR = 0x84, R_DONE = 0x85,
-    R_READ_DATA = 0x86, R_AUTH_RESULT = 0x87, R_HELLO = 0x88  /* reserved */
+    R_READ_DATA = 0x86, R_SIZE = 0x89,
+    R_AUTH_RESULT = 0x87, R_HELLO = 0x88  /* reserved */
 };
 enum { ERR_DEV = 0, ERR_CRC = 1, ERR_NI = 2 };  /* NI = not implemented */
 
@@ -263,6 +266,7 @@ int main(int argc, char **argv)
     if (fd < 0) { err_rec(ERR_DEV, 0, (unsigned)errno, 0); return 1; }
 
     long long sz = lseek(fd, 0, SEEK_END);
+    int size_errno = sz < 0 ? errno : 0;
     lseek(fd, 0, SEEK_SET);  /* the size query left the offset at the end */
     unsigned char rp[9];
     rp[0] = PROTO_VER; wr_u64(rp + 1, (unsigned long long)(sz < 0 ? 0 : sz));
@@ -282,6 +286,14 @@ int main(int argc, char **argv)
 
         if (op == OP_QUIT)
             break;
+
+        else if (op == OP_SIZE) {
+            if (plen != 0) { skip(plen); err_rec(ERR_NI, OP_SIZE, 0, cur); continue; }
+            if (sz < 0) { err_rec(ERR_DEV, OP_SIZE, (unsigned)size_errno, cur); continue; }
+            unsigned char p[8];
+            wr_u64(p, (unsigned long long)sz);
+            emit(R_SIZE, p, sizeof p);
+        }
 
         else if (op == OP_DATA) {
             if (plen < 8) { skip(plen); err_rec(ERR_NI, OP_DATA, 0, cur); continue; }

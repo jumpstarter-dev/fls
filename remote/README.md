@@ -28,15 +28,24 @@ scans for it to resync after any corruption.
 
 | | opcode | | opcode |
 |---|---|---|---|
-| **Requests** | `DATA 0x01` `SKIP 0x02` `SEEK 0x03` `SYNC 0x04` `QUIT 0x05` `READ 0x06` `ZERO 0x09` | **Responses** | `READY 0x81` `OK 0x82` `PROG 0x83` `ERR 0x84` `DONE 0x85` `READ_DATA 0x86` |
+| **Requests** | `DATA 0x01` `SKIP 0x02` `SEEK 0x03` `SYNC 0x04` `QUIT 0x05` `READ 0x06` `ZERO 0x09` `SIZE 0x0a` | **Responses** | `READY 0x81` `OK 0x82` `PROG 0x83` `ERR 0x84` `DONE 0x85` `READ_DATA 0x86` `SIZE 0x89` |
 | **Reserved** | `AUTH 0x07` `HELLO 0x08` | | `AUTH_RESULT 0x87` `HELLO 0x88` |
 
-The `READY` payload carries a protocol version byte (currently 1) for
-forward compatibility. `DATA` is `size:u32 + content + crc:u32` (CRC32-IEEE);
+The `READY` payload is `version:u8 + size:u64` (total device bytes, measured
+at open); the protocol version is currently 1. `DATA` is
+`size:u32 + content + crc:u32` (CRC32-IEEE);
 `READ` is `len:u64` (reads from the current offset, advances it, capped at
 1 MiB) and returns `READ_DATA` with the bytes. `ZERO` is `len:u64` — writes
 that many zeros from the current offset and advances it, sending only the 8
 length bytes over the wire (for filling regions without transferring bytes).
+
+`SIZE` has no request payload and returns `SIZE 0x89` with `size:u64` (the
+same total device bytes measured at open), without changing the cursor. If
+the size could not be determined, it returns `ERR` with the original errno;
+the startup `READY` uses zero for unknown size.
+Before writing an image, the client can use `READY` or `SIZE` to check
+`image_size <= device_size - write_offset` after checking that
+`write_offset <= device_size`. For sparse images, compare the expanded size.
 
 ## Build
 

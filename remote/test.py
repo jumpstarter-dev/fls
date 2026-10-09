@@ -18,6 +18,7 @@ import zlib
 MAGIC = b"FLSW"
 OP_DATA, OP_SKIP, OP_SEEK, OP_SYNC, OP_QUIT, OP_READ, OP_ZERO = 1, 2, 3, 4, 5, 6, 9
 R_READY, R_ACK, R_PROG, R_ERR, R_DONE, R_READ_DATA = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86
+OP_SIZE, R_SIZE = 0x0A, 0x89
 
 
 def frame(op, payload):
@@ -67,8 +68,7 @@ def main():
     with open(blk, "wb") as f:
         f.truncate(1 << 20)
 
-    # 3. build the command script: SEEK 0, DATA 16, SEEK 0, READ 16, SKIP 8,
-    #    ZERO 256, SYNC, QUIT
+    # SIZE between SKIP and ZERO must leave the logical and device offsets intact.
     content = bytes(range(16))
     crc = zlib.crc32(content) & 0xFFFFFFFF
     script = b""
@@ -78,7 +78,9 @@ def main():
     script += frame(OP_SEEK, struct.pack("<Q", 0))
     script += frame(OP_READ, struct.pack("<Q", len(content)))
     script += frame(OP_SKIP, struct.pack("<Q", 8))
+    script += frame(OP_SIZE, b"")
     script += frame(OP_ZERO, struct.pack("<Q", 256))
+    script += frame(OP_SIZE, b"")
     script += frame(OP_SYNC, b"")
     script += frame(OP_QUIT, b"")
 
@@ -111,6 +113,9 @@ def main():
     rd = [p for op, p in recs if op == R_READ_DATA]
     assert len(rd) == 1, f"expected one READ_DATA, got {len(rd)}"
     assert rd[0] == content, f"READ_DATA mismatch: {rd[0].hex()} != {content.hex()}"
+    assert [p for op, p in recs if op == R_SIZE] == [struct.pack("<Q", size)] * 2, recs
+    zero_acks = [struct.unpack("<BQQ", p) for op, p in recs if op == R_ACK and p[0] == OP_ZERO]
+    assert zero_acks == [(OP_ZERO, 24, 256)], zero_acks
 
     # 6. the file bytes were written at offset 0, and ZERO zeroed 256 bytes
     #    at offset 24 (after SKIP 8 from offset 16)
@@ -144,6 +149,7 @@ static ssize_t fault_read(int fd, void *buf, size_t n) {
     return read(fd, buf, n);
 }
 static off_t fault_seek(int fd, off_t off, int whence) {
+    if (whence == SEEK_END) { errno = EIO; return -1; }
     off_t result = lseek(fd, off, whence);
     if (result >= 0) errno = EINVAL;
     return result;
@@ -164,7 +170,7 @@ static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
 
     seek0 = frame(OP_SEEK, struct.pack("<Q", 0))
     prefix = b"abcd"
-    script = seek0 + data(bytes(range(16))) + data(prefix)
+    script = frame(OP_SIZE, b"") + seek0 + data(bytes(range(16))) + data(prefix)
     script += seek0 + frame(OP_READ, struct.pack("<Q", 16))
     script += frame(OP_READ, struct.pack("<Q", 4))
     script += seek0 + frame(OP_ZERO, struct.pack("<Q", 16)) + data(prefix)
@@ -175,13 +181,26 @@ static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
     recs = parse(r.stdout)
     errors = [struct.unpack("<BBIQ", p) for op, p in recs if op == R_ERR]
     assert errors == [(0, op, errno.EIO, off) for op, off in
-                      ((OP_DATA, 0), (OP_READ, 0), (OP_ZERO, 0), (OP_DATA, 0), (OP_SYNC, 4))], errors
+                      ((OP_SIZE, 0), (OP_DATA, 0), (OP_READ, 0), (OP_ZERO, 0), (OP_DATA, 0), (OP_SYNC, 4))], errors
     writes = [struct.unpack("<BQQ", p) for op, p in recs if op == R_ACK and p[0] == OP_DATA]
     assert writes == [(OP_DATA, 0, 4)] * 3, writes
     assert [p for op, p in recs if op == R_READ_DATA] == [prefix], recs
     assert recs[-1] == (R_DONE, struct.pack("<Q", 12)), recs[-1]
     with open(blk, "rb") as f:
         assert f.read(4) == prefix
+
+    # A malformed SIZE is drained; a valid empty device still reports size zero.
+    empty = os.path.join(tmpdir, "empty")
+    open(empty, "wb").close()
+    r = subprocess.run([binp, empty],
+                       input=frame(OP_SIZE, b"x") + frame(OP_SIZE, b"") + frame(OP_QUIT, b""),
+                       capture_output=True, timeout=10, check=True)
+    assert parse(r.stdout) == [
+        (R_READY, struct.pack("<BQ", 1, 0)),
+        (R_ERR, struct.pack("<BBIQ", 2, OP_SIZE, 0, 0)),
+        (R_SIZE, struct.pack("<Q", 0)),
+        (R_DONE, struct.pack("<Q", 0)),
+    ], r.stdout
 
     print("native test OK")
 
