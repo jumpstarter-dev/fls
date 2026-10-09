@@ -10,6 +10,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # runs first: builds the write-head binaries and leaves them as artifacts
+  # for later fls jobs (add `needs: write-head` + actions/download-artifact
+  # in a job that wants them)
+  write-head:
+    name: Write head (fls-wh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # build the QNX cross binary in the fedora container (remote/ has its
+      # own Containerfile with the cross toolchain)
+      - name: Build in fedora container (podman)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman
+          podman build -t fls-wh-builder remote/
+          podman run --rm -v "$GITHUB_WORKSPACE":/src -w /src fls-wh-builder \
+            make -C remote LD=aarch64-linux-gnu-ld STUB_LD=aarch64-linux-gnu-ld
+
+      # the QNX binary can't run on a linux runner, so verify the artifact:
+      # aarch64 ELF, QNX interpreter, correct SONAME and NEEDED entries
+      - name: Verify artifact
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+          file remote/flswh-aarch64-qnx7 | grep -q 'ARM aarch64'
+          file remote/flswh-aarch64-qnx7 | grep -q '/usr/lib/ldqnx-64.so.2'
+          aarch64-linux-gnu-readelf -d remote/flswh-aarch64-qnx7 | grep -q 'NEEDED.*libc.so.5'
+          aarch64-linux-gnu-readelf -d remote/stubs/libc.min.so_stub.so | grep -q 'SONAME.*libc.so.5'
+
+      # runtime test: build the same source natively and drive it with a
+      # framed command script against a temp file; assert records + bytes
+      - name: Native test
+        run: python3 remote/test.py
+
+      # build the native (runner) binary too, kept for later fls testing
+      - name: Build native
+        run: make -C remote native
+
+      - name: Upload flswh-aarch64-qnx7
+        uses: actions/upload-artifact@v4
+        with:
+          name: flswh-aarch64-qnx7
+          path: remote/flswh-aarch64-qnx7
+          if-no-files-found: error
+
+      - name: Upload flswh-x86_64-linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: flswh-x86_64-linux
+          path: remote/flswh-x86_64-linux
+          if-no-files-found: error
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -151,4 +204,6 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
           if-no-files-found: error
+
+
 
