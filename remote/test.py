@@ -6,6 +6,7 @@ assert the framed records + the file bytes.
 Runs on Linux and macOS: `SYNC` uses `fdatasync` where available and falls
 back to `fsync` on macOS (which has no `fdatasync`).
 """
+import errno
 import os
 import shutil
 import struct
@@ -119,6 +120,68 @@ def main():
         zeros = f.read(256)
     assert head == content, f"file bytes mismatch: {head.hex()} != {content.hex()}"
     assert zeros == b"\0" * 256, f"ZERO region not zeroed: {zeros[:16].hex()}..."
+
+    # Inject short I/O followed by EIO, zero-progress writes, and SYNC failure.
+    # Successful lseek deliberately changes errno to catch lost error codes.
+    fault_src = os.path.join(tmpdir, "faults.c")
+    fault_bin = os.path.join(tmpdir, "fls-wh-faults")
+    with open(fault_src, "w") as f:
+        f.write('''#include <unistd.h>
+#include <errno.h>
+static ssize_t fault_write(int fd, const void *buf, size_t n) {
+    if (fd > 2) {
+        if (n == 32) return 0;
+        if (n == 8) { errno = EIO; return -1; }
+        if (n == 16) n = 8;
+    }
+    return write(fd, buf, n);
+}
+static ssize_t fault_read(int fd, void *buf, size_t n) {
+    if (fd > 2) {
+        if (n == 8) { errno = EIO; return -1; }
+        if (n == 16) n = 8;
+    }
+    return read(fd, buf, n);
+}
+static off_t fault_seek(int fd, off_t off, int whence) {
+    off_t result = lseek(fd, off, whence);
+    if (result >= 0) errno = EINVAL;
+    return result;
+}
+static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
+#define write fault_write
+#define read fault_read
+#define lseek fault_seek
+#define fsync fault_sync
+#define fdatasync fault_sync
+#include "fls-wh.c"
+''')
+    subprocess.run([find_cc(), "-O2", "-I", here, fault_src, "-o", fault_bin], check=True)
+
+    def data(content):
+        return frame(OP_DATA, struct.pack("<I", len(content)) + content
+                     + struct.pack("<I", zlib.crc32(content)))
+
+    seek0 = frame(OP_SEEK, struct.pack("<Q", 0))
+    prefix = b"abcd"
+    script = seek0 + data(bytes(range(16))) + data(prefix)
+    script += seek0 + frame(OP_READ, struct.pack("<Q", 16))
+    script += frame(OP_READ, struct.pack("<Q", 4))
+    script += seek0 + frame(OP_ZERO, struct.pack("<Q", 16)) + data(prefix)
+    script += seek0 + data(bytes(32)) + data(prefix)
+    script += frame(OP_SYNC, b"") + frame(OP_QUIT, b"")
+    r = subprocess.run([fault_bin, blk], input=script,
+                       capture_output=True, timeout=10, check=True)
+    recs = parse(r.stdout)
+    errors = [struct.unpack("<BBIQ", p) for op, p in recs if op == R_ERR]
+    assert errors == [(0, op, errno.EIO, off) for op, off in
+                      ((OP_DATA, 0), (OP_READ, 0), (OP_ZERO, 0), (OP_DATA, 0), (OP_SYNC, 4))], errors
+    writes = [struct.unpack("<BQQ", p) for op, p in recs if op == R_ACK and p[0] == OP_DATA]
+    assert writes == [(OP_DATA, 0, 4)] * 3, writes
+    assert [p for op, p in recs if op == R_READ_DATA] == [prefix], recs
+    assert recs[-1] == (R_DONE, struct.pack("<Q", 12)), recs[-1]
+    with open(blk, "rb") as f:
+        assert f.read(4) == prefix
 
     print("native test OK")
 

@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   # runs first: builds the write-head binaries and leaves them as artifacts
   # for later fls jobs (add `needs: write-head` + actions/download-artifact
@@ -18,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # build the QNX cross binary in the fedora container (remote/ has its
       # own Containerfile with the cross toolchain)
