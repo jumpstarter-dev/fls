@@ -185,11 +185,13 @@ exec "$@"
         if matches!(auth, "probe-fail" | "strict-unknown-key") {
             assert!(!output.status.success());
             assert!(!upload.exists(), "Platform detection must precede upload");
-            assert!(String::from_utf8_lossy(&output.stderr)
-                .contains("Remote platform detection failed"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("SSH to root@fake-host failed")
+            );
             if auth == "strict-unknown-key" {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(stderr.contains("Host key verification failed"));
+                assert_eq!(stderr.matches("Host key verification failed").count(), 1);
                 assert!(stderr.contains("ssh -p 11223 'root@fake-host'"));
                 assert!(std::fs::read(&device)
                     .unwrap()
