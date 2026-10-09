@@ -15,7 +15,7 @@ import tempfile
 import zlib
 
 MAGIC = b"FLSW"
-OP_DATA, OP_SKIP, OP_SEEK, OP_SYNC, OP_QUIT, OP_READ = 1, 2, 3, 4, 5, 6
+OP_DATA, OP_SKIP, OP_SEEK, OP_SYNC, OP_QUIT, OP_READ, OP_ZERO = 1, 2, 3, 4, 5, 6, 9
 R_READY, R_ACK, R_PROG, R_ERR, R_DONE, R_READ_DATA = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86
 
 
@@ -67,7 +67,7 @@ def main():
         f.truncate(1 << 20)
 
     # 3. build the command script: SEEK 0, DATA 16, SEEK 0, READ 16, SKIP 8,
-    #    SYNC, QUIT
+    #    ZERO 256, SYNC, QUIT
     content = bytes(range(16))
     crc = zlib.crc32(content) & 0xFFFFFFFF
     script = b""
@@ -77,6 +77,7 @@ def main():
     script += frame(OP_SEEK, struct.pack("<Q", 0))
     script += frame(OP_READ, struct.pack("<Q", len(content)))
     script += frame(OP_SKIP, struct.pack("<Q", 8))
+    script += frame(OP_ZERO, struct.pack("<Q", 256))
     script += frame(OP_SYNC, b"")
     script += frame(OP_QUIT, b"")
 
@@ -99,10 +100,10 @@ def main():
     assert R_ERR not in ops, f"ERR record present: {recs}"
     assert ops[-1] == R_DONE, f"last record not DONE: {ops[-1]:#x}"
     (total,) = struct.unpack_from("<Q", recs[-1][1])
-    assert total == len(content), f"total {total} != {len(content)}"
+    assert total == len(content) + 256, f"total {total} != {len(content) + 256}"
 
     ok_ops = [struct.unpack_from("<B", p)[0] for op, p in recs if op == R_ACK]
-    for want in (OP_SEEK, OP_DATA, OP_SKIP, OP_SYNC):
+    for want in (OP_SEEK, OP_DATA, OP_SKIP, OP_SYNC, OP_ZERO):
         assert want in ok_ops, f"no OK for op {want:#x}: {ok_ops}"
 
     # 5b. the READ_DATA record carries exactly the bytes we wrote
@@ -110,10 +111,14 @@ def main():
     assert len(rd) == 1, f"expected one READ_DATA, got {len(rd)}"
     assert rd[0] == content, f"READ_DATA mismatch: {rd[0].hex()} != {content.hex()}"
 
-    # 6. the file bytes were written at offset 0
+    # 6. the file bytes were written at offset 0, and ZERO zeroed 256 bytes
+    #    at offset 24 (after SKIP 8 from offset 16)
     with open(blk, "rb") as f:
         head = f.read(16)
+        f.seek(24)
+        zeros = f.read(256)
     assert head == content, f"file bytes mismatch: {head.hex()} != {content.hex()}"
+    assert zeros == b"\0" * 256, f"ZERO region not zeroed: {zeros[:16].hex()}..."
 
     print("native test OK")
 
