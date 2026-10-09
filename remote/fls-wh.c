@@ -65,7 +65,10 @@ enum { ERR_DEV = 0, ERR_CRC = 1, ERR_NI = 2 };  /* NI = not implemented */
 
 static const unsigned char MAGIC[4] = { 0x46, 0x4c, 0x53, 0x57 }; /* "FLSW" */
 static const unsigned char PROTO_VER = 1;
-static const size_t PROG_STEP = 1u << 20;  /* emit PROG every 1 MiB */
+#ifndef WRITE_CHUNK_SIZE
+#define WRITE_CHUNK_SIZE (8u << 20)              /* 8 MiB disk write chunks (-DWRITE_CHUNK_SIZE=N to override) */
+#endif
+static const size_t PROG_STEP = WRITE_CHUNK_SIZE; /* emit PROG every chunk */
 #define MAX_READ (1u << 20)                /* cap a single READ at 1 MiB */
 static unsigned char dbuf[MAX_READ];       /* device read buffer */
 
@@ -101,6 +104,18 @@ static void crc_update(const unsigned char *b, size_t n)
 }
 static unsigned int crc_final(void) { return crc_state ^ 0xFFFFFFFFu; }
 
+/* write all, retrying on partial writes; -1 on error (errno set) */
+static int write_all(int fd, const unsigned char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 /* --- framed output (stdout) --- */
 static void emit(int op, const unsigned char *payload, size_t len)
 {
@@ -109,8 +124,8 @@ static void emit(int op, const unsigned char *payload, size_t len)
     hdr[2] = MAGIC[2]; hdr[3] = MAGIC[3];
     hdr[4] = (unsigned char)op;
     wr_u32(hdr + 5, (unsigned int)len);
-    (void)write(1, hdr, 9);
-    if (len) (void)write(1, payload, len);
+    (void)write_all(1, hdr, 9);
+    if (len) (void)write_all(1, payload, len);
 }
 static void ok_rec(int op, unsigned long long off, unsigned long long bytes)
 {
@@ -178,30 +193,18 @@ static int skip(unsigned long long n)
     return 1;
 }
 
-/* write all, retrying on partial writes; -1 on error (errno set) */
-static int write_all(int fd, const unsigned char *buf, size_t len)
-{
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
-        if (n < 0) return -1;
-        off += (size_t)n;
-    }
-    return 0;
-}
-
 /* read all, retrying on partial reads; -1 on error (errno set), else the bytes
  * read (which may be < len near end of device) */
-static int read_all(int fd, unsigned char *buf, size_t len)
+static ssize_t read_all(int fd, unsigned char *buf, size_t len)
 {
     size_t off = 0;
     while (off < len) {
         ssize_t n = read(fd, buf + off, len - off);
         if (n < 0) return -1;
-        if (n == 0) return (int)off;  /* EOF: partial read */
+        if (n == 0) return (ssize_t)off;  /* EOF: partial read */
         off += (size_t)n;
     }
-    return (int)len;
+    return (ssize_t)len;
 }
 
 int main(int argc, char **argv)
@@ -232,11 +235,12 @@ int main(int argc, char **argv)
             break;
 
         else if (op == OP_DATA) {
+            if (plen < 8) { skip(plen); err_rec(ERR_NI, OP_DATA, 0, cur); continue; }
             unsigned char szf[4];
             if (!rreadn(szf, 4)) break;
             unsigned int size = rd_u32(szf);
             if (plen != 8 + (unsigned long long)size) {  /* malformed frame */
-                if (plen >= 4) skip(plen - 4);
+                skip(plen - 4);
                 err_rec(ERR_NI, OP_DATA, 0, cur);
                 continue;
             }
@@ -244,7 +248,7 @@ int main(int argc, char **argv)
             crc_reset();
             unsigned long long done = 0, next_prog = PROG_STEP;
             int status = 0;  /* 0=ok, 1=eof, 2=write error */
-            unsigned char chunk[1 << 16];
+            static unsigned char chunk[WRITE_CHUNK_SIZE];
             while (done < size) {
                 size_t want = (size_t)(size - done);
                 if (want > sizeof chunk) want = sizeof chunk;
@@ -262,7 +266,10 @@ int main(int argc, char **argv)
             cur = start + done;
             total += done;
             if (status == 1) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
-            if (status == 2) { err_rec(ERR_DEV, OP_DATA, (unsigned)errno, start); }
+            if (status == 2) {
+                skip((unsigned long long)(size - done) + 4);  /* drain remaining content + CRC */
+                err_rec(ERR_DEV, OP_DATA, (unsigned)errno, start);
+            }
             else if (done < size) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
             else {
                 unsigned char crcf[4];
@@ -300,7 +307,7 @@ int main(int argc, char **argv)
             if (!rreadn(lf, 8)) break;
             unsigned long long len = rd_u64(lf);
             if (len > MAX_READ) { err_rec(ERR_DEV, OP_READ, 22, cur); continue; }  /* 22 = EINVAL */
-            int n = read_all(fd, dbuf, (size_t)len);
+            ssize_t n = read_all(fd, dbuf, (size_t)len);
             if (n < 0) { err_rec(ERR_DEV, OP_READ, (unsigned)errno, cur); continue; }
             emit(R_READ_DATA, dbuf, (size_t)n);  /* the bytes read (may be empty) */
             cur += (unsigned long long)n;

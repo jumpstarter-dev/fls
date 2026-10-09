@@ -11,6 +11,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 
 MAGIC = b"FLSW"
@@ -54,8 +55,9 @@ def find_cc():
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(here, "fls-wh.c")
-    binp = "/tmp/fls-wh-native"
-    blk = "/tmp/fls-wh-test-blk"
+    tmpdir = tempfile.mkdtemp(prefix="fls-wh-test-")
+    binp = os.path.join(tmpdir, "fls-wh-native")
+    blk = os.path.join(tmpdir, "blk")
 
     # 1. build with the system compiler (system headers, not include/)
     subprocess.run([find_cc(), "-O2", src, "-o", binp], check=True)
