@@ -59,6 +59,10 @@ the registry-password option. Password authentication uses `sshpass` with
 `--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
 the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;
 `--wh-bin` can also be supplied through `FLS_WH_BIN`.
+SSH connections require a known host key and use non-interactive key/agent
+authentication unless `sshpass` is selected. Connect once with `ssh root@board`
+(or `ssh -p <port> root@board`) to verify the host key before flashing; unknown
+or changed keys fail promptly instead of waiting behind the progress display.
 
 Before uploading, `fls` queries the remote OS, CPU architecture, and release
 using `uname` (`-p` for the QNX processor, `-m` elsewhere). The embedded binary
