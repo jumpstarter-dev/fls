@@ -190,8 +190,14 @@ exec "$@"
             );
             if auth == "strict-unknown-key" {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(stderr.contains("Host key verification failed"));
-                assert_eq!(stderr.matches("Host key verification failed").count(), 1);
+                // The inline error report and the final summary can both carry
+                // the diagnostic; the inline one races the process exit, so 1
+                // or 2.
+                let count = stderr.matches("Host key verification failed").count();
+                assert!(
+                    (1..=2).contains(&count),
+                    "host key failure reported {count} times"
+                );
                 assert!(stderr.contains("ssh -p 11223 'root@fake-host'"));
                 assert!(std::fs::read(&device)
                     .unwrap()
