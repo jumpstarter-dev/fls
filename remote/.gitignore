@@ -1,0 +1,3 @@
+*.o
+flswh-*
+stubs/*.so_stub.so*
