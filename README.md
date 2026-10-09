@@ -53,10 +53,18 @@ and use `--wh-bin /path/to/flswh`. When building from source, run
 work without it. See [remote/README.md](remote/README.md) for build instructions.
 
 SSH keys, agents, host keys, ports, and aliases use the system `ssh` and your
-`~/.ssh/config`. Password authentication uses `sshpass` with
+`~/.ssh/config`. `--ssh-port <port>` overrides the port for platform detection,
+upload, and flashing; without it the SSH configuration is used. `-p` remains
+the registry-password option. Password authentication uses `sshpass` with
 `--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
 the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;
 `--wh-bin` can also be supplied through `FLS_WH_BIN`.
+
+Before uploading, `fls` queries the remote OS, CPU architecture, and release
+using `uname` (`-p` for the QNX processor, `-m` elsewhere). The embedded binary
+is selected only for aarch64 QNX 7. Other platforms require `--wh-bin` with a
+compatible write head; automatic Linux/macOS binary embedding can be added
+when those artifacts are available.
 
 Remote zero fills use ZERO rather than transferring their contents. The writer
 checks write, fill, and seek ranges against remote device capacity, and waits
@@ -207,4 +215,3 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - Ensure the target device is not mounted
 - Verify the device path to avoid data loss
 - Use `lsblk` or `fdisk -l` to identify the correct device before flashing
-

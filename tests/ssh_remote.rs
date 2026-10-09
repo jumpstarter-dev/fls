@@ -23,6 +23,11 @@ async fn http_cli_uploads_and_flashes_with_all_ssh_auth_modes() {
         &ssh,
         r#"#!/bin/sh
 if [ "$1" = -C ]; then echo compression >> "$SSH_LOG"; shift; fi
+if [ "$1" = -p ]; then
+  [ "$2" = 11223 ] || exit 48
+  echo port >> "$SSH_LOG"
+  shift 2
+fi
 [ "$1" = -T ] || exit 40
 shift
 [ "$1" = -- ] || exit 41
@@ -30,6 +35,10 @@ shift
 [ "$1" = root@fake-host ] || exit 42
 shift
 case "$1" in
+  *"uname -s"*)
+    echo probe >> "$SSH_LOG"
+    [ "$PROBE_FAIL" != 1 ] || exit 47
+    printf '%s\n' Linux x86_64 6.1.0 ;;
   PATH=*) cat > "$WH_UPLOAD" && chmod +x "$WH_UPLOAD" ;;
   /tmp/fls-wh\ *) command=${1#/tmp/fls-wh}; exec sh -c "\"$WH_UPLOAD\"$command" ;;
   *) exit 43 ;;
@@ -65,7 +74,14 @@ exec "$@"
         .mount(&server)
         .await;
 
-    for auth in ["key", "env", "file", "oversize"] {
+    for auth in [
+        "key",
+        "env",
+        "file",
+        "config-port",
+        "oversize",
+        "probe-fail",
+    ] {
         let device = dir.path().join(format!("block '{auth};device"));
         let file = std::fs::File::create(&device).unwrap();
         file.set_len(if auth == "oversize" {
@@ -100,7 +116,11 @@ exec "$@"
             .env_remove("SSHPASS")
             .env_remove("FLS_SSH_PASS_FILE")
             .env_remove("FLS_WH_BIN")
+            .env_remove("PROBE_FAIL")
             .kill_on_drop(true);
+        if auth != "config-port" {
+            command.args(["--ssh-port", "11223"]);
+        }
         match auth {
             "env" => {
                 command.env("SSHPASS", "test-password");
@@ -111,12 +131,24 @@ exec "$@"
                     .env("SSHPASS", "ignored-password")
                     .env("FLS_SSH_PASS_FILE", &password);
             }
+            "probe-fail" => {
+                command
+                    .env("PROBE_FAIL", "1")
+                    .args(["--write-buffer-size", "8"]);
+            }
             _ => {}
         }
         let output = tokio::time::timeout(Duration::from_secs(30), command.output())
             .await
             .unwrap()
             .unwrap();
+        if auth == "probe-fail" {
+            assert!(!output.status.success());
+            assert!(!upload.exists(), "Platform detection must precede upload");
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("Remote platform detection failed"));
+            continue;
+        }
         if auth == "oversize" {
             assert!(!output.status.success());
             assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds remote device size"));
@@ -135,14 +167,19 @@ exec "$@"
             std::fs::read(&native).unwrap()
         );
         let log = std::fs::read_to_string(log).unwrap();
-        assert_eq!(log.matches("compression").count(), 2);
+        assert_eq!(log.matches("compression").count(), 3);
+        assert_eq!(
+            log.matches("port").count(),
+            if auth == "config-port" { 0 } else { 3 }
+        );
+        assert_eq!(log.matches("probe").count(), 1);
         assert_eq!(
             log.matches("file").count(),
-            if auth == "file" { 2 } else { 0 }
+            if auth == "file" { 3 } else { 0 }
         );
         assert_eq!(
             log.matches("env").count(),
-            if auth == "env" { 2 } else { 0 }
+            if auth == "env" { 3 } else { 0 }
         );
     }
 }

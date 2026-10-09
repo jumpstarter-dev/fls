@@ -81,6 +81,9 @@ enum Commands {
         /// Enable SSH compression
         #[arg(long)]
         ssh_compress: bool,
+        /// SSH port (defaults to SSH configuration)
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        ssh_port: Option<u16>,
         /// Write-head binary to upload (default: embedded aarch64-qnx7)
         #[arg(long, env = "FLS_WH_BIN")]
         wh_bin: Option<String>,
@@ -151,6 +154,7 @@ async fn main() {
             xz_memlimit,
             ssh_password_file,
             ssh_compress,
+            ssh_port,
             wh_bin,
         } => {
             // Detect URL scheme to determine handler
@@ -207,6 +211,7 @@ async fn main() {
                         xz_memlimit_mb: xz_memlimit,
                         ssh_password_file,
                         ssh_compress,
+                        ssh_port,
                         wh_bin,
                     },
                     username,
@@ -289,6 +294,7 @@ async fn main() {
                         xz_memlimit_mb: xz_memlimit,
                         ssh_password_file,
                         ssh_compress,
+                        ssh_port,
                         wh_bin,
                     },
                     max_retries,

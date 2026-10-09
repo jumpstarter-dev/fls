@@ -1,5 +1,6 @@
 use std::io::{self, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::block_writer::WriterCommand;
@@ -107,8 +108,49 @@ fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Comm
     if options.ssh_compress {
         command.arg("-C");
     }
+    if let Some(port) = options.ssh_port {
+        command.arg("-p").arg(port.to_string());
+    }
     command.args(["-T", "--", host, remote_command]);
     command
+}
+
+fn detect_target(host: &str, options: &FlashOptions) -> io::Result<(String, String, String)> {
+    let command = "PATH=/proc/boot:/usr/bin:/bin:$PATH; \
+        os=$(uname -s) || exit; echo \"$os\"; \
+        if [ \"$os\" = QNX ]; then uname -p; else uname -m; fi || exit; uname -r";
+    let output = ssh_command(host, command, options)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Remote platform detection failed: {}",
+            output.status
+        )));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| invalid("Remote platform response is not UTF-8"))?;
+    let fields: Vec<_> = text.lines().map(str::trim).collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return Err(invalid(
+            "Expected remote OS, processor architecture, and release",
+        ));
+    }
+    Ok((fields[0].into(), fields[1].into(), fields[2].into()))
+}
+
+fn check_embedded_target(os: &str, arch: &str, release: &str) -> io::Result<()> {
+    if os == "QNX"
+        && matches!(arch, "aarch64le" | "aarch64" | "arm64")
+        && release.split('.').next() == Some("7")
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("Embedded write head requires aarch64 QNX 7; remote is {os} {arch} {release}. Pass --wh-bin built for this target"),
+    ))
 }
 
 fn upload_wh(host: &str, binary: &[u8], options: &FlashOptions) -> io::Result<()> {
@@ -329,6 +371,7 @@ impl Drop for Session {
 pub(crate) struct SshBlockWriter {
     writer_tx: mpsc::Sender<WriterCommand>,
     writer_handle: tokio::task::JoinHandle<io::Result<u64>>,
+    writer_error: Arc<Mutex<Option<io::Error>>>,
 }
 
 impl SshBlockWriter {
@@ -350,6 +393,12 @@ impl SshBlockWriter {
                 "Expected [user@]host:/absolute/device",
             ));
         }
+        if options.ssh_port == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH port must be between 1 and 65535",
+            ));
+        }
         let binary = match &options.wh_bin {
             Some(path) => std::fs::read(path)?,
             None => EMBEDDED_WH.to_vec(),
@@ -362,30 +411,47 @@ impl SshBlockWriter {
         }
         let options = options.clone();
         let (writer_tx, mut writer_rx) = mpsc::channel((options.write_buffer_size_mb / 8).max(1));
+        let writer_error = Arc::new(Mutex::new(None));
+        let error_state = Arc::clone(&writer_error);
         let writer_handle = tokio::task::spawn_blocking(move || {
-            upload_wh(&host, &binary, &options)?;
-            let remote_command = format!("{REMOTE_WH} {}", shell_quote(&device));
-            let child = ssh_command(&host, &remote_command, &options)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()?;
-            let mut session = Session::new(child, progress)?;
-            if options.debug {
-                eprintln!("[DEBUG] Remote device size: {} bytes", session.size);
-            }
-            while let Some(command) = writer_rx.blocking_recv() {
-                match command {
-                    WriterCommand::Write(data) => session.write(&data)?,
-                    WriterCommand::Seek(offset) => session.seek(offset)?,
-                    WriterCommand::Fill { pattern, bytes } => session.fill(pattern, bytes)?,
+            let result = (|| {
+                let (os, arch, release) = detect_target(&host, &options)?;
+                if options.wh_bin.is_none() {
+                    check_embedded_target(&os, &arch, &release)?;
                 }
+                if options.debug {
+                    eprintln!("[DEBUG] Remote platform: {os} {arch} {release}");
+                }
+                upload_wh(&host, &binary, &options)?;
+                let remote_command = format!("{REMOTE_WH} {}", shell_quote(&device));
+                let child = ssh_command(&host, &remote_command, &options)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()?;
+                let mut session = Session::new(child, progress)?;
+                if options.debug {
+                    eprintln!("[DEBUG] Remote device size: {} bytes", session.size);
+                }
+                while let Some(command) = writer_rx.blocking_recv() {
+                    match command {
+                        WriterCommand::Write(data) => session.write(&data)?,
+                        WriterCommand::Seek(offset) => session.seek(offset)?,
+                        WriterCommand::Fill { pattern, bytes } => session.fill(pattern, bytes)?,
+                    }
+                }
+                session.finish()
+            })();
+            if let Err(ref error) = result {
+                *error_state.lock().unwrap() =
+                    Some(io::Error::new(error.kind(), error.to_string()));
             }
-            session.finish()
+            result
         });
         Ok(Self {
             writer_tx,
             writer_handle,
+            writer_error,
         })
     }
 
@@ -402,10 +468,12 @@ impl SshBlockWriter {
     }
 
     async fn send(&self, command: WriterCommand) -> io::Result<()> {
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "SSH writer channel closed"))
+        self.writer_tx.send(command).await.map_err(|_| {
+            match self.writer_error.lock().unwrap().as_ref() {
+                Some(error) => io::Error::new(error.kind(), error.to_string()),
+                None => io::Error::new(io::ErrorKind::BrokenPipe, "SSH writer channel closed"),
+            }
+        })
     }
 
     pub(crate) async fn close(self) -> io::Result<u64> {
@@ -491,6 +559,7 @@ mod tests {
         let options = FlashOptions {
             ssh_password_file: Some("password file".into()),
             ssh_compress: true,
+            ssh_port: Some(11223),
             ..Default::default()
         };
         let command = ssh_command("board", "echo ready", &options);
@@ -506,6 +575,8 @@ mod tests {
                 "password file",
                 "ssh",
                 "-C",
+                "-p",
+                "11223",
                 "-T",
                 "--",
                 "board",
@@ -519,6 +590,18 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, path.as_bytes());
+        assert!(check_embedded_target("QNX", "aarch64le", "7.1.0").is_ok());
+        for (os, arch, release) in [
+            ("Linux", "aarch64", "6.1.0"),
+            ("Darwin", "arm64", "25.0.0"),
+            ("QNX", "x86_64", "7.1.0"),
+            ("QNX", "aarch64le", "8.0.0"),
+        ] {
+            assert_eq!(
+                check_embedded_target(os, arch, release).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
     }
 
     #[test]
