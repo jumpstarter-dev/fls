@@ -511,9 +511,7 @@ impl Session {
         } else {
             // ponytail: nonzero fills travel as DATA; add FILL if bandwidth matters.
             let mut buffer = vec![0; CHUNK_SIZE];
-            for chunk in buffer.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&pattern);
-            }
+            buffer.as_chunks_mut::<4>().0.fill(pattern);
             let mut remaining = bytes;
             while remaining > 0 {
                 let n = remaining.min(CHUNK_SIZE as u64) as usize;
