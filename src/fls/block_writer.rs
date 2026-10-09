@@ -5,6 +5,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::ptr::NonNull;
 use tokio::sync::mpsc;
 
+use super::options::FlashOptions;
+use super::ssh_writer::{parse_ssh_target, SshBlockWriter};
+
 const BLOCK_SIZE: usize = 1024 * 1024; // 1MB blocks for better throughput
 const ALIGNMENT: usize = 4096; // 4KB alignment for direct I/O
 
@@ -590,6 +593,60 @@ impl AsyncBlockWriter {
     pub(crate) async fn close(self) -> io::Result<u64> {
         drop(self.writer_tx);
         self.writer_handle.await.map_err(io::Error::other)?
+    }
+}
+
+pub(crate) enum DeviceWriter {
+    Local(AsyncBlockWriter),
+    Ssh(SshBlockWriter),
+}
+
+impl DeviceWriter {
+    pub(crate) fn new(
+        options: &FlashOptions,
+        progress: mpsc::UnboundedSender<u64>,
+    ) -> io::Result<Self> {
+        if let Some((host, device)) = parse_ssh_target(&options.device) {
+            Ok(Self::Ssh(SshBlockWriter::new(
+                host, device, progress, options,
+            )?))
+        } else {
+            Ok(Self::Local(AsyncBlockWriter::new(
+                options.device.clone(),
+                progress,
+                options.debug,
+                options.o_direct,
+                options.write_buffer_size_mb,
+            )?))
+        }
+    }
+
+    pub(crate) async fn write(&self, data: Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Local(writer) => writer.write(data).await,
+            Self::Ssh(writer) => writer.write(data).await,
+        }
+    }
+
+    pub(crate) async fn seek(&self, offset: u64) -> io::Result<()> {
+        match self {
+            Self::Local(writer) => writer.seek(offset).await,
+            Self::Ssh(writer) => writer.seek(offset).await,
+        }
+    }
+
+    pub(crate) async fn fill(&self, pattern: [u8; 4], bytes: u64) -> io::Result<()> {
+        match self {
+            Self::Local(writer) => writer.fill(pattern, bytes).await,
+            Self::Ssh(writer) => writer.fill(pattern, bytes).await,
+        }
+    }
+
+    pub(crate) async fn close(self) -> io::Result<u64> {
+        match self {
+            Self::Local(writer) => writer.close().await,
+            Self::Ssh(writer) => writer.close().await,
+        }
     }
 }
 

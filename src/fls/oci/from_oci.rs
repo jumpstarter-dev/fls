@@ -24,7 +24,7 @@ use super::registry::RegistryClient;
 use crate::fls::annotation_schema::{
     effective_schemas, resolve_annotation_schema, searched_keys_display,
 };
-use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::block_writer::DeviceWriter;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
@@ -915,7 +915,7 @@ fn sanitize_partition_name(name: &str) -> Result<String, String> {
 /// Execute a sequence of write commands on the block writer
 async fn execute_write_commands(
     commands: Vec<WriteCommand>,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     debug: bool,
 ) -> std::io::Result<()> {
     for cmd in commands {
@@ -953,7 +953,7 @@ async fn execute_write_commands(
 async fn process_sparse_data(
     parser: &mut SparseParser,
     data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     debug: bool,
 ) -> std::io::Result<()> {
     let (commands, _consumed) = parser.process(data).map_err(|e| {
@@ -970,7 +970,7 @@ async fn handle_detected_format(
     format: FileFormat,
     consumed_bytes: Vec<u8>,
     remaining_data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     debug: bool,
 ) -> std::io::Result<Option<SparseParser>> {
     match format {
@@ -1019,7 +1019,7 @@ async fn process_buffer_with_format_detection(
     detector: &mut FormatDetector,
     parser: &mut Option<SparseParser>,
     format_determined: &mut bool,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     debug: bool,
 ) -> std::io::Result<()> {
     if !*format_determined {
@@ -1056,7 +1056,7 @@ async fn process_buffer_with_format_detection(
 async fn finalize_format_at_eof(
     detector: &mut FormatDetector,
     format_determined: bool,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     debug: bool,
 ) -> std::io::Result<()> {
     if !format_determined {
@@ -1160,13 +1160,7 @@ async fn setup_tar_processing_pipeline(
     );
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(
-        options.common.device.clone(),
-        written_progress_tx.clone(),
-        options.common.debug,
-        options.common.o_direct,
-        options.common.write_buffer_size_mb,
-    )?;
+    let block_writer = DeviceWriter::new(&options.common, written_progress_tx.clone())?;
 
     // Spawn task: decompressor stdout -> block writer with sparse image detection
     let error_tx_clone = error_tx.clone();
@@ -1449,7 +1443,7 @@ async fn coordinate_download_and_processing(
 
 async fn setup_inprocess_decompression_pipeline(
     http_rx: ByteBoundedReceiver<bytes::Bytes>,
-    block_writer: AsyncBlockWriter,
+    block_writer: DeviceWriter,
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
     compression_type: Compression,
     debug: bool,
@@ -2384,13 +2378,7 @@ async fn flash_raw_disk_image_directly(
     let (raw_written_progress_tx, raw_written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(
-        options.common.device.clone(),
-        raw_written_progress_tx,
-        options.common.debug,
-        options.common.o_direct,
-        options.common.write_buffer_size_mb,
-    )?;
+    let block_writer = DeviceWriter::new(&options.common, raw_written_progress_tx)?;
 
     // Set up byte-bounded streaming pipeline
     let buffer_size_mb = options.common.buffer_size_mb;

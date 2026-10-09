@@ -37,6 +37,33 @@ sudo cp target/release/fls /usr/local/bin/
 
 ## Usage
 
+### Remote devices over SSH
+
+Use `[user@]host:/absolute/device` as the destination for HTTP/HTTPS or OCI images:
+
+```bash
+fls from-url "https://example.com/image.img.xz" root@board:/dev/emmc0
+fls from-url "oci://quay.io/org/image:latest" root@board:/dev/emmc0
+```
+
+`fls` uploads its embedded aarch64-QNX write head over SSH, then streams framed
+commands. For another target architecture/OS, build the appropriate write head
+and use `--wh-bin /path/to/flswh`. When building from source, run
+`make remote-wh` before `cargo build` to embed the QNX binary; local-only builds
+work without it. See [remote/README.md](remote/README.md) for build instructions.
+
+SSH keys, agents, host keys, ports, and aliases use the system `ssh` and your
+`~/.ssh/config`. Password authentication uses `sshpass` with
+`--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
+the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;
+`--wh-bin` can also be supplied through `FLS_WH_BIN`.
+
+Remote zero fills use ZERO rather than transferring their contents. The writer
+checks write, fill, and seek ranges against remote device capacity, and waits
+for successful SYNC and QUIT before reporting completion. `--o-direct` applies
+to local devices; remote durability uses SYNC. One flash session per host is
+supported because uploads share `/tmp/fls-wh`.
+
 ### Basic Example
 
 Flash a compressed image from a URL to a block device:
@@ -180,5 +207,4 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - Ensure the target device is not mounted
 - Verify the device path to avoid data loss
 - Use `lsblk` or `fdisk -l` to identify the correct device before flashing
-
 
