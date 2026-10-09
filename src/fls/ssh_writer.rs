@@ -1,6 +1,6 @@
 use std::io::{self, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Condvar, Mutex};
 use tokio::sync::mpsc;
 
 use super::block_writer::WriterCommand;
@@ -178,28 +178,219 @@ fn upload_wh(host: &str, binary: &[u8], options: &FlashOptions) -> io::Result<()
     Ok(())
 }
 
-struct Session {
-    child: Child,
-    input: Option<ChildStdin>,
-    output: FrameReader<ChildStdout>,
+fn read_response<R: Read>(output: &mut FrameReader<R>) -> io::Result<(u8, Vec<u8>)> {
+    let (op, payload) = output.read_frame()?;
+    if op == R_ERR {
+        if payload.len() != 14 {
+            return Err(invalid("Malformed remote ERR"));
+        }
+        let code = payload[0];
+        let command = payload[1];
+        let errno = u32::from_le_bytes(payload[2..6].try_into().unwrap());
+        let offset = u64::from_le_bytes(payload[6..].try_into().unwrap());
+        let reason = match code {
+            0 => "device I/O error",
+            1 => "CRC mismatch",
+            2 => "unsupported or malformed command",
+            _ => "unknown error",
+        };
+        return Err(io::Error::other(format!(
+            "Remote {reason}: opcode {command:#04x}, errno {errno}, offset {offset}"
+        )));
+    }
+    Ok((op, payload))
+}
+
+struct Expected {
+    op: u8,
+    start: u64,
+    bytes: u64,
+    charge: usize,
+}
+
+#[derive(Default)]
+struct FlowState {
+    bytes: usize,
+    commands: usize,
+    error: Option<io::Error>,
+}
+
+struct FlowControl {
+    state: Mutex<FlowState>,
+    ready: Condvar,
+    limit: usize,
+}
+
+impl FlowControl {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(FlowState::default()),
+            ready: Condvar::new(),
+            limit,
+        }
+    }
+
+    fn reserve(&self, bytes: usize) -> io::Result<()> {
+        if bytes > self.limit {
+            return Err(invalid("Frame exceeds SSH in-flight window"));
+        }
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(error) = &state.error {
+                return Err(io::Error::new(error.kind(), error.to_string()));
+            }
+            // Also bound metadata for tiny ZERO/SEEK requests.
+            if state.bytes <= self.limit - bytes && state.commands < 1024 {
+                state.bytes += bytes;
+                state.commands += 1;
+                return Ok(());
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    fn complete(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes -= bytes;
+        state.commands -= 1;
+        self.ready.notify_all();
+    }
+
+    fn fail(&self, error: &io::Error) {
+        let mut state = self.state.lock().unwrap();
+        if state.error.is_none() {
+            state.error = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+        self.ready.notify_all();
+    }
+
+    fn wait_idle(&self) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(error) = &state.error {
+                return Err(io::Error::new(error.kind(), error.to_string()));
+            }
+            if state.commands == 0 {
+                return Ok(());
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+}
+
+fn expect_ok<R: Read>(
+    output: &mut FrameReader<R>,
+    expected: &Expected,
+    progress: &mpsc::UnboundedSender<u64>,
+) -> io::Result<()> {
+    let mut last_done = 0;
+    loop {
+        let (op, payload) = read_response(output)?;
+        if op == R_PROG && matches!(expected.op, OP_DATA | OP_ZERO) && payload.len() == 16 {
+            let offset = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let done = u64::from_le_bytes(payload[8..].try_into().unwrap());
+            if done < last_done
+                || done > expected.bytes
+                || expected.start.checked_add(done) != Some(offset)
+            {
+                return Err(invalid("Invalid remote PROG range"));
+            }
+            last_done = done;
+            let _ = progress.send(offset);
+        } else if op == R_ACK && payload.len() == 17 && payload[0] == expected.op {
+            let offset = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let written = u64::from_le_bytes(payload[9..].try_into().unwrap());
+            if offset != expected.start || written != expected.bytes {
+                return Err(invalid("Remote OK does not match the command range"));
+            }
+            if matches!(expected.op, OP_DATA | OP_ZERO | OP_SEEK) {
+                let _ = progress.send(expected.start + expected.bytes);
+            }
+            return Ok(());
+        } else {
+            return Err(invalid(format!(
+                "Unexpected response {op:#04x} to {:#04x}",
+                expected.op
+            )));
+        }
+    }
+}
+
+fn read_acks(
+    mut output: FrameReader<ChildStdout>,
+    requests: std_mpsc::Receiver<Expected>,
+    flow: Arc<FlowControl>,
+    child: Arc<Mutex<Child>>,
     progress: mpsc::UnboundedSender<u64>,
+) -> io::Result<u64> {
+    let result = (|| {
+        let mut total = 0u64;
+        while let Ok(expected) = requests.recv() {
+            if expected.op == OP_QUIT {
+                let (op, payload) = read_response(&mut output)?;
+                if op != R_DONE || payload.len() != 8 {
+                    return Err(invalid("Invalid write-head DONE"));
+                }
+                if u64::from_le_bytes(payload[..].try_into().unwrap()) != total {
+                    return Err(invalid("DONE total does not match acknowledged writes"));
+                }
+                flow.complete(expected.charge);
+                return Ok(total);
+            }
+            expect_ok(&mut output, &expected, &progress)?;
+            if matches!(expected.op, OP_DATA | OP_ZERO) {
+                total = total
+                    .checked_add(expected.bytes)
+                    .ok_or_else(|| invalid("Written byte count overflow"))?;
+            }
+            flow.complete(expected.charge);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "SSH writer closed without QUIT",
+        ))
+    })();
+    if let Err(ref error) = result {
+        flow.fail(error);
+        // Interrupt a sender blocked in write_all when the peer reports an error.
+        let _ = child.lock().unwrap().kill();
+    }
+    result
+}
+
+struct Session {
+    child: Arc<Mutex<Child>>,
+    input: Option<ChildStdin>,
+    requests: Option<std_mpsc::Sender<Expected>>,
+    reader: Option<std::thread::JoinHandle<io::Result<u64>>>,
+    flow: Arc<FlowControl>,
     cursor: u64,
     size: u64,
+    pending: Vec<u8>,
+    frame_size: usize,
 }
 
 impl Session {
-    fn new(mut child: Child, progress: mpsc::UnboundedSender<u64>) -> io::Result<Self> {
+    fn new(
+        mut child: Child,
+        progress: mpsc::UnboundedSender<u64>,
+        window: usize,
+    ) -> io::Result<Self> {
         let input = child.stdin.take().unwrap();
-        let output = FrameReader::new(child.stdout.take().unwrap());
+        let mut output = FrameReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = std_mpsc::channel();
         let mut session = Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             input: Some(input),
-            output,
-            progress,
+            requests: Some(tx),
+            reader: None,
+            flow: Arc::new(FlowControl::new(window)),
             cursor: 0,
             size: 0,
+            pending: Vec::with_capacity(window.min(CHUNK_SIZE)),
+            frame_size: window.min(CHUNK_SIZE),
         };
-        let (op, payload) = session.response()?;
+        let (op, payload) = read_response(&mut output)?;
         if op != R_READY || payload.len() != 9 || payload[0] != PROTO_VER {
             return Err(invalid(
                 "Invalid write-head READY or unsupported protocol version",
@@ -207,8 +398,12 @@ impl Session {
         }
         let advertised = u64::from_le_bytes(payload[1..].try_into().unwrap());
         // SIZE distinguishes an unknown startup size from a genuinely empty device.
-        session.send(OP_SIZE, &[])?;
-        let (op, payload) = session.response()?;
+        session
+            .input
+            .as_mut()
+            .unwrap()
+            .write_all(&encode_frame(OP_SIZE, &[])?)?;
+        let (op, payload) = read_response(&mut output)?;
         if op != R_SIZE || payload.len() != 8 {
             return Err(invalid("Invalid write-head SIZE response"));
         }
@@ -216,64 +411,43 @@ impl Session {
         if advertised != session.size {
             return Err(invalid("READY and SIZE disagree about device capacity"));
         }
+        let flow = Arc::clone(&session.flow);
+        let child = Arc::clone(&session.child);
+        session.reader = Some(
+            std::thread::Builder::new()
+                .name("fls-ssh-acks".into())
+                .spawn(move || read_acks(output, rx, flow, child, progress))?,
+        );
         Ok(session)
     }
 
-    fn send(&mut self, op: u8, payload: &[u8]) -> io::Result<()> {
+    fn queue_frame(&mut self, op: u8, start: u64, bytes: u64, frame: &[u8]) -> io::Result<()> {
+        let charge = if op == OP_DATA { bytes as usize } else { 1 };
+        self.flow.reserve(charge)?;
+        self.requests
+            .as_ref()
+            .unwrap()
+            .send(Expected {
+                op,
+                start,
+                bytes,
+                charge,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "SSH response reader closed"))?;
         self.input
             .as_mut()
             .unwrap()
-            .write_all(&encode_frame(op, payload)?)
+            .write_all(frame)
+            .map_err(|error| {
+                self.flow.fail(&error);
+                let state = self.flow.state.lock().unwrap();
+                let error = state.error.as_ref().unwrap();
+                io::Error::new(error.kind(), error.to_string())
+            })
     }
 
-    fn response(&mut self) -> io::Result<(u8, Vec<u8>)> {
-        let (op, payload) = self.output.read_frame()?;
-        if op == R_ERR {
-            if payload.len() != 14 {
-                return Err(invalid("Malformed remote ERR"));
-            }
-            let code = payload[0];
-            let command = payload[1];
-            let errno = u32::from_le_bytes(payload[2..6].try_into().unwrap());
-            let offset = u64::from_le_bytes(payload[6..].try_into().unwrap());
-            let reason = match code {
-                0 => "device I/O error",
-                1 => "CRC mismatch",
-                2 => "unsupported or malformed command",
-                _ => "unknown error",
-            };
-            return Err(io::Error::other(format!(
-                "Remote {reason}: opcode {command:#04x}, errno {errno}, offset {offset}"
-            )));
-        }
-        Ok((op, payload))
-    }
-
-    fn expect_ok(&mut self, command: u8, start: u64, bytes: u64) -> io::Result<()> {
-        let mut last_done = 0;
-        loop {
-            let (op, payload) = self.response()?;
-            if op == R_PROG && matches!(command, OP_DATA | OP_ZERO) && payload.len() == 16 {
-                let offset = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                let done = u64::from_le_bytes(payload[8..].try_into().unwrap());
-                if done < last_done || done > bytes || start.checked_add(done) != Some(offset) {
-                    return Err(invalid("Invalid remote PROG range"));
-                }
-                last_done = done;
-                let _ = self.progress.send(offset);
-            } else if op == R_ACK && payload.len() == 17 && payload[0] == command {
-                let offset = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-                let written = u64::from_le_bytes(payload[9..].try_into().unwrap());
-                if offset != start || written != bytes {
-                    return Err(invalid("Remote OK does not match the command range"));
-                }
-                return Ok(());
-            } else {
-                return Err(invalid(format!(
-                    "Unexpected response {op:#04x} to {command:#04x}"
-                )));
-            }
-        }
+    fn send(&mut self, op: u8, start: u64, bytes: u64, payload: &[u8]) -> io::Result<()> {
+        self.queue_frame(op, start, bytes, &encode_frame(op, payload)?)
     }
 
     fn check_range(&self, bytes: u64) -> io::Result<()> {
@@ -291,15 +465,27 @@ impl Session {
 
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.check_range(data.len() as u64)?;
-        for chunk in data.chunks(CHUNK_SIZE) {
-            self.input
-                .as_mut()
-                .unwrap()
-                .write_all(&encode_data_frame(chunk)?)?;
-            self.expect_ok(OP_DATA, self.cursor, chunk.len() as u64)?;
-            self.cursor += chunk.len() as u64;
-            let _ = self.progress.send(self.cursor);
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let n = remaining.len().min(self.frame_size - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..n]);
+            self.cursor += n as u64;
+            remaining = &remaining[n..];
+            if self.pending.len() == self.frame_size {
+                self.flush_pending()?;
+            }
         }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let bytes = self.pending.len() as u64;
+        let start = self.cursor - bytes;
+        self.queue_frame(OP_DATA, start, bytes, &encode_data_frame(&self.pending)?)?;
+        self.pending.clear();
         Ok(())
     }
 
@@ -310,20 +496,18 @@ impl Session {
                 "Seek exceeds remote device size",
             ));
         }
-        self.send(OP_SEEK, &offset.to_le_bytes())?;
-        self.expect_ok(OP_SEEK, offset, 0)?;
+        self.flush_pending()?;
+        self.send(OP_SEEK, offset, 0, &offset.to_le_bytes())?;
         self.cursor = offset;
-        let _ = self.progress.send(offset);
         Ok(())
     }
 
     fn fill(&mut self, pattern: [u8; 4], bytes: u64) -> io::Result<()> {
         self.check_range(bytes)?;
+        self.flush_pending()?;
         if pattern == [0; 4] {
-            self.send(OP_ZERO, &bytes.to_le_bytes())?;
-            self.expect_ok(OP_ZERO, self.cursor, bytes)?;
+            self.send(OP_ZERO, self.cursor, bytes, &bytes.to_le_bytes())?;
             self.cursor += bytes;
-            let _ = self.progress.send(self.cursor);
         } else {
             // ponytail: nonzero fills travel as DATA; add FILL if bandwidth matters.
             let mut buffer = vec![0; CHUNK_SIZE];
@@ -341,30 +525,38 @@ impl Session {
     }
 
     fn finish(mut self) -> io::Result<u64> {
-        self.send(OP_SYNC, &[])?;
-        self.expect_ok(OP_SYNC, self.cursor, 0)?;
-        self.send(OP_QUIT, &[])?;
-        let (op, payload) = self.response()?;
-        if op != R_DONE || payload.len() != 8 {
-            return Err(invalid("Invalid write-head DONE"));
-        }
+        self.flush_pending()?;
+        self.flow.wait_idle()?;
+        self.send(OP_SYNC, self.cursor, 0, &[])?;
+        self.send(OP_QUIT, self.cursor, 0, &[])?;
         self.input.take();
-        let status = self.child.wait()?;
+        self.requests.take();
+        let total = self
+            .reader
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| io::Error::other("SSH response reader panicked"))??;
+        let status = self.child.lock().unwrap().wait()?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "Remote writer exited with {status}"
             )));
         }
-        Ok(u64::from_le_bytes(payload[..].try_into().unwrap()))
+        Ok(total)
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.input.take();
+        self.requests.take();
         // std::process::Child does not reap or terminate on drop.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.lock().unwrap().kill();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        let _ = self.child.lock().unwrap().wait();
     }
 }
 
@@ -399,6 +591,16 @@ impl SshBlockWriter {
                 "SSH port must be between 1 and 65535",
             ));
         }
+        let window = options
+            .write_buffer_size_mb
+            .max(1)
+            .checked_mul(1 << 20)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSH write buffer size overflow",
+                )
+            })?;
         let binary = match &options.wh_bin {
             Some(path) => std::fs::read(path)?,
             None => EMBEDDED_WH.to_vec(),
@@ -429,9 +631,10 @@ impl SshBlockWriter {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::inherit())
                     .spawn()?;
-                let mut session = Session::new(child, progress)?;
+                let mut session = Session::new(child, progress, window)?;
                 if options.debug {
                     eprintln!("[DEBUG] Remote device size: {} bytes", session.size);
+                    eprintln!("[DEBUG] SSH in-flight DATA window: {} MiB", window >> 20);
                 }
                 while let Some(command) = writer_rx.blocking_recv() {
                     match command {
@@ -508,14 +711,22 @@ mod tests {
             .path()
     }
 
-    fn native_session(device: &std::path::Path) -> Session {
-        let child = Command::new(native_binary().join("fls-wh"))
+    fn native_child(device: &std::path::Path) -> Child {
+        Command::new(native_binary().join("fls-wh"))
             .arg(device)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap();
-        Session::new(child, mpsc::unbounded_channel().0).unwrap()
+            .unwrap()
+    }
+
+    fn native_session(device: &std::path::Path) -> Session {
+        Session::new(
+            native_child(device),
+            mpsc::unbounded_channel().0,
+            2 * CHUNK_SIZE,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -608,9 +819,9 @@ mod tests {
     fn native_write_head_round_trip_and_capacity() {
         let mut device = tempfile::NamedTempFile::new().unwrap();
         device.write_all(&vec![0x55; CHUNK_SIZE * 3]).unwrap();
-        let mut session = native_session(device.path());
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        session.progress = progress_tx;
+        let mut session =
+            Session::new(native_child(device.path()), progress_tx, 2 * CHUNK_SIZE).unwrap();
         session.write(&vec![0xa5; CHUNK_SIZE + 17]).unwrap();
         session.seek(32).unwrap();
         session.fill([0; 4], (CHUNK_SIZE + 5) as u64).unwrap();
@@ -646,14 +857,132 @@ mod tests {
     }
 
     #[test]
+    fn small_writes_coalesce_and_flush_at_command_boundaries() {
+        let mut device = tempfile::NamedTempFile::new().unwrap();
+        device.as_file().set_len(16).unwrap();
+        let mut session = native_session(device.path());
+        session.write(b"ab").unwrap();
+        session.write(b"cd").unwrap();
+        assert_eq!(session.pending, b"abcd");
+        let mut head = [0; 4];
+        device.read_exact(&mut head).unwrap();
+        assert_eq!(head, [0; 4]);
+        session.seek(8).unwrap();
+        session.flow.wait_idle().unwrap();
+        assert!(session.pending.is_empty());
+        device.seek(io::SeekFrom::Start(0)).unwrap();
+        device.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"abcd");
+        session.write(b"ef").unwrap();
+        session.fill([1, 2, 3, 4], 4).unwrap();
+        session.write(b"gh").unwrap();
+        assert_eq!(session.finish().unwrap(), 12);
+        device.seek(io::SeekFrom::Start(8)).unwrap();
+        let mut tail = [0; 8];
+        device.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"ef\x01\x02\x03\x04gh");
+    }
+
+    #[test]
+    fn streams_two_frames_before_the_first_ack() {
+        // The peer withholds every ACK until it has received both DATA frames.
+        // Its alarm makes a stop-and-wait regression fail instead of hanging.
+        let script = r#"
+import signal, struct, sys, zlib
+signal.alarm(10)
+def exact(n):
+    out = b''
+    while len(out) < n:
+        data = sys.stdin.buffer.read(n - len(out))
+        if not data: raise EOFError()
+        out += data
+    return out
+def receive():
+    header = exact(9)
+    assert header[:4] == b'FLSW'
+    return header[4], exact(struct.unpack_from('<I', header, 5)[0])
+def emit(op, payload):
+    sys.stdout.buffer.write(b'FLSW' + bytes([op]) + struct.pack('<I', len(payload)) + payload)
+    sys.stdout.buffer.flush()
+size = 1 << 30
+emit(0x81, struct.pack('<BQ', 1, size))
+assert receive() == (10, b'')
+emit(0x89, struct.pack('<Q', size))
+frames = [receive(), receive()]
+offset = 0
+for op, payload in frames:
+    assert op == 1
+    n = struct.unpack_from('<I', payload)[0]
+    assert len(payload) == n + 8
+    assert zlib.crc32(payload[4:-4]) == struct.unpack_from('<I', payload, len(payload) - 4)[0]
+    emit(0x82, struct.pack('<BQQ', 1, offset, n))
+    offset += n
+assert receive() == (4, b'')
+emit(0x82, struct.pack('<BQQ', 4, offset, 0))
+assert receive() == (5, b'')
+emit(0x85, struct.pack('<Q', offset))
+"#;
+        let child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut session = Session::new(child, mpsc::unbounded_channel().0, 2 * CHUNK_SIZE).unwrap();
+        session.write(b"first").unwrap();
+        session.flush_pending().unwrap();
+        session.write(b"second").unwrap();
+        session.flush_pending().unwrap();
+        assert_eq!(session.finish().unwrap(), 11);
+    }
+
+    #[test]
+    fn in_flight_bytes_apply_backpressure_and_errors_wake_waiters() {
+        use std::time::Duration;
+        let flow = Arc::new(FlowControl::new(8));
+        flow.reserve(6).unwrap();
+        let (tx, rx) = std_mpsc::channel();
+        let waiter = Arc::clone(&flow);
+        let thread = std::thread::spawn(move || {
+            tx.send(waiter.reserve(3)).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        flow.complete(6);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        thread.join().unwrap();
+        flow.complete(3);
+        flow.reserve(8).unwrap();
+        let (tx, rx) = std_mpsc::channel();
+        let waiter = Arc::clone(&flow);
+        let thread = std::thread::spawn(move || {
+            tx.send(waiter.reserve(1)).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        flow.fail(&io::Error::other("remote failed"));
+        let error = rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "remote failed");
+        thread.join().unwrap();
+        assert!(flow.wait_idle().is_err());
+    }
+
+    #[test]
     fn native_crc_error_is_propagated() {
         let device = tempfile::NamedTempFile::new().unwrap();
         device.as_file().set_len(32).unwrap();
         let mut session = native_session(device.path());
         let mut frame = encode_data_frame(b"test").unwrap();
         *frame.last_mut().unwrap() ^= 1;
-        session.input.as_mut().unwrap().write_all(&frame).unwrap();
-        let error = session.expect_ok(OP_DATA, 0, 4).unwrap_err();
+        session.queue_frame(OP_DATA, 0, 4, &frame).unwrap();
+        let error = session.finish().unwrap_err();
         assert!(error.to_string().contains("CRC mismatch"), "{error}");
         assert!(error.to_string().contains("opcode 0x01"), "{error}");
     }

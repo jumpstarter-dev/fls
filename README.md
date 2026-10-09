@@ -66,8 +66,15 @@ is selected only for aarch64 QNX 7. Other platforms require `--wh-bin` with a
 compatible write head; automatic Linux/macOS binary embedding can be added
 when those artifacts are available.
 
-Remote zero fills use ZERO rather than transferring their contents. The writer
-checks write, fill, and seek ranges against remote device capacity, and waits
+Remote zero fills use ZERO rather than transferring their contents. Adjacent
+DATA writes are coalesced into frames of up to 8 MiB, flushing before SEEK,
+FILL, and final SYNC so sparse-image fragments do not each require an ACK.
+DATA, ZERO, and SEEK frames are pipelined in order while a separate reader
+consumes progress and ACKs. `--write-buffer-size` also limits unacknowledged
+DATA bytes (default: 128 MiB); smaller windows reduce the maximum frame size.
+Small-command metadata is bounded to 1024 outstanding requests. Closing drains
+the ACKs before SYNC/QUIT, and remote errors stop the pipeline.
+The writer checks write, fill, and seek ranges against remote device capacity, and waits
 for successful SYNC and QUIT before reporting completion. `--o-direct` applies
 to local devices; remote durability uses SYNC. One flash session per host is
 supported because uploads share `/tmp/fls-wh`.
@@ -199,6 +206,7 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - `-k, --insecure-tls` - Ignore SSL certificate verification
 - `--cacert <CACERT>` - Path to CA certificate PEM file for TLS validation
 - `--buffer-size <SIZE>` - Buffer size in MB for download buffering (default: 1024)
+- `--write-buffer-size <SIZE>` - Write queue and remote unacknowledged DATA limit (default: 128 MiB)
 - `--max-retries <NUM>` - Maximum number of retry attempts (default: 10)
 - `--retry-delay <SECONDS>` - Delay in seconds between retry attempts (default: 2)
 - `--debug` - Enable debug output
