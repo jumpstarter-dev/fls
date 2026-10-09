@@ -246,13 +246,14 @@ int main(int argc, char **argv)
             }
             unsigned long long start = cur;
             crc_reset();
-            unsigned long long done = 0, next_prog = PROG_STEP;
+            unsigned long long done = 0, rd = 0, next_prog = PROG_STEP;  /* rd = bytes read from the stream */
             int status = 0;  /* 0=ok, 1=eof, 2=write error */
             static unsigned char chunk[WRITE_CHUNK_SIZE];
             while (done < size) {
                 size_t want = (size_t)(size - done);
                 if (want > sizeof chunk) want = sizeof chunk;
                 if (!rreadn(chunk, want)) { status = 1; break; }
+                rd += want;
                 crc_update(chunk, want);
                 if (write_all(fd, chunk, want) < 0) { status = 2; break; }
                 done += want;
@@ -267,7 +268,7 @@ int main(int argc, char **argv)
             total += done;
             if (status == 1) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
             if (status == 2) {
-                skip((unsigned long long)(size - done) + 4);  /* drain remaining content + CRC */
+                skip((unsigned long long)(size - rd) + 4);  /* drain unread content + CRC (the failed chunk is already consumed) */
                 err_rec(ERR_DEV, OP_DATA, (unsigned)errno, start);
             }
             else if (done < size) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
