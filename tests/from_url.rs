@@ -1,7 +1,7 @@
-// Integration tests for flash_from_url function
+// Integration tests for flash_from function
 mod common;
 
-use fls::{flash_from_url, BlockFlashOptions, FlashOptions};
+use fls::{flash_from, BlockFlashOptions, FlashOptions};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -65,7 +65,7 @@ async fn test_flash_uncompressed_file() {
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -124,7 +124,7 @@ async fn test_flash_xz_compressed_file() {
 
     // Execute the flash operation
     let url = format!("{}/test.img.xz", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -184,7 +184,7 @@ async fn test_flash_gz_compressed_file() {
 
     // Execute the flash operation
     let url = format!("{}/test.img.gz", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -250,7 +250,7 @@ async fn test_resume_after_connection_failure() {
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -321,7 +321,7 @@ async fn test_resume_compressed_file() {
 
     // Execute the flash operation
     let url = format!("{}/test.img.xz", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -397,7 +397,7 @@ async fn test_multiple_connection_failures() {
 
     // Execute the flash operation
     let url = format!("{}/test.img", mock_server.uri());
-    let result = flash_from_url(&url, options).await;
+    let result = flash_from(&url, options).await;
 
     // Verify the operation succeeded
     assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
@@ -595,7 +595,7 @@ async fn test_real_partial_transfer_with_resume() {
     options.max_retries = 5;
 
     // Execute the flash operation
-    let result = flash_from_url(&server_url, options).await;
+    let result = flash_from(&server_url, options).await;
 
     // Shutdown server
     server_handle.abort();
@@ -774,7 +774,7 @@ async fn test_https_with_custom_ca_certificate() {
     println!("  Using CA certificate: {}", ca_cert_path.display());
 
     // Execute the flash operation
-    let result = flash_from_url(&server_url, options).await;
+    let result = flash_from(&server_url, options).await;
 
     // Wait for server to finish
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), server_handle).await;
@@ -937,7 +937,7 @@ async fn test_https_with_insecure_flag() {
     options.max_retries = 1; // Limit retries since server handles only one connection
 
     // Execute the flash operation
-    let result = flash_from_url(&server_url, options).await;
+    let result = flash_from(&server_url, options).await;
 
     // Wait for server to finish
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
@@ -1034,7 +1034,7 @@ async fn test_https_certificate_validation_fails() {
     options.max_retries = 1; // Limit retries since server handles only one connection
 
     // Execute the flash operation
-    let result = flash_from_url(&server_url, options).await;
+    let result = flash_from(&server_url, options).await;
 
     // Wait for server to finish
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
@@ -1049,4 +1049,194 @@ async fn test_https_certificate_validation_fails() {
     println!("  Expected error: {}", error_msg);
 
     println!("✓ Test passed: Certificate validation correctly rejected certificate without CA");
+}
+
+// --- CLI tests for local file sources ---
+
+/// Deterministic 4 KiB blocks for the sparse fixture.
+fn sparse_blocks() -> (Vec<u8>, Vec<u8>) {
+    let a: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| ((i % 191) + 64) as u8).collect();
+    (a, b)
+}
+
+/// Tiny 4-block sparse image: RAW, FILL, DONT_CARE, RAW (4096-byte blocks).
+fn build_sparse_image(block_a: &[u8], block_b: &[u8]) -> Vec<u8> {
+    let mut image = Vec::new();
+    // File header (28 bytes, little-endian)
+    image.extend_from_slice(&0xED26FF3Au32.to_le_bytes()); // magic
+    image.extend_from_slice(&1u16.to_le_bytes()); // major
+    image.extend_from_slice(&0u16.to_le_bytes()); // minor
+    image.extend_from_slice(&28u16.to_le_bytes()); // file header size
+    image.extend_from_slice(&12u16.to_le_bytes()); // chunk header size
+    image.extend_from_slice(&4096u32.to_le_bytes()); // block size
+    image.extend_from_slice(&4u32.to_le_bytes()); // total blocks
+    image.extend_from_slice(&4u32.to_le_bytes()); // total chunks
+    image.extend_from_slice(&0u32.to_le_bytes()); // checksum
+
+    let chunk_header = |chunk_type: u16, total_size: u32| {
+        let mut header = Vec::with_capacity(12);
+        header.extend_from_slice(&chunk_type.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        header.extend_from_slice(&1u32.to_le_bytes()); // chunk blocks
+        header.extend_from_slice(&total_size.to_le_bytes());
+        header
+    };
+
+    // RAW
+    image.extend(chunk_header(0xCAC1, 12 + 4096));
+    image.extend_from_slice(block_a);
+    // FILL
+    image.extend(chunk_header(0xCAC2, 16));
+    image.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    // DONT_CARE
+    image.extend(chunk_header(0xCAC3, 12));
+    // RAW
+    image.extend(chunk_header(0xCAC1, 12 + 4096));
+    image.extend_from_slice(block_b);
+
+    image
+}
+
+/// Expected 16 KiB output: RAW, FILL, untouched (zero) DONT_CARE, RAW.
+///
+/// Regular-file destinations are truncated on open, so the DONT_CARE region
+/// reads back as zeros: the flasher must not write into it.
+fn expected_sparse_output(block_a: &[u8], block_b: &[u8]) -> Vec<u8> {
+    let fill: Vec<u8> = [0x12, 0x34, 0x56, 0x78].repeat(1024);
+    let mut out = Vec::with_capacity(16384);
+    out.extend_from_slice(block_a);
+    out.extend_from_slice(&fill);
+    out.extend(std::iter::repeat_n(0u8, 4096)); // DONT_CARE: never written
+    out.extend_from_slice(block_b);
+    out
+}
+
+#[tokio::test]
+async fn local_source_cli_flashes_raw_gzip_and_sparse_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 199) as u8).collect();
+    std::fs::write(dir.path().join("image.img"), &raw).unwrap();
+    std::fs::write(dir.path().join("image.img.gz"), common::compress_gz(&raw)).unwrap();
+
+    let (block_a, block_b) = sparse_blocks();
+    let sparse = build_sparse_image(&block_a, &block_b);
+    let expected = expected_sparse_output(&block_a, &block_b);
+    let abs_xz = dir.path().join("disk.simg.xz");
+    std::fs::write(&abs_xz, common::compress_xz(&sparse)).unwrap();
+    // A name with spaces and a literal '?' and '#' before the extension.
+    let tricky_xz = dir.path().join("file with ?#.simg.xz");
+    std::fs::write(&tricky_xz, common::compress_xz(&sparse)).unwrap();
+
+    let cases: Vec<(&str, &str, String, Vec<u8>)> = vec![
+        ("raw", "from", "image.img".to_string(), raw.clone()),
+        ("gz", "from", "./image.img.gz".to_string(), raw.clone()),
+        (
+            "abs-xz",
+            "from",
+            abs_xz.to_str().unwrap().to_string(),
+            expected.clone(),
+        ),
+        (
+            "file-abs",
+            "from",
+            format!("file://{}", abs_xz.display()),
+            expected.clone(),
+        ),
+        (
+            "file-rel",
+            "from",
+            format!("file://./{}", tricky_xz.file_name().unwrap().display()),
+            expected.clone(),
+        ),
+        ("alias", "from-url", "image.img".to_string(), raw.clone()),
+    ];
+
+    for (name, command, source, expected_bytes) in cases {
+        let device = dir.path().join(format!("{name}-device"));
+        std::fs::write(&device, vec![0u8; expected_bytes.len()]).unwrap();
+        let device_arg = device.display().to_string();
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"));
+        cmd.current_dir(dir.path())
+            .args([
+                command,
+                &source,
+                &device_arg,
+                "--progress-interval",
+                "0",
+                "--newline-progress",
+            ])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("Result: FLASH_COMPLETED"),
+            "{name}: {stdout}"
+        );
+        assert_eq!(std::fs::read(&device).unwrap(), expected_bytes, "{name}");
+        // Local sources report Read progress and never Download.
+        assert!(stdout.contains("Read:"), "{name}: {stdout}");
+        assert!(stdout.contains("Read complete:"), "{name}: {stdout}");
+        assert!(!stdout.contains("Download:"), "{name}: {stdout}");
+        assert!(!stdout.contains("Starting download"), "{name}: {stdout}");
+        if command == "from-url" {
+            assert_eq!(
+                stderr.matches("is deprecated").count(),
+                1,
+                "{name}: {stderr}"
+            );
+        } else {
+            assert!(!stderr.contains("deprecated"), "{name}: {stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_source_cli_fails_cleanly_without_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let bad_xz = dir.path().join("bad.simg.xz");
+    std::fs::write(&bad_xz, b"not an xz stream").unwrap();
+
+    // (name, source, destination must be unchanged)
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("missing", "nope.img".to_string(), true),
+        ("directory", source_dir.path().display().to_string(), true),
+        ("bare-file", "file://".to_string(), true),
+        ("ftp", "ftp://example.com/image.img".to_string(), true),
+        // Decompression fails after the writer opened, so the destination
+        // was already truncated by then.
+        ("bad-xz", "bad.simg.xz".to_string(), false),
+    ];
+
+    for (name, source, device_untouched) in cases {
+        let device = dir.path().join(format!("{name}-device"));
+        std::fs::write(&device, vec![0u8; 4096]).unwrap();
+        let device_arg = device.display().to_string();
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"));
+        cmd.current_dir(dir.path())
+            .args(["from", &source, &device_arg])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}: {stdout}\n{stderr}");
+        assert!(stdout.contains("Result: FLASH_FAILED"), "{name}: {stdout}");
+        assert!(!stdout.contains("FLASH_COMPLETED"), "{name}: {stdout}");
+        // No success stats and no download retry messages.
+        assert!(!stdout.contains("complete:"), "{name}: {stdout}");
+        assert!(!stderr.to_lowercase().contains("retry"), "{name}: {stderr}");
+        assert!(stderr.contains("Error:"), "{name}: {stderr}");
+        if device_untouched {
+            assert_eq!(std::fs::read(&device).unwrap(), vec![0u8; 4096], "{name}");
+        }
+    }
 }

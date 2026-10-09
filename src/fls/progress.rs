@@ -72,6 +72,8 @@ pub(crate) struct ProgressTracker {
     pub(crate) write_duration: Option<Duration>,
     // Store content length for percentage calculations
     pub(crate) content_length: Option<u64>,
+    // Label for the input phase: "Download" for network sources, "Read" for local files
+    input_label: &'static str,
     // Track if we're actually decompressing (not using cat)
     is_compressed: bool,
     // Whether to print on new lines instead of clearing and rewriting
@@ -98,6 +100,7 @@ impl ProgressTracker {
             decompress_duration: None,
             write_duration: None,
             content_length: None,
+            input_label: "Download",
             is_compressed: true,
             newline_progress,
             line_open: false,
@@ -111,6 +114,10 @@ impl ProgressTracker {
 
     pub(crate) fn set_is_compressed(&mut self, is_compressed: bool) {
         self.is_compressed = is_compressed;
+    }
+
+    pub(crate) fn set_input_label(&mut self, label: &'static str) {
+        self.input_label = label;
     }
 
     pub(crate) fn update_progress(
@@ -206,14 +213,24 @@ impl ProgressTracker {
             if self.newline_progress {
                 // Print on a new line
                 println!(
-                    "Download: {} | {}: {} | Written: {}{}",
-                    download_status, progress_label, decompress_status, write_status, memory_suffix
+                    "{}: {} | {}: {} | Written: {}{}",
+                    self.input_label,
+                    download_status,
+                    progress_label,
+                    decompress_status,
+                    write_status,
+                    memory_suffix
                 );
             } else {
                 // Use carriage return and clear line
                 print!(
-                    "\r\x1b[KDownload: {} | {}: {} | Written: {}{}",
-                    download_status, progress_label, decompress_status, write_status, memory_suffix
+                    "\r\x1b[K{}: {} | {}: {} | Written: {}{}",
+                    self.input_label,
+                    download_status,
+                    progress_label,
+                    decompress_status,
+                    write_status,
+                    memory_suffix
                 );
                 self.line_open = true;
                 io::stdout().flush()?;
@@ -268,7 +285,8 @@ impl ProgressTracker {
     fn print_stats(&mut self, include_compression_ratio: bool) {
         let stats = self.final_stats();
         println!(
-            "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
+            "\n{} complete: {:.2} MB in {} ({:.2} MB/s)",
+            self.input_label,
             stats.mb_received,
             stats.download_time_formatted(),
             stats.download_rate

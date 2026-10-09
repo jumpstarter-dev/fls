@@ -30,10 +30,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash a block device from a URL (supports http://, https://, oci://)
-    FromUrl {
-        /// URL to download the image from (http://, https://, oci://)
-        url: String,
+    /// Flash a block device from a URL, OCI image, or local file
+    #[command(name = "from", visible_alias = "from-url")]
+    From {
+        /// Image source: http://, https://, oci://, file://, or a local path
+        source: String,
         /// Destination device path or SSH target ([user@]host:/dev/emmc0)
         device: String,
         /// Path to CA certificate PEM file for TLS validation
@@ -42,7 +43,7 @@ enum Commands {
         /// Ignore SSL certificate verification
         #[arg(short = 'k', long = "insecure-tls")]
         insecure_tls: bool,
-        /// Buffer size in MB for download buffering (default: 128 MB)
+        /// Buffer size in MB for input buffering (default: 128 MB)
         #[arg(long, default_value = "128")]
         buffer_size: usize,
         /// Write buffer size in MB; also limits remote unacknowledged DATA (default: 128 MB)
@@ -133,11 +134,19 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    // Clap canonicalizes aliases, so detect the deprecated spelling from the
+    // raw arguments before parsing.
+    let deprecated_from_url = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg.to_str() == Some("from-url"));
     let cli = Cli::parse();
+    if deprecated_from_url {
+        eprintln!("Warning: 'from-url' is deprecated; use 'from' instead.");
+    }
 
     match cli.command {
-        Commands::FromUrl {
-            url,
+        Commands::From {
+            source,
             device,
             cacert,
             insecure_tls,
@@ -161,18 +170,18 @@ async fn main() {
             strict_ssh_host_key_checking,
             wh_bin,
         } => {
-            // Detect URL scheme to determine handler
-            let is_oci = url.starts_with("oci://");
+            // Detect source scheme to determine handler
+            let is_oci = source.starts_with("oci://");
 
             if debug {
-                eprintln!("[DEBUG] URL: '{}', is_oci: {}", url, is_oci);
+                eprintln!("[DEBUG] Source: '{}', is_oci: {}", source, is_oci);
             }
 
             if is_oci {
                 // OCI image - strip scheme prefix
-                let image_ref = url
+                let image_ref = source
                     .strip_prefix("oci://")
-                    .expect("URL should start with 'oci://' as verified above");
+                    .expect("Source should start with 'oci://' as verified above");
 
                 println!("OCI flash command:");
                 println!("  Image: {}", image_ref);
@@ -239,18 +248,21 @@ async fn main() {
                     }
                 }
             } else {
-                // HTTP/HTTPS URL
+                // HTTP/HTTPS URL or local file
+                let is_http = source.starts_with("http://") || source.starts_with("https://");
                 println!("Block flash command:");
-                println!("  URL: {}", url);
+                println!("  Source: {}", source);
                 println!("  Device: {}", device);
-                if let Some(ref cert_path) = cacert {
-                    println!("  CA Certificate: {}", cert_path.display());
+                if is_http {
+                    if let Some(ref cert_path) = cacert {
+                        println!("  CA Certificate: {}", cert_path.display());
+                    }
+                    println!("  Ignore certificates: {}", insecure_tls);
+                    println!("  Max retries: {}", max_retries);
+                    println!("  Retry delay: {} seconds", retry_delay);
                 }
-                println!("  Ignore certificates: {}", insecure_tls);
                 println!("  Buffer size: {} MB", buffer_size);
                 println!("  Write buffer size: {} MB", write_buffer_size);
-                println!("  Max retries: {}", max_retries);
-                println!("  Retry delay: {} seconds", retry_delay);
                 println!("  Debug: {}", debug);
                 println!("  O_DIRECT mode: {}", o_direct);
 
@@ -276,7 +288,7 @@ async fn main() {
                     })
                     .collect();
 
-                if !parsed_headers.is_empty() {
+                if !parsed_headers.is_empty() && is_http {
                     println!("  Custom headers:");
                     for (name, value) in &parsed_headers {
                         println!("    {}: {}", name, value);
@@ -308,7 +320,7 @@ async fn main() {
                     headers: parsed_headers,
                 };
 
-                match fls::flash_from_url(&url, options).await {
+                match fls::flash_from(&source, options).await {
                     Ok(_) => {
                         println!("Result: FLASH_COMPLETED");
                         std::process::exit(0);

@@ -190,7 +190,7 @@ async fn oci_cli_reports_ssh_connection_failures_without_mixing_progress() {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"));
         command
             .args([
-                "from-url",
+                "from",
                 &format!("oci://{address}/{REPO}:{TAG}"),
                 &format!("root@fake-host:{}", device.display()),
                 "--ssh-port",

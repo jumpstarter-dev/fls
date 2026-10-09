@@ -39,11 +39,13 @@ sudo cp target/release/fls /usr/local/bin/
 
 ### Remote devices over SSH
 
-Use `[user@]host:/absolute/device` as the destination for HTTP/HTTPS or OCI images:
+Use `[user@]host:/absolute/device` as the destination for HTTP/HTTPS, OCI, or
+local file sources:
 
 ```bash
-fls from-url "https://example.com/image.img.xz" root@board:/dev/emmc0
-fls from-url "oci://quay.io/org/image:latest" root@board:/dev/emmc0
+fls from "https://example.com/image.img.xz" root@board:/dev/emmc0
+fls from "oci://quay.io/org/image:latest" root@board:/dev/emmc0
+fls from ./my.image.simg.xz root@board:/dev/emmc0
 ```
 
 `fls` uploads its embedded aarch64-QNX write head over SSH, then streams framed
@@ -94,7 +96,7 @@ skips, matching local flashing; DONE still validates only actual written bytes.
 Flash a compressed image from a URL to a block device:
 
 ```bash
-fls from-url \
+fls from \
   -k \
   -n \
   "https://example.com/path/to/image.raw.xz" \
@@ -105,12 +107,27 @@ fls from-url \
 - `-k` - Skip SSL certificate verification (useful for internal servers with self-signed certs)
 - `-n` - Print progress on new lines (better for logging)
 
+### Local Files
+
+Flash a local image file (relative or absolute path, `file://`-prefixed or not):
+
+```bash
+fls from ./my.image.simg.xz /dev/sdb
+fls from /home/user/my.image.simg.xz /dev/sdb
+fls from file:///home/user/my.image.simg.xz /dev/sdb
+```
+
+`file://` is a literal path prefix, not a URI: `file://./a.img` is the relative
+path `./a.img`, and `file:///home/a.img` is `/home/a.img`. Compression is
+detected from the file extension (`.gz`, `.xz`, `.zst`). The old `from-url`
+command name still works but prints a deprecation warning.
+
 ### Advanced Example
 
 Flash with custom headers and progress interval:
 
 ```bash
-fls from-url \
+fls from \
   --header "Authorization: Bearer token123" \
   --progress-interval 1.0 \
   --buffer-size 2048 \
@@ -122,7 +139,7 @@ fls from-url \
 
 ```
 Block flash command:
-  URL: https://example.com/path/to/image.raw.xz
+  Source: https://example.com/path/to/image.raw.xz
   Device: /dev/mmcblk1
   Buffer size: 1024 MB
   Max retries: 10
@@ -154,10 +171,10 @@ or to fastboot partitions.
 
 #### Flash an OCI image to a block device
 
-Use `from-url` with an `oci://` prefix:
+Use `from` with an `oci://` prefix:
 
 ```bash
-fls from-url \
+fls from \
   -u "$REGISTRY_USER" \
   -p "$REGISTRY_PASS" \
   "oci://quay.io/org/image:latest" \
@@ -200,22 +217,23 @@ required for authenticated access.
 
 ## Command Options
 
-### `fls from-url`
+### `fls from`
 
-Flash an image from a URL to a block device.
+Flash an image from a URL, OCI image, or local file to a block device.
+`from-url` is a deprecated alias that still works.
 
 ```
-fls from-url [OPTIONS] <URL> <DEVICE>
+fls from [OPTIONS] <SOURCE> <DEVICE>
 ```
 
 **Arguments:**
-- `<URL>` - URL to download the image from
-- `<DEVICE>` - Destination device path (e.g., `/dev/sdb`, `/dev/mmcblk1`)
+- `<SOURCE>` - Image source: `http://`, `https://`, `oci://`, `file://`, or a local path
+- `<DEVICE>` - Destination device path (e.g., `/dev/sdb`, `/dev/mmcblk1`) or SSH target (`[user@]host:/dev/emmc0`)
 
 **Options:**
 - `-k, --insecure-tls` - Ignore SSL certificate verification
 - `--cacert <CACERT>` - Path to CA certificate PEM file for TLS validation
-- `--buffer-size <SIZE>` - Buffer size in MB for download buffering (default: 1024)
+- `--buffer-size <SIZE>` - Buffer size in MB for input buffering (default: 128)
 - `--write-buffer-size <SIZE>` - Write queue and remote unacknowledged DATA limit (default: 128 MiB)
 - `--max-retries <NUM>` - Maximum number of retry attempts (default: 10)
 - `--retry-delay <SECONDS>` - Delay in seconds between retry attempts (default: 2)
