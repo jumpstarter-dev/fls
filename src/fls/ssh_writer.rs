@@ -112,7 +112,18 @@ fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Comm
         command.arg("-p").arg(port.to_string());
     }
     // Streaming stdin belongs to the protocol; terminal prompts would stall it.
-    command.args(["-o", "StrictHostKeyChecking=yes"]);
+    if options.strict_ssh_host_key_checking {
+        command.args(["-o", "StrictHostKeyChecking=yes"]);
+    } else {
+        command.args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+        ]);
+    }
     if command.get_program() == "ssh" {
         command.args(["-o", "BatchMode=yes"]);
     }
@@ -798,7 +809,11 @@ mod tests {
                 "-p",
                 "11223",
                 "-o",
-                "StrictHostKeyChecking=yes",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
                 "-T",
                 "--",
                 "board",

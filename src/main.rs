@@ -84,6 +84,9 @@ enum Commands {
         /// SSH port (defaults to SSH configuration)
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         ssh_port: Option<u16>,
+        /// Require verified SSH host keys (default: skip host-key checks)
+        #[arg(long)]
+        strict_ssh_host_key_checking: bool,
         /// Write-head binary to upload (default: embedded aarch64-qnx7)
         #[arg(long, env = "FLS_WH_BIN")]
         wh_bin: Option<String>,
@@ -155,6 +158,7 @@ async fn main() {
             ssh_password_file,
             ssh_compress,
             ssh_port,
+            strict_ssh_host_key_checking,
             wh_bin,
         } => {
             // Detect URL scheme to determine handler
@@ -212,6 +216,7 @@ async fn main() {
                         ssh_password_file,
                         ssh_compress,
                         ssh_port,
+                        strict_ssh_host_key_checking,
                         wh_bin,
                     },
                     username,
@@ -295,6 +300,7 @@ async fn main() {
                         ssh_password_file,
                         ssh_compress,
                         ssh_port,
+                        strict_ssh_host_key_checking,
                         wh_bin,
                     },
                     max_retries,

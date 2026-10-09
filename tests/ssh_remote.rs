@@ -28,8 +28,19 @@ if [ "$1" = -p ]; then
   echo port >> "$SSH_LOG"
   shift 2
 fi
-[ "$1" = -o ] && [ "$2" = StrictHostKeyChecking=yes ] || exit 49
-shift 2
+if [ "$STRICT_CHECK" = 1 ]; then
+  [ "$1" = -o ] && [ "$2" = StrictHostKeyChecking=yes ] || exit 49
+  shift 2
+  echo strict >> "$SSH_LOG"
+else
+  [ "$1" = -o ] && [ "$2" = StrictHostKeyChecking=no ] || exit 49
+  shift 2
+  [ "$1" = -o ] && [ "$2" = UserKnownHostsFile=/dev/null ] || exit 53
+  shift 2
+  [ "$1" = -o ] && [ "$2" = LogLevel=ERROR ] || exit 54
+  shift 2
+  echo unchecked >> "$SSH_LOG"
+fi
 if [ "$1" = -o ]; then
   [ "$2" = BatchMode=yes ] || exit 50
   [ -z "$SSHPASS$FLS_SSH_PASS_FILE" ] || exit 51
@@ -48,7 +59,7 @@ case "$1" in
   *"uname -s"*)
     echo probe >> "$SSH_LOG"
     [ "$PROBE_FAIL" != 1 ] || exit 47
-    if [ "$HOST_KEY_UNKNOWN" = 1 ]; then
+    if [ "$HOST_KEY_UNKNOWN" = 1 ] && [ "$STRICT_CHECK" = 1 ]; then
       echo 'Host key verification failed.' >&2
       exit 255
     fi
@@ -96,6 +107,10 @@ exec "$@"
         "oversize",
         "probe-fail",
         "unknown-key",
+        "strict-key",
+        "strict-env",
+        "strict-file",
+        "strict-unknown-key",
     ] {
         let device = dir.path().join(format!("block '{auth};device"));
         let file = std::fs::File::create(&device).unwrap();
@@ -133,15 +148,21 @@ exec "$@"
             .env_remove("FLS_WH_BIN")
             .env_remove("PROBE_FAIL")
             .env_remove("HOST_KEY_UNKNOWN")
+            .env_remove("STRICT_CHECK")
             .kill_on_drop(true);
         if auth != "config-port" {
             command.args(["--ssh-port", "11223"]);
         }
+        if auth.starts_with("strict-") {
+            command
+                .arg("--strict-ssh-host-key-checking")
+                .env("STRICT_CHECK", "1");
+        }
         match auth {
-            "env" => {
+            "env" | "strict-env" => {
                 command.env("SSHPASS", "test-password");
             }
-            "file" => {
+            "file" | "strict-file" => {
                 // File authentication must win even when SSHPASS is set.
                 command
                     .env("SSHPASS", "ignored-password")
@@ -152,7 +173,7 @@ exec "$@"
                     .env("PROBE_FAIL", "1")
                     .args(["--write-buffer-size", "8"]);
             }
-            "unknown-key" => {
+            "unknown-key" | "strict-unknown-key" => {
                 command.env("HOST_KEY_UNKNOWN", "1");
             }
             _ => {}
@@ -161,12 +182,12 @@ exec "$@"
             .await
             .unwrap()
             .unwrap();
-        if matches!(auth, "probe-fail" | "unknown-key") {
+        if matches!(auth, "probe-fail" | "strict-unknown-key") {
             assert!(!output.status.success());
             assert!(!upload.exists(), "Platform detection must precede upload");
             assert!(String::from_utf8_lossy(&output.stderr)
                 .contains("Remote platform detection failed"));
-            if auth == "unknown-key" {
+            if auth == "strict-unknown-key" {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(stderr.contains("Host key verification failed"));
                 assert!(stderr.contains("ssh -p 11223 'root@fake-host'"));
@@ -202,16 +223,36 @@ exec "$@"
         );
         assert_eq!(log.matches("probe").count(), 1);
         assert_eq!(
+            log.matches("strict").count(),
+            if auth.starts_with("strict-") { 3 } else { 0 }
+        );
+        assert_eq!(
+            log.matches("unchecked").count(),
+            if auth.starts_with("strict-") { 0 } else { 3 }
+        );
+        assert_eq!(
             log.matches("batch").count(),
-            if matches!(auth, "file" | "env") { 0 } else { 3 }
+            if matches!(auth, "file" | "env" | "strict-file" | "strict-env") {
+                0
+            } else {
+                3
+            }
         );
         assert_eq!(
             log.matches("file").count(),
-            if auth == "file" { 3 } else { 0 }
+            if matches!(auth, "file" | "strict-file") {
+                3
+            } else {
+                0
+            }
         );
         assert_eq!(
             log.matches("env").count(),
-            if auth == "env" { 3 } else { 0 }
+            if matches!(auth, "env" | "strict-env") {
+                3
+            } else {
+                0
+            }
         );
     }
 }

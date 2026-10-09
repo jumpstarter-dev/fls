@@ -52,17 +52,21 @@ and use `--wh-bin /path/to/flswh`. When building from source, run
 `make remote-wh` before `cargo build` to embed the QNX binary; local-only builds
 work without it. See [remote/README.md](remote/README.md) for build instructions.
 
-SSH keys, agents, host keys, ports, and aliases use the system `ssh` and your
+SSH keys, agents, ports, and aliases use the system `ssh` and your
 `~/.ssh/config`. `--ssh-port <port>` overrides the port for platform detection,
 upload, and flashing; without it the SSH configuration is used. `-p` remains
 the registry-password option. Password authentication uses `sshpass` with
 `--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
 the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;
 `--wh-bin` can also be supplied through `FLS_WH_BIN`.
-SSH connections require a known host key and use non-interactive key/agent
-authentication unless `sshpass` is selected. Connect once with `ssh root@board`
-(or `ssh -p <port> root@board`) to verify the host key before flashing; unknown
-or changed keys fail promptly instead of waiting behind the progress display.
+By default, all SSH connections use `StrictHostKeyChecking=no`,
+`UserKnownHostsFile=/dev/null`, and `LogLevel=ERROR`: host keys are not verified
+or saved to your user known-hosts file. `--strict-ssh-host-key-checking` instead
+uses `StrictHostKeyChecking=yes` with your configured known-hosts files and log
+level. In strict mode, connect once with `ssh root@board` (or
+`ssh -p <port> root@board`) to verify the key before flashing; unknown or changed
+keys fail promptly. Key/agent authentication remains non-interactive unless
+`sshpass` is selected.
 
 Before uploading, `fls` queries the remote OS, CPU architecture, and release
 using `uname` (`-p` for the QNX processor, `-m` elsewhere). The embedded binary
