@@ -531,8 +531,7 @@ impl Session {
         self.send(OP_QUIT, self.cursor, 0, &[])?;
         self.input.take();
         self.requests.take();
-        let total = self
-            .reader
+        self.reader
             .take()
             .unwrap()
             .join()
@@ -543,7 +542,9 @@ impl Session {
                 "Remote writer exited with {status}"
             )));
         }
-        Ok(total)
+        // Match the local writer: completion includes sparse seeks/skips.
+        // The ACK reader separately validates DONE's physical write count.
+        Ok(self.cursor)
     }
 }
 
@@ -840,9 +841,14 @@ mod tests {
             session.write(&[1, 2]).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
-        let total = session.finish().unwrap();
-        assert_eq!(total, (2 * CHUNK_SIZE + 29) as u64);
-        assert!(progress_rx.try_recv().is_ok());
+        let final_offset = session.cursor;
+        assert_eq!(session.finish().unwrap(), final_offset);
+        assert_eq!(final_offset, (3 * CHUNK_SIZE - 1) as u64);
+        let mut last_progress = None;
+        while let Ok(offset) = progress_rx.try_recv() {
+            last_progress = Some(offset);
+        }
+        assert_eq!(last_progress, Some(final_offset));
         device.seek(io::SeekFrom::Start(0)).unwrap();
         let mut prefix = [0; 32];
         device.read_exact(&mut prefix).unwrap();
@@ -876,7 +882,7 @@ mod tests {
         session.write(b"ef").unwrap();
         session.fill([1, 2, 3, 4], 4).unwrap();
         session.write(b"gh").unwrap();
-        assert_eq!(session.finish().unwrap(), 12);
+        assert_eq!(session.finish().unwrap(), 16);
         device.seek(io::SeekFrom::Start(8)).unwrap();
         let mut tail = [0; 8];
         device.read_exact(&mut tail).unwrap();

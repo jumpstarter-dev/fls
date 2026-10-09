@@ -78,6 +78,8 @@ The writer checks write, fill, and seek ranges against remote device capacity, a
 for successful SYNC and QUIT before reporting completion. `--o-direct` applies
 to local devices; remote durability uses SYNC. One flash session per host is
 supported because uploads share `/tmp/fls-wh`.
+The reported Written count is the logical device position, including sparse
+skips, matching local flashing; DONE still validates only actual written bytes.
 
 ### Basic Example
 
