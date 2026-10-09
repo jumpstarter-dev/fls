@@ -17,6 +17,7 @@ pub mod oci;
 mod options;
 mod progress;
 mod simg;
+mod ssh_writer;
 mod stream_utils;
 
 // Public re-exports

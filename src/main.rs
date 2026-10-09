@@ -34,7 +34,7 @@ enum Commands {
     FromUrl {
         /// URL to download the image from (http://, https://, oci://)
         url: String,
-        /// Destination device path (e.g., /dev/sdb)
+        /// Destination device path or SSH target ([user@]host:/dev/emmc0)
         device: String,
         /// Path to CA certificate PEM file for TLS validation
         #[arg(long)]
@@ -75,6 +75,15 @@ enum Commands {
         /// XZ decompression memory limit in MB (exceeds = single-thread fallback, then error)
         #[arg(long, default_value = "256")]
         xz_memlimit: u64,
+        /// SSH password file (uses sshpass -f)
+        #[arg(long, env = "FLS_SSH_PASS_FILE")]
+        ssh_password_file: Option<String>,
+        /// Enable SSH compression
+        #[arg(long)]
+        ssh_compress: bool,
+        /// Write-head binary to upload (default: embedded aarch64-qnx7)
+        #[arg(long, env = "FLS_WH_BIN")]
+        wh_bin: Option<String>,
         /// Registry username for OCI authentication
         #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
@@ -140,6 +149,9 @@ async fn main() {
             password,
             file_pattern,
             xz_memlimit,
+            ssh_password_file,
+            ssh_compress,
+            wh_bin,
         } => {
             // Detect URL scheme to determine handler
             let is_oci = url.starts_with("oci://");
@@ -193,6 +205,9 @@ async fn main() {
                         newline_progress,
                         show_memory,
                         xz_memlimit_mb: xz_memlimit,
+                        ssh_password_file,
+                        ssh_compress,
+                        wh_bin,
                     },
                     username,
                     password,
@@ -272,6 +287,9 @@ async fn main() {
                         newline_progress,
                         show_memory,
                         xz_memlimit_mb: xz_memlimit,
+                        ssh_password_file,
+                        ssh_compress,
+                        wh_bin,
                     },
                     max_retries,
                     retry_delay_secs: retry_delay,

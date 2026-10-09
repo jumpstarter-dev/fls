@@ -4,7 +4,6 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,9 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  # runs first: builds the write-head binaries and leaves them as artifacts
-  # for later fls jobs (add `needs: write-head` + actions/download-artifact
-  # in a job that wants them)
+  # Build the write head before the Rust jobs embed it.
   write-head:
     name: Write head (fls-wh)
     runs-on: ubuntu-latest
@@ -70,9 +67,15 @@ jobs:
 
   lint:
     name: Lint
+    needs: write-head
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flswh-aarch64-qnx7
+          path: remote/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -105,9 +108,15 @@ jobs:
 
   test:
     name: Test
+    needs: write-head
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flswh-aarch64-qnx7
+          path: remote/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -135,6 +144,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
+    needs: write-head
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -158,6 +168,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flswh-aarch64-qnx7
+          path: remote/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -209,6 +224,4 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
           if-no-files-found: error
-
-
 

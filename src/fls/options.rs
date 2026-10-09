@@ -21,6 +21,9 @@ pub struct FlashOptions {
     pub newline_progress: bool,
     pub show_memory: bool,
     pub xz_memlimit_mb: u64,
+    pub ssh_password_file: Option<String>,
+    pub ssh_compress: bool,
+    pub wh_bin: Option<String>,
 }
 
 impl Default for FlashOptions {
@@ -37,6 +40,9 @@ impl Default for FlashOptions {
             newline_progress: false,
             show_memory: false,
             xz_memlimit_mb: DEFAULT_XZ_MEMLIMIT_MB,
+            ssh_password_file: None,
+            ssh_compress: false,
+            wh_bin: None,
         }
     }
 }

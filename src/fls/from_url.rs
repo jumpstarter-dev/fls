@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::block_writer::DeviceWriter;
 use crate::fls::byte_channel::byte_bounded_channel;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{get_compression_from_url, start_inprocess_decompressor};
@@ -42,7 +42,7 @@ use crate::fls::download_error::handle_download_retry;
 /// Execute a sequence of write commands on the block writer
 async fn execute_write_commands(
     commands: Vec<WriteCommand>,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<()> {
@@ -92,7 +92,7 @@ async fn execute_write_commands(
 async fn process_sparse_data(
     parser: &mut SparseParser,
     data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<()> {
@@ -107,7 +107,7 @@ async fn process_sparse_data(
 /// Write data to the block writer with error reporting
 async fn write_regular_data(
     data: Vec<u8>,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
 ) -> io::Result<()> {
     writer.write(data).await.map_err(|e| {
@@ -121,7 +121,7 @@ async fn handle_detected_format(
     format: FileFormat,
     consumed_bytes: Vec<u8>,
     remaining_data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<Option<SparseParser>> {
@@ -187,13 +187,7 @@ pub async fn flash_from_url(
     );
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(
-        options.common.device.clone(),
-        written_progress_tx,
-        options.common.debug,
-        options.common.o_direct,
-        options.common.write_buffer_size_mb,
-    )?;
+    let block_writer = DeviceWriter::new(&options.common, written_progress_tx)?;
 
     // Create byte-bounded download buffer
     let buffer_size_mb = options.common.buffer_size_mb;

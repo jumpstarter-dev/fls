@@ -408,6 +408,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "crc32fast",
  "flate2",
  "futures-util",
  "http-body",
