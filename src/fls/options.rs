@@ -24,6 +24,7 @@ pub struct FlashOptions {
     pub ssh_password_file: Option<String>,
     pub ssh_compress: bool,
     pub ssh_port: Option<u16>,
+    pub strict_ssh_host_key_checking: bool,
     pub wh_bin: Option<String>,
 }
 
@@ -44,6 +45,7 @@ impl Default for FlashOptions {
             ssh_password_file: None,
             ssh_compress: false,
             ssh_port: None,
+            strict_ssh_host_key_checking: false,
             wh_bin: None,
         }
     }
