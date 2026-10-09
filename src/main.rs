@@ -45,7 +45,7 @@ enum Commands {
         /// Buffer size in MB for download buffering (default: 128 MB)
         #[arg(long, default_value = "128")]
         buffer_size: usize,
-        /// Write buffer size in MB for decompressed data buffering (default: 128 MB)
+        /// Write buffer size in MB; also limits remote unacknowledged DATA (default: 128 MB)
         #[arg(long, default_value = "128")]
         write_buffer_size: usize,
         /// Maximum number of retry attempts for failed downloads (default: 10)
