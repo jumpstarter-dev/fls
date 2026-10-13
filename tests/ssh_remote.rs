@@ -127,7 +127,11 @@ exec "$@"
             .args([
                 "from-url",
                 &format!("{}/image.img.gz", server.uri()),
-                &format!("root@fake-host:{}", device.display()),
+                &if auth == "config-port" {
+                    format!("root@fake-host:{}", device.display())
+                } else {
+                    format!("ssh://root@fake-host:11223{}", device.display())
+                },
                 "--ssh-compress",
                 "--wh-bin",
             ])
@@ -150,9 +154,6 @@ exec "$@"
             .env_remove("HOST_KEY_UNKNOWN")
             .env_remove("STRICT_CHECK")
             .kill_on_drop(true);
-        if auth != "config-port" {
-            command.args(["--ssh-port", "11223"]);
-        }
         if auth.starts_with("strict-") {
             command
                 .arg("--strict-ssh-host-key-checking")

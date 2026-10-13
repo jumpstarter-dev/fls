@@ -23,7 +23,6 @@ pub struct FlashOptions {
     pub xz_memlimit_mb: u64,
     pub ssh_password_file: Option<String>,
     pub ssh_compress: bool,
-    pub ssh_port: Option<u16>,
     pub strict_ssh_host_key_checking: bool,
     pub wh_bin: Option<String>,
 }
@@ -44,7 +43,6 @@ impl Default for FlashOptions {
             xz_memlimit_mb: DEFAULT_XZ_MEMLIMIT_MB,
             ssh_password_file: None,
             ssh_compress: false,
-            ssh_port: None,
             strict_ssh_host_key_checking: false,
             wh_bin: None,
         }

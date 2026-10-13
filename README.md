@@ -39,12 +39,16 @@ sudo cp target/release/fls /usr/local/bin/
 
 ### Remote devices over SSH
 
-Use `[user@]host:/absolute/device` as the destination for HTTP/HTTPS or OCI images:
+Use `ssh://[user@]host[:port]/device` as the destination for HTTP/HTTPS or OCI images:
 
 ```bash
-fls from-url "https://example.com/image.img.xz" root@board:/dev/emmc0
-fls from-url "oci://quay.io/org/image:latest" root@board:/dev/emmc0
+fls from-url "https://example.com/image.img.xz" ssh://root@board/dev/emmc0
+fls from-url "oci://quay.io/org/image:latest" ssh://root@board:2222/dev/emmc0
+# IPv6
+fls from-url "https://example.com/image.img.xz" ssh://root@[::1]/dev/emmc0
 ```
+
+The legacy form `[user@]host:/device` is still accepted (no IPv6 or inline port).
 
 `fls` uploads its embedded aarch64-QNX write head over SSH, then streams framed
 commands. For another target architecture/OS, build the appropriate write head
@@ -53,8 +57,7 @@ and use `--wh-bin /path/to/flswh`. When building from source, run
 work without it. See [remote/README.md](remote/README.md) for build instructions.
 
 SSH keys, agents, ports, and aliases use the system `ssh` and your
-`~/.ssh/config`. `--ssh-port <port>` overrides the port for platform detection,
-upload, and flashing; without it the SSH configuration is used. `-p` remains
+`~/.ssh/config`. Set the port inline: `ssh://host:2222/dev/x`. `-p` remains
 the registry-password option. Password authentication uses `sshpass` with
 `--ssh-password-file <path>` (`FLS_SSH_PASS_FILE`) or, if no file is specified,
 the `SSHPASS` environment variable. `--ssh-compress` enables SSH compression;

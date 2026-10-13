@@ -80,20 +80,58 @@ impl<R: Read> FrameReader<R> {
     }
 }
 
-pub(crate) fn parse_ssh_target(device: &str) -> Option<(String, String)> {
+/// Parsed SSH destination.
+pub(crate) struct SshTarget {
+    pub host: String,
+    pub port: Option<u16>,
+    pub device: String,
+}
+
+/// Parse `ssh://[user@]host[:port]/device` (with IPv6 bracket support) or
+/// the legacy `[user@]host:/device` form.  Returns `None` for local paths.
+pub(crate) fn parse_ssh_target(device: &str) -> Option<SshTarget> {
     if device.starts_with('/') {
         return None;
     }
-    device
-        .split_once(':')
-        .map(|(host, path)| (host.to_owned(), path.to_owned()))
+    if let Some(rest) = device.strip_prefix("ssh://") {
+        let slash = rest.find('/')?;
+        let authority = &rest[..slash];
+        let device_path = &rest[slash..];
+        if authority.is_empty() || device_path.len() < 2 {
+            return None;
+        }
+        // Find the host:port boundary, respecting IPv6 brackets.
+        let port_start = match authority.rfind(']') {
+            Some(i) => i + 1,
+            None => authority.find('@').map_or(0, |i| i + 1),
+        };
+        let (host_part, port) = match authority[port_start..].find(':') {
+            Some(i) => {
+                let p = authority[port_start + i + 1..].parse::<u16>().ok()?;
+                (&authority[..port_start + i], Some(p))
+            }
+            None => (authority, None),
+        };
+        let host = host_part.replace(['[', ']'], "");
+        if host.is_empty() {
+            return None;
+        }
+        return Some(SshTarget { host, port, device: device_path.to_owned() });
+    }
+    // Legacy: [user@]host:/device
+    let (host, path) = device.split_once(':')?;
+    if host.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some(SshTarget { host: host.to_owned(), port: None, device: path.to_owned() })
 }
+
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Command {
+fn ssh_command(host: &str, remote_command: &str, port: Option<u16>, options: &FlashOptions) -> Command {
     let mut command = if let Some(file) = &options.ssh_password_file {
         let mut command = Command::new("sshpass");
         command.args(["-f", file, "ssh"]);
@@ -108,7 +146,7 @@ fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Comm
     if options.ssh_compress {
         command.arg("-C");
     }
-    if let Some(port) = options.ssh_port {
+    if let Some(port) = port {
         command.arg("-p").arg(port.to_string());
     }
     // Streaming stdin belongs to the protocol; terminal prompts would stall it.
@@ -131,11 +169,11 @@ fn ssh_command(host: &str, remote_command: &str, options: &FlashOptions) -> Comm
     command
 }
 
-fn detect_target(host: &str, options: &FlashOptions) -> io::Result<(String, String, String)> {
+fn detect_target(host: &str, port: Option<u16>, options: &FlashOptions) -> io::Result<(String, String, String)> {
     let command = "PATH=/proc/boot:/usr/bin:/bin:$PATH; \
         os=$(uname -s) || exit; echo \"$os\"; \
         if [ \"$os\" = QNX ]; then uname -p; else uname -m; fi || exit; uname -r";
-    let output = ssh_command(host, command, options)
+    let output = ssh_command(host, command, port, options)
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
@@ -145,12 +183,9 @@ fn detect_target(host: &str, options: &FlashOptions) -> io::Result<(String, Stri
         } else {
             stderr.trim()
         };
-        let port = options
-            .ssh_port
-            .map(|port| format!(" -p {port}"))
-            .unwrap_or_default();
+        let port_flag = port.map(|p| format!(" -p {p}")).unwrap_or_default();
         return Err(io::Error::other(format!(
-            "SSH to {host} failed ({}): {reason}\nCheck the connection with `ssh{port} {}`",
+            "SSH to {host} failed ({}): {reason}\nCheck the connection with `ssh{port_flag} {}`",
             output.status,
             shell_quote(host)
         )));
@@ -179,12 +214,12 @@ fn check_embedded_target(os: &str, arch: &str, release: &str) -> io::Result<()> 
     ))
 }
 
-fn upload_wh(host: &str, binary: &[u8], options: &FlashOptions) -> io::Result<()> {
+fn upload_wh(host: &str, binary: &[u8], port: Option<u16>, options: &FlashOptions) -> io::Result<()> {
     // QNX boot-image utilities may be absent from the default PATH.
     let remote_command =
         format!("PATH=/proc/boot:/usr/bin:/bin:$PATH; cat > {REMOTE_WH} && chmod +x {REMOTE_WH}");
     // ponytail: one upload path per host; use unique paths for concurrent flash sessions.
-    let mut child = ssh_command(host, &remote_command, options)
+    let mut child = ssh_command(host, &remote_command, port, options)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -594,6 +629,7 @@ pub(crate) struct SshBlockWriter {
 impl SshBlockWriter {
     pub(crate) fn new(
         host: String,
+        port: Option<u16>,
         device: String,
         progress: mpsc::UnboundedSender<u64>,
         options: &FlashOptions,
@@ -607,10 +643,10 @@ impl SshBlockWriter {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Expected [user@]host:/absolute/device",
+                "Expected ssh://[user@]host[:port]/device or [user@]host:/device",
             ));
         }
-        if options.ssh_port == Some(0) {
+        if port == Some(0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SSH port must be between 1 and 65535",
@@ -642,16 +678,16 @@ impl SshBlockWriter {
         let error_state = Arc::clone(&writer_error);
         let writer_handle = tokio::task::spawn_blocking(move || {
             let result = (|| {
-                let (os, arch, release) = detect_target(&host, &options)?;
+                let (os, arch, release) = detect_target(&host, port, &options)?;
                 if options.wh_bin.is_none() {
                     check_embedded_target(&os, &arch, &release)?;
                 }
                 if options.debug {
                     eprintln!("[DEBUG] Remote platform: {os} {arch} {release}");
                 }
-                upload_wh(&host, &binary, &options)?;
+                upload_wh(&host, &binary, port, &options)?;
                 let remote_command = format!("{REMOTE_WH} {}", shell_quote(&device));
-                let child = ssh_command(&host, &remote_command, &options)
+                let child = ssh_command(&host, &remote_command, port, &options)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::inherit())
@@ -786,19 +822,30 @@ mod tests {
 
     #[test]
     fn target_parsing_auth_and_shell_quoting() {
-        assert_eq!(
-            parse_ssh_target("root@board:/dev/emmc0"),
-            Some(("root@board".into(), "/dev/emmc0".into()))
-        );
-        assert_eq!(parse_ssh_target("/dev/disk:local"), None);
-        assert_eq!(parse_ssh_target("image.img"), None);
+        fn t(input: &str) -> Option<(String, Option<u16>, String)> {
+            parse_ssh_target(input).map(|t| (t.host, t.port, t.device))
+        }
+        // Legacy form
+        assert_eq!(t("root@board:/dev/emmc0"), Some(("root@board".into(), None, "/dev/emmc0".into())));
+        // ssh:// with port
+        assert_eq!(t("ssh://root@board:2222/dev/emmc0"), Some(("root@board".into(), Some(2222), "/dev/emmc0".into())));
+        // ssh:// without port
+        assert_eq!(t("ssh://board/dev/emmc0"), Some(("board".into(), None, "/dev/emmc0".into())));
+        // ssh:// IPv6 with port
+        assert_eq!(t("ssh://root@[::1]:2222/dev/emmc0"), Some(("root@::1".into(), Some(2222), "/dev/emmc0".into())));
+        // ssh:// IPv6 without port
+        assert_eq!(t("ssh://root@[::1]/dev/emmc0"), Some(("root@::1".into(), None, "/dev/emmc0".into())));
+        // Local paths and non-SSH strings
+        assert_eq!(t("/dev/disk:local"), None);
+        assert_eq!(t("image.img"), None);
+        // Reject bare path after ssh://
+        assert_eq!(t("ssh:///dev/foo"), None);
         let options = FlashOptions {
             ssh_password_file: Some("password file".into()),
             ssh_compress: true,
-            ssh_port: Some(11223),
             ..Default::default()
         };
-        let command = ssh_command("board", "echo ready", &options);
+        let command = ssh_command("board", "echo ready", Some(11223), &options);
         assert_eq!(command.get_program(), "sshpass");
         let args: Vec<_> = command
             .get_args()

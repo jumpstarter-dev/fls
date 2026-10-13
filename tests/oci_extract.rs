@@ -192,9 +192,7 @@ async fn oci_cli_reports_ssh_connection_failures_without_mixing_progress() {
             .args([
                 "from-url",
                 &format!("oci://{address}/{REPO}:{TAG}"),
-                &format!("root@fake-host:{}", device.display()),
-                "--ssh-port",
-                "11223",
+                &format!("ssh://root@fake-host:11223{}", device.display()),
                 "--progress-interval",
                 "0",
                 "--insecure-tls",

@@ -81,9 +81,6 @@ enum Commands {
         /// Enable SSH compression
         #[arg(long)]
         ssh_compress: bool,
-        /// SSH port (defaults to SSH configuration)
-        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
-        ssh_port: Option<u16>,
         /// Require verified SSH host keys (default: skip host-key checks)
         #[arg(long)]
         strict_ssh_host_key_checking: bool,
@@ -157,7 +154,6 @@ async fn main() {
             xz_memlimit,
             ssh_password_file,
             ssh_compress,
-            ssh_port,
             strict_ssh_host_key_checking,
             wh_bin,
         } => {
@@ -215,8 +211,7 @@ async fn main() {
                         xz_memlimit_mb: xz_memlimit,
                         ssh_password_file,
                         ssh_compress,
-                        ssh_port,
-                        strict_ssh_host_key_checking,
+                                    strict_ssh_host_key_checking,
                         wh_bin,
                     },
                     username,
@@ -299,8 +294,7 @@ async fn main() {
                         xz_memlimit_mb: xz_memlimit,
                         ssh_password_file,
                         ssh_compress,
-                        ssh_port,
-                        strict_ssh_host_key_checking,
+                                    strict_ssh_host_key_checking,
                         wh_bin,
                     },
                     max_retries,

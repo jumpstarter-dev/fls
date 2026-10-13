@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use tokio::sync::mpsc;
 
 use super::options::FlashOptions;
-use super::ssh_writer::{parse_ssh_target, SshBlockWriter};
+use super::ssh_writer::{parse_ssh_target, SshBlockWriter, SshTarget};
 
 const BLOCK_SIZE: usize = 1024 * 1024; // 1MB blocks for better throughput
 const ALIGNMENT: usize = 4096; // 4KB alignment for direct I/O
@@ -606,9 +606,10 @@ impl DeviceWriter {
         options: &FlashOptions,
         progress: mpsc::UnboundedSender<u64>,
     ) -> io::Result<Self> {
-        if let Some((host, device)) = parse_ssh_target(&options.device) {
+        if let Some(target) = parse_ssh_target(&options.device) {
+            let SshTarget { host, port, device } = target;
             Ok(Self::Ssh(SshBlockWriter::new(
-                host, device, progress, options,
+                host, port, device, progress, options,
             )?))
         } else {
             Ok(Self::Local(AsyncBlockWriter::new(
