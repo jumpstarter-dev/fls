@@ -133,6 +133,7 @@ def main():
                        input=frame(OP_SEEK, struct.pack("<Q", 0))
                        + frame(OP_DATA, struct.pack("<I", len(bad)) + bad
                               + struct.pack("<I", 0xDEADBEEF))
+                       + frame(OP_SIZE, b"")
                        + frame(OP_QUIT, b""),
                        capture_output=True, timeout=10, check=True)
     assert parse(r.stdout) == [
@@ -180,6 +181,7 @@ static ssize_t fault_read(int fd, void *buf, size_t n) {
 }
 static off_t fault_seek(int fd, off_t off, int whence) {
     if (whence == SEEK_END) { errno = EIO; return -1; }
+    if (whence == SEEK_SET && off == 123) { errno = EIO; return -1; }
     off_t result = lseek(fd, off, whence);
     if (result >= 0) errno = EINVAL;
     return result;
@@ -201,41 +203,52 @@ static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
     seek0 = frame(OP_SEEK, struct.pack("<Q", 0))
 
     # Every ERR is fatal: the write head exits right after reporting it.
-    # Run each fault in a fresh process and check the exact record sequence.
-    # (A partial write is not counted: total tracks acknowledged bytes only.)
+    # Queue a valid write after each fault and keep stdin open: the process
+    # must report ERR and exit without executing the write or waiting for EOF.
     seek_ack = (R_ACK, struct.pack("<BQQ", OP_SEEK, 0, 0))
 
-    def fault_run(script, err, total):
-        r = subprocess.run([fault_bin, blk], input=script,
-                           capture_output=True, timeout=10, check=True)
-        assert parse(r.stdout) == [
+    def fault_run(script, err):
+        marker_offset = (1 << 20) - 4
+        with open(blk, "rb") as f:
+            f.seek(marker_offset)
+            marker = f.read(4)
+        followup = frame(OP_SEEK, struct.pack("<Q", marker_offset)) + data(b"NEXT")
+        with subprocess.Popen([fault_bin, blk], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+            p.stdin.write(seek0 + script + followup)
+            p.stdin.flush()
+            try:
+                p.wait(timeout=10)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+            out = p.stdout.read()
+            assert p.returncode == 0, p.stderr.read()
+        assert parse(out) == [
             (R_READY, struct.pack("<BQ", 1, 0)),
             seek_ack,
             (R_ERR, struct.pack("<BBIQ", *err)),
-            (R_DONE, struct.pack("<Q", total)),
-        ], r.stdout
+            (R_DONE, struct.pack("<Q", 0)),
+        ], out
+        with open(blk, "rb") as f:
+            f.seek(marker_offset)
+            assert f.read(4) == marker, "write after ERR was executed"
 
     # SIZE: the SEEK_END probe at open failed (EIO), so the query reports it.
-    # (No SEEK in this script, so no ACK record.)
-    r = subprocess.run([fault_bin, blk], input=frame(OP_SIZE, b""),
-                       capture_output=True, timeout=10, check=True)
-    assert parse(r.stdout) == [
-        (R_READY, struct.pack("<BQ", 1, 0)),
-        (R_ERR, struct.pack("<BBIQ", 0, OP_SIZE, errno.EIO, 0)),
-        (R_DONE, struct.pack("<Q", 0)),
-    ], r.stdout
+    fault_run(frame(OP_SIZE, b""), (0, OP_SIZE, errno.EIO, 0))
     # DATA: 16 -> 8 partial write, then EIO on the retry.
-    fault_run(seek0 + data(bytes(range(16))), (0, OP_DATA, errno.EIO, 0), 0)
+    fault_run(data(bytes(range(16))), (0, OP_DATA, errno.EIO, 0))
     # DATA: a zero-progress write is a hard error.
-    fault_run(seek0 + data(bytes(32)), (0, OP_DATA, errno.EIO, 0), 0)
+    fault_run(data(bytes(32)), (0, OP_DATA, errno.EIO, 0))
     # READ: 16 -> 8 partial read, then EIO on the retry.
-    fault_run(seek0 + frame(OP_READ, struct.pack("<Q", 16)),
-              (0, OP_READ, errno.EIO, 0), 0)
+    fault_run(frame(OP_READ, struct.pack("<Q", 16)), (0, OP_READ, errno.EIO, 0))
     # ZERO: 16 -> 8 partial write, then EIO on the retry.
-    fault_run(seek0 + frame(OP_ZERO, struct.pack("<Q", 16)),
-              (0, OP_ZERO, errno.EIO, 0), 0)
+    fault_run(frame(OP_ZERO, struct.pack("<Q", 16)), (0, OP_ZERO, errno.EIO, 0))
+    # SEEK: reject the injected failing offset.
+    fault_run(frame(OP_SEEK, struct.pack("<Q", 123)), (0, OP_SEEK, errno.EIO, 123))
     # SYNC: the sync always fails.
-    fault_run(seek0 + frame(OP_SYNC, b""), (0, OP_SYNC, errno.EIO, 0), 0)
+    fault_run(frame(OP_SYNC, b""), (0, OP_SYNC, errno.EIO, 0))
 
     # A malformed SIZE is fatal too: the write head exits and the second
     # SIZE in the stream is never processed.
