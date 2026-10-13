@@ -34,6 +34,8 @@
  *            AUTH_RESULT(0x87) HELLO(0x88)   [reserved]
  *
  * DATA payload:  size:u32 + content[size] + crc:u32 (CRC32-IEEE of content)
+ *                (size must be <= 8 MiB; the payload is staged and CRC-
+ *                validated before any device write)
  * SEEK payload:  offset:u64
  * SYNC/QUIT/SIZE: (no payload)
  * READ payload:  len:u64  (read len bytes from the current offset, advance it;
@@ -73,6 +75,7 @@ static const unsigned char PROTO_VER = 1;
 static const size_t PROG_STEP = WRITE_CHUNK_SIZE; /* emit PROG every chunk */
 #define MAX_READ (1u << 20)                /* cap a single READ at 1 MiB */
 static unsigned char dbuf[MAX_READ];       /* device read buffer */
+#define MAX_DATA WRITE_CHUNK_SIZE          /* cap a single DATA at the staging buffer size */
 
 /* --- little-endian packing --- */
 static unsigned int rd_u32(const unsigned char *p)
@@ -292,17 +295,34 @@ int main(int argc, char **argv)
                 err_rec(ERR_NI, OP_DATA, 0, cur);
                 break;
             }
+            if (size > MAX_DATA) { err_rec(ERR_NI, OP_DATA, 0, cur); break; }
+            /* Stage the whole payload, validate the CRC, and only then touch
+             * the device: a corrupt chunk must not leave bytes behind. */
+            static unsigned char buf[WRITE_CHUNK_SIZE];
             unsigned long long start = cur;
             crc_reset();
+            unsigned long long rd = 0;
+            int fail = 0;
+            while (rd < size) {
+                size_t want = (size_t)(size - rd);
+                if (want > sizeof buf) want = sizeof buf;
+                if (!rreadn(buf + rd, want)) { fail = 1; break; }
+                crc_update(buf + rd, want);
+                rd += want;
+            }
+            if (fail) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
+            unsigned char crcf[4];
+            if (!rreadn(crcf, 4)) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
+            if (crc_final() != rd_u32(crcf)) {
+                err_rec(ERR_CRC, OP_DATA, 0, start);
+                break;
+            }
             unsigned long long done = 0, next_prog = PROG_STEP;
-            int status = 0;  /* 0=ok, 1=eof, 2=write error */
-            static unsigned char chunk[WRITE_CHUNK_SIZE];
+            int werr = 0;
             while (done < size) {
                 size_t want = (size_t)(size - done);
-                if (want > sizeof chunk) want = sizeof chunk;
-                if (!rreadn(chunk, want)) { status = 1; break; }
-                crc_update(chunk, want);
-                if (write_all(fd, chunk, want) < 0) { status = 2; break; }
+                if (want > sizeof buf) want = sizeof buf;
+                if (write_all(fd, buf + done, want) < 0) { werr = errno; break; }
                 done += want;
                 while (done >= next_prog) {
                     unsigned char pp[16];
@@ -313,17 +333,7 @@ int main(int argc, char **argv)
             }
             cur = start + done;
             total += done;
-            if (status) {
-                int e = status == 2 ? errno : 0;
-                err_rec(ERR_DEV, OP_DATA, (unsigned)e, start);
-                break;
-            }
-            unsigned char crcf[4];
-            if (!rreadn(crcf, 4)) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
-            if (crc_final() != rd_u32(crcf)) {
-                err_rec(ERR_CRC, OP_DATA, 0, start);
-                break;
-            }
+            if (werr) { err_rec(ERR_DEV, OP_DATA, (unsigned)werr, start); break; }
             ok_rec(OP_DATA, start, done);
         }
 

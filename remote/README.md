@@ -34,7 +34,9 @@ scans for it to resync after any corruption.
 
 The `READY` payload is `version:u8 + size:u64` (total device bytes, measured
 at open); the protocol version is currently 1. `DATA` is
-`size:u32 + content + crc:u32` (CRC32-IEEE);
+`size:u32 + content + crc:u32` (CRC32-IEEE, capped at 8 MiB); the payload is
+staged and CRC-validated before the device is written, so a corrupt chunk
+leaves no bytes behind.
 `READ` is `len:u64` (reads from the current offset, advances it, capped at
 1 MiB) and returns `READ_DATA` with the bytes. `ZERO` is `len:u64` — writes
 that many zeros from the current offset and advances it, sending only the 8

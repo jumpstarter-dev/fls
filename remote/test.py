@@ -126,6 +126,36 @@ def main():
     assert head == content, f"file bytes mismatch: {head.hex()} != {content.hex()}"
     assert zeros == b"\0" * 256, f"ZERO region not zeroed: {zeros[:16].hex()}..."
 
+    # A CRC mismatch is fatal and must not touch the device: the (distinct)
+    # payload must not land at offset 0.
+    bad = b"X" * 16
+    r = subprocess.run([binp, blk],
+                       input=frame(OP_SEEK, struct.pack("<Q", 0))
+                       + frame(OP_DATA, struct.pack("<I", len(bad)) + bad
+                              + struct.pack("<I", 0xDEADBEEF))
+                       + frame(OP_QUIT, b""),
+                       capture_output=True, timeout=10, check=True)
+    assert parse(r.stdout) == [
+        (R_READY, struct.pack("<BQ", 1, 1 << 20)),
+        (R_ACK, struct.pack("<BQQ", OP_SEEK, 0, 0)),
+        (R_ERR, struct.pack("<BBIQ", 1, OP_DATA, 0, 0)),
+        (R_DONE, struct.pack("<Q", 0)),
+    ], r.stdout
+    with open(blk, "rb") as f:
+        assert f.read(16) == content, "device modified despite CRC mismatch"
+
+    # An oversized DATA (above the 8 MiB cap) is rejected before staging.
+    big = b"y" * ((8 << 20) + 1)
+    r = subprocess.run([binp, blk],
+                       input=frame(OP_DATA, struct.pack("<I", len(big)) + big
+                                  + struct.pack("<I", zlib.crc32(big))),
+                       capture_output=True, timeout=60, check=True)
+    assert parse(r.stdout) == [
+        (R_READY, struct.pack("<BQ", 1, 1 << 20)),
+        (R_ERR, struct.pack("<BBIQ", 2, OP_DATA, 0, 0)),
+        (R_DONE, struct.pack("<Q", 0)),
+    ], r.stdout
+
     # Inject short I/O followed by EIO, zero-progress writes, and SYNC failure.
     # Successful lseek deliberately changes errno to catch lost error codes.
     fault_src = os.path.join(tmpdir, "faults.c")
