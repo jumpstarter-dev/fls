@@ -232,17 +232,6 @@ static int read_magic(void)
         w[0] = w[1]; w[1] = w[2]; w[2] = b;
     }
 }
-/* skip n bytes from the stream (drop a malformed frame's remainder); 0 on EOF */
-static int skip(unsigned long long n)
-{
-    unsigned char b[1 << 16];
-    while (n > 0) {
-        size_t take = (n > sizeof b) ? sizeof b : (size_t)n;
-        if (!rreadn(b, take)) return 0;
-        n -= take;
-    }
-    return 1;
-}
 
 /* read all, retrying on partial reads; -1 on error (errno set), else the bytes
  * read (which may be < len near end of device) */
@@ -287,33 +276,31 @@ int main(int argc, char **argv)
             break;
 
         else if (op == OP_SIZE) {
-            if (plen != 0) { skip(plen); err_rec(ERR_NI, OP_SIZE, 0, cur); continue; }
-            if (sz < 0) { err_rec(ERR_DEV, OP_SIZE, (unsigned)size_errno, cur); continue; }
+            if (plen != 0) { err_rec(ERR_NI, OP_SIZE, 0, cur); break; }
+            if (sz < 0) { err_rec(ERR_DEV, OP_SIZE, (unsigned)size_errno, cur); break; }
             unsigned char p[8];
             wr_u64(p, (unsigned long long)sz);
             emit(R_SIZE, p, sizeof p);
         }
 
         else if (op == OP_DATA) {
-            if (plen < 8) { skip(plen); err_rec(ERR_NI, OP_DATA, 0, cur); continue; }
+            if (plen < 8) { err_rec(ERR_NI, OP_DATA, 0, cur); break; }
             unsigned char szf[4];
             if (!rreadn(szf, 4)) break;
             unsigned int size = rd_u32(szf);
             if (plen != 8 + (unsigned long long)size) {  /* malformed frame */
-                skip(plen - 4);
                 err_rec(ERR_NI, OP_DATA, 0, cur);
-                continue;
+                break;
             }
             unsigned long long start = cur;
             crc_reset();
-            unsigned long long done = 0, rd = 0, next_prog = PROG_STEP;  /* rd = bytes read from the stream */
+            unsigned long long done = 0, next_prog = PROG_STEP;
             int status = 0;  /* 0=ok, 1=eof, 2=write error */
             static unsigned char chunk[WRITE_CHUNK_SIZE];
             while (done < size) {
                 size_t want = (size_t)(size - done);
                 if (want > sizeof chunk) want = sizeof chunk;
                 if (!rreadn(chunk, want)) { status = 1; break; }
-                rd += want;
                 crc_update(chunk, want);
                 if (write_all(fd, chunk, want) < 0) { status = 2; break; }
                 done += want;
@@ -326,32 +313,22 @@ int main(int argc, char **argv)
             }
             cur = start + done;
             total += done;
-            if (status == 1) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
-            if (status == 2) {
-                int e = errno;
-                if (!skip((unsigned long long)(size - rd) + 4)) {  /* unread content + CRC; failed chunk already consumed */
-                    err_rec(ERR_DEV, OP_DATA, (unsigned)e, start);
-                    break;
-                }
-                if (lseek(fd, (off_t)cur, SEEK_SET) < 0) {
-                    err_rec(ERR_DEV, OP_DATA, (unsigned)errno, cur);
-                    break;
-                }
+            if (status) {
+                int e = status == 2 ? errno : 0;
                 err_rec(ERR_DEV, OP_DATA, (unsigned)e, start);
+                break;
             }
-            else if (done < size) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
-            else {
-                unsigned char crcf[4];
-                if (!rreadn(crcf, 4)) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
-                if (crc_final() != rd_u32(crcf))
-                    err_rec(ERR_CRC, OP_DATA, 0, start);
-                else
-                    ok_rec(OP_DATA, start, done);
+            unsigned char crcf[4];
+            if (!rreadn(crcf, 4)) { err_rec(ERR_DEV, OP_DATA, 0, start); break; }
+            if (crc_final() != rd_u32(crcf)) {
+                err_rec(ERR_CRC, OP_DATA, 0, start);
+                break;
             }
+            ok_rec(OP_DATA, start, done);
         }
 
         else if (op == OP_ZERO) {
-            if (plen != 8) { skip(plen); err_rec(ERR_NI, OP_ZERO, 0, cur); continue; }
+            if (plen != 8) { err_rec(ERR_NI, OP_ZERO, 0, cur); break; }
             unsigned char lf[8];
             if (!rreadn(lf, 8)) break;
             unsigned long long len = rd_u64(lf);
@@ -373,56 +350,53 @@ int main(int argc, char **argv)
             cur = start + done;
             total += done;
             if (status) {
-                if (lseek(fd, (off_t)cur, SEEK_SET) < 0) {
-                    err_rec(ERR_DEV, OP_ZERO, (unsigned)errno, cur);
-                    break;
-                }
-                err_rec(ERR_DEV, OP_ZERO, (unsigned)status, start);  /* no drain: nothing left in the stream */
+                err_rec(ERR_DEV, OP_ZERO, (unsigned)status, start);
+                break;
             }
-            else ok_rec(OP_ZERO, start, done);
+            ok_rec(OP_ZERO, start, done);
         }
 
         else if (op == OP_SEEK) {
-            if (plen != 8) { skip(plen); err_rec(ERR_NI, OP_SEEK, 0, cur); continue; }
+            if (plen != 8) { err_rec(ERR_NI, OP_SEEK, 0, cur); break; }
             unsigned char of[8];
             if (!rreadn(of, 8)) break;
             unsigned long long off = rd_u64(of);
-            if (lseek(fd, off, SEEK_SET) < 0)
+            if (lseek(fd, off, SEEK_SET) < 0) {
                 err_rec(ERR_DEV, OP_SEEK, (unsigned)errno, off);
-            else { ok_rec(OP_SEEK, off, 0); cur = off; }
+                break;
+            }
+            ok_rec(OP_SEEK, off, 0);
+            cur = off;
         }
 
         else if (op == OP_READ) {
-            if (plen != 8) { skip(plen); err_rec(ERR_NI, OP_READ, 0, cur); continue; }
+            if (plen != 8) { err_rec(ERR_NI, OP_READ, 0, cur); break; }
             unsigned char lf[8];
             if (!rreadn(lf, 8)) break;
             unsigned long long len = rd_u64(lf);
-            if (len > MAX_READ) { err_rec(ERR_DEV, OP_READ, 22, cur); continue; }  /* 22 = EINVAL */
+            if (len > MAX_READ) { err_rec(ERR_DEV, OP_READ, 22, cur); break; }  /* 22 = EINVAL */
             ssize_t n = read_all(fd, dbuf, (size_t)len);
             if (n < 0) {
                 int e = errno;
-                if (lseek(fd, (off_t)cur, SEEK_SET) < 0) {
-                    err_rec(ERR_DEV, OP_READ, (unsigned)errno, cur);
-                    break;
-                }
                 err_rec(ERR_DEV, OP_READ, (unsigned)e, cur);
-                continue;
+                break;
             }
             emit(R_READ_DATA, dbuf, (size_t)n);  /* the bytes read (may be empty) */
             cur += (unsigned long long)n;
         }
 
         else if (op == OP_SYNC) {
-            if (plen != 0) { skip(plen); err_rec(ERR_NI, OP_SYNC, 0, cur); continue; }
-            if (sync_file(fd) < 0)
+            if (plen != 0) { err_rec(ERR_NI, OP_SYNC, 0, cur); break; }
+            if (sync_file(fd) < 0) {
                 err_rec(ERR_DEV, OP_SYNC, (unsigned)errno, cur);  /* durability not achieved; don't claim it */
-            else
-                ok_rec(OP_SYNC, cur, 0);
+                break;
+            }
+            ok_rec(OP_SYNC, cur, 0);
         }
 
         else {  /* reserved (AUTH/HELLO) or unknown opcode */
-            skip(plen);
             err_rec(ERR_NI, op, 0, cur);
+            break;
         }
     }
 

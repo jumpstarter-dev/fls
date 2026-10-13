@@ -18,7 +18,8 @@ Opens `<device>` (`O_RDWR`), reports its size (`READY`), then reads framed
 commands from stdin and writes them to the device, emitting framed records to
 stdout. Intended to be driven by a remote client (e.g. over SSH). QUIT or
 EOF exits.
-Device I/O errors are reported (`ERR`) and processing continues.
+Device I/O errors are reported (`ERR`), after which the write head exits;
+the client treats any `ERR` as fatal.
 
 ## Protocol
 

@@ -169,27 +169,46 @@ static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
                      + struct.pack("<I", zlib.crc32(content)))
 
     seek0 = frame(OP_SEEK, struct.pack("<Q", 0))
-    prefix = b"abcd"
-    script = frame(OP_SIZE, b"") + seek0 + data(bytes(range(16))) + data(prefix)
-    script += seek0 + frame(OP_READ, struct.pack("<Q", 16))
-    script += frame(OP_READ, struct.pack("<Q", 4))
-    script += seek0 + frame(OP_ZERO, struct.pack("<Q", 16)) + data(prefix)
-    script += seek0 + data(bytes(32)) + data(prefix)
-    script += frame(OP_SYNC, b"") + frame(OP_QUIT, b"")
-    r = subprocess.run([fault_bin, blk], input=script,
-                       capture_output=True, timeout=10, check=True)
-    recs = parse(r.stdout)
-    errors = [struct.unpack("<BBIQ", p) for op, p in recs if op == R_ERR]
-    assert errors == [(0, op, errno.EIO, off) for op, off in
-                      ((OP_SIZE, 0), (OP_DATA, 0), (OP_READ, 0), (OP_ZERO, 0), (OP_DATA, 0), (OP_SYNC, 4))], errors
-    writes = [struct.unpack("<BQQ", p) for op, p in recs if op == R_ACK and p[0] == OP_DATA]
-    assert writes == [(OP_DATA, 0, 4)] * 3, writes
-    assert [p for op, p in recs if op == R_READ_DATA] == [prefix], recs
-    assert recs[-1] == (R_DONE, struct.pack("<Q", 12)), recs[-1]
-    with open(blk, "rb") as f:
-        assert f.read(4) == prefix
 
-    # A malformed SIZE is drained; a valid empty device still reports size zero.
+    # Every ERR is fatal: the write head exits right after reporting it.
+    # Run each fault in a fresh process and check the exact record sequence.
+    # (A partial write is not counted: total tracks acknowledged bytes only.)
+    seek_ack = (R_ACK, struct.pack("<BQQ", OP_SEEK, 0, 0))
+
+    def fault_run(script, err, total):
+        r = subprocess.run([fault_bin, blk], input=script,
+                           capture_output=True, timeout=10, check=True)
+        assert parse(r.stdout) == [
+            (R_READY, struct.pack("<BQ", 1, 0)),
+            seek_ack,
+            (R_ERR, struct.pack("<BBIQ", *err)),
+            (R_DONE, struct.pack("<Q", total)),
+        ], r.stdout
+
+    # SIZE: the SEEK_END probe at open failed (EIO), so the query reports it.
+    # (No SEEK in this script, so no ACK record.)
+    r = subprocess.run([fault_bin, blk], input=frame(OP_SIZE, b""),
+                       capture_output=True, timeout=10, check=True)
+    assert parse(r.stdout) == [
+        (R_READY, struct.pack("<BQ", 1, 0)),
+        (R_ERR, struct.pack("<BBIQ", 0, OP_SIZE, errno.EIO, 0)),
+        (R_DONE, struct.pack("<Q", 0)),
+    ], r.stdout
+    # DATA: 16 -> 8 partial write, then EIO on the retry.
+    fault_run(seek0 + data(bytes(range(16))), (0, OP_DATA, errno.EIO, 0), 0)
+    # DATA: a zero-progress write is a hard error.
+    fault_run(seek0 + data(bytes(32)), (0, OP_DATA, errno.EIO, 0), 0)
+    # READ: 16 -> 8 partial read, then EIO on the retry.
+    fault_run(seek0 + frame(OP_READ, struct.pack("<Q", 16)),
+              (0, OP_READ, errno.EIO, 0), 0)
+    # ZERO: 16 -> 8 partial write, then EIO on the retry.
+    fault_run(seek0 + frame(OP_ZERO, struct.pack("<Q", 16)),
+              (0, OP_ZERO, errno.EIO, 0), 0)
+    # SYNC: the sync always fails.
+    fault_run(seek0 + frame(OP_SYNC, b""), (0, OP_SYNC, errno.EIO, 0), 0)
+
+    # A malformed SIZE is fatal too: the write head exits and the second
+    # SIZE in the stream is never processed.
     empty = os.path.join(tmpdir, "empty")
     open(empty, "wb").close()
     r = subprocess.run([binp, empty],
@@ -198,7 +217,6 @@ static int fault_sync(int fd) { (void)fd; errno = EIO; return -1; }
     assert parse(r.stdout) == [
         (R_READY, struct.pack("<BQ", 1, 0)),
         (R_ERR, struct.pack("<BBIQ", 2, OP_SIZE, 0, 0)),
-        (R_SIZE, struct.pack("<Q", 0)),
         (R_DONE, struct.pack("<Q", 0)),
     ], r.stdout
 
