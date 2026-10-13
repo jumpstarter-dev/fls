@@ -81,6 +81,7 @@ impl<R: Read> FrameReader<R> {
 }
 
 /// Parsed SSH destination.
+#[derive(Debug)]
 pub(crate) struct SshTarget {
     pub host: String,
     pub port: Option<u16>,
@@ -88,17 +89,26 @@ pub(crate) struct SshTarget {
 }
 
 /// Parse `ssh://[user@]host[:port]/device` (with IPv6 bracket support) or
-/// the legacy `[user@]host:/device` form.  Returns `None` for local paths.
-pub(crate) fn parse_ssh_target(device: &str) -> Option<SshTarget> {
+/// the legacy `[user@]host:/device` form.  Returns `Ok(None)` for local
+/// paths, `Err` for malformed `ssh://` URIs that can never be local paths.
+pub(crate) fn parse_ssh_target(device: &str) -> io::Result<Option<SshTarget>> {
     if device.starts_with('/') {
-        return None;
+        return Ok(None);
     }
     if let Some(rest) = device.strip_prefix("ssh://") {
-        let slash = rest.find('/')?;
+        let bad =
+            |msg: &str| {
+                io::Error::new(io::ErrorKind::InvalidInput,
+            format!("malformed SSH destination: {msg} — expected ssh://[user@]host[:port]/device"))
+            };
+        let slash = rest.find('/').ok_or_else(|| bad("missing /device path"))?;
         let authority = &rest[..slash];
         let device_path = &rest[slash..];
-        if authority.is_empty() || device_path.len() < 2 {
-            return None;
+        if authority.is_empty() {
+            return Err(bad("empty host"));
+        }
+        if device_path.len() < 2 {
+            return Err(bad("missing device path after /"));
         }
         // Find the host:port boundary, respecting IPv6 brackets.
         let port_start = match authority.rfind(']') {
@@ -107,31 +117,45 @@ pub(crate) fn parse_ssh_target(device: &str) -> Option<SshTarget> {
         };
         let (host_part, port) = match authority[port_start..].find(':') {
             Some(i) => {
-                let p = authority[port_start + i + 1..].parse::<u16>().ok()?;
+                let port_str = &authority[port_start + i + 1..];
+                let p = port_str
+                    .parse::<u16>()
+                    .map_err(|_| bad(&format!("invalid port \"{port_str}\"")))?;
                 (&authority[..port_start + i], Some(p))
             }
             None => (authority, None),
         };
         let host = host_part.replace(['[', ']'], "");
         if host.is_empty() {
-            return None;
+            return Err(bad("empty host"));
         }
-        return Some(SshTarget { host, port, device: device_path.to_owned() });
+        return Ok(Some(SshTarget {
+            host,
+            port,
+            device: device_path.to_owned(),
+        }));
     }
     // Legacy: [user@]host:/device
-    let (host, path) = device.split_once(':')?;
-    if host.is_empty() || !path.starts_with('/') {
-        return None;
+    match device.split_once(':') {
+        Some((host, path)) if !host.is_empty() && path.starts_with('/') => Ok(Some(SshTarget {
+            host: host.to_owned(),
+            port: None,
+            device: path.to_owned(),
+        })),
+        _ => Ok(None),
     }
-    Some(SshTarget { host: host.to_owned(), port: None, device: path.to_owned() })
 }
-
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn ssh_command(host: &str, remote_command: &str, port: Option<u16>, options: &FlashOptions) -> Command {
+fn ssh_command(
+    host: &str,
+    remote_command: &str,
+    port: Option<u16>,
+    options: &FlashOptions,
+) -> Command {
     let mut command = if let Some(file) = &options.ssh_password_file {
         let mut command = Command::new("sshpass");
         command.args(["-f", file, "ssh"]);
@@ -169,7 +193,11 @@ fn ssh_command(host: &str, remote_command: &str, port: Option<u16>, options: &Fl
     command
 }
 
-fn detect_target(host: &str, port: Option<u16>, options: &FlashOptions) -> io::Result<(String, String, String)> {
+fn detect_target(
+    host: &str,
+    port: Option<u16>,
+    options: &FlashOptions,
+) -> io::Result<(String, String, String)> {
     let command = "PATH=/proc/boot:/usr/bin:/bin:$PATH; \
         os=$(uname -s) || exit; echo \"$os\"; \
         if [ \"$os\" = QNX ]; then uname -p; else uname -m; fi || exit; uname -r";
@@ -214,7 +242,12 @@ fn check_embedded_target(os: &str, arch: &str, release: &str) -> io::Result<()> 
     ))
 }
 
-fn upload_wh(host: &str, binary: &[u8], port: Option<u16>, options: &FlashOptions) -> io::Result<()> {
+fn upload_wh(
+    host: &str,
+    binary: &[u8],
+    port: Option<u16>,
+    options: &FlashOptions,
+) -> io::Result<()> {
     // QNX boot-image utilities may be absent from the default PATH.
     let remote_command =
         format!("PATH=/proc/boot:/usr/bin:/bin:$PATH; cat > {REMOTE_WH} && chmod +x {REMOTE_WH}");
@@ -408,10 +441,20 @@ impl Session {
     }
 
     fn queue_frame(&mut self, op: u8, start: u64, bytes: u64, frame: &[u8]) -> io::Result<()> {
-        if self.requests.as_ref().unwrap().send(Expected { op, start, bytes }).is_err() {
+        if self
+            .requests
+            .as_ref()
+            .unwrap()
+            .send(Expected { op, start, bytes })
+            .is_err()
+        {
             return Err(self.reader_error());
         }
-        self.input.as_mut().unwrap().write_all(frame).map_err(|_| self.reader_error())
+        self.input
+            .as_mut()
+            .unwrap()
+            .write_all(frame)
+            .map_err(|_| self.reader_error())
     }
 
     /// Join the reader thread and return its error.  The reader always has
@@ -743,23 +786,51 @@ mod tests {
     #[test]
     fn target_parsing_auth_and_shell_quoting() {
         fn t(input: &str) -> Option<(String, Option<u16>, String)> {
-            parse_ssh_target(input).map(|t| (t.host, t.port, t.device))
+            parse_ssh_target(input)
+                .unwrap()
+                .map(|t| (t.host, t.port, t.device))
         }
         // Legacy form
-        assert_eq!(t("root@board:/dev/emmc0"), Some(("root@board".into(), None, "/dev/emmc0".into())));
+        assert_eq!(
+            t("root@board:/dev/emmc0"),
+            Some(("root@board".into(), None, "/dev/emmc0".into()))
+        );
         // ssh:// with port
-        assert_eq!(t("ssh://root@board:2222/dev/emmc0"), Some(("root@board".into(), Some(2222), "/dev/emmc0".into())));
+        assert_eq!(
+            t("ssh://root@board:2222/dev/emmc0"),
+            Some(("root@board".into(), Some(2222), "/dev/emmc0".into()))
+        );
         // ssh:// without port
-        assert_eq!(t("ssh://board/dev/emmc0"), Some(("board".into(), None, "/dev/emmc0".into())));
+        assert_eq!(
+            t("ssh://board/dev/emmc0"),
+            Some(("board".into(), None, "/dev/emmc0".into()))
+        );
         // ssh:// IPv6 with port
-        assert_eq!(t("ssh://root@[::1]:2222/dev/emmc0"), Some(("root@::1".into(), Some(2222), "/dev/emmc0".into())));
+        assert_eq!(
+            t("ssh://root@[::1]:2222/dev/emmc0"),
+            Some(("root@::1".into(), Some(2222), "/dev/emmc0".into()))
+        );
         // ssh:// IPv6 without port
-        assert_eq!(t("ssh://root@[::1]/dev/emmc0"), Some(("root@::1".into(), None, "/dev/emmc0".into())));
-        // Local paths and non-SSH strings
+        assert_eq!(
+            t("ssh://root@[::1]/dev/emmc0"),
+            Some(("root@::1".into(), None, "/dev/emmc0".into()))
+        );
+        // Local paths and non-SSH strings → Ok(None)
         assert_eq!(t("/dev/disk:local"), None);
         assert_eq!(t("image.img"), None);
-        // Reject bare path after ssh://
-        assert_eq!(t("ssh:///dev/foo"), None);
+        // Malformed ssh:// URIs → Err (not silent None)
+        for bad in [
+            "ssh:///dev/foo",
+            "ssh://board",
+            "ssh://root@board:22a/dev/x",
+            "ssh://root@::1/dev/x",
+        ] {
+            assert_eq!(
+                parse_ssh_target(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad}"
+            );
+        }
         let options = FlashOptions {
             ssh_password_file: Some("password file".into()),
             ssh_compress: true,

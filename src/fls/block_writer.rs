@@ -606,7 +606,7 @@ impl DeviceWriter {
         options: &FlashOptions,
         progress: mpsc::UnboundedSender<u64>,
     ) -> io::Result<Self> {
-        if let Some(target) = parse_ssh_target(&options.device) {
+        if let Some(target) = parse_ssh_target(&options.device)? {
             let SshTarget { host, port, device } = target;
             Ok(Self::Ssh(SshBlockWriter::new(
                 host, port, device, progress, options,
