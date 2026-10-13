@@ -28,7 +28,7 @@ scans for it to resync after any corruption.
 
 | | opcode | | opcode |
 |---|---|---|---|
-| **Requests** | `DATA 0x01` `SKIP 0x02` `SEEK 0x03` `SYNC 0x04` `QUIT 0x05` `READ 0x06` `ZERO 0x09` `SIZE 0x0a` | **Responses** | `READY 0x81` `OK 0x82` `PROG 0x83` `ERR 0x84` `DONE 0x85` `READ_DATA 0x86` `SIZE 0x89` |
+| **Requests** | `DATA 0x01` `SEEK 0x03` `SYNC 0x04` `QUIT 0x05` `READ 0x06` `ZERO 0x09` `SIZE 0x0a` | **Responses** | `READY 0x81` `OK 0x82` `PROG 0x83` `ERR 0x84` `DONE 0x85` `READ_DATA 0x86` `SIZE 0x89` |
 | **Reserved** | `AUTH 0x07` `HELLO 0x08` | | `AUTH_RESULT 0x87` `HELLO 0x88` |
 
 The `READY` payload is `version:u8 + size:u64` (total device bytes, measured

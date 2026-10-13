@@ -26,15 +26,14 @@
  * Little-endian throughout. The magic is a sync header: the reader scans for
  * it to resync after any corruption.
  *
- * Requests:  DATA(0x01) SKIP(0x02) SEEK(0x03) SYNC(0x04) QUIT(0x05)
+ * Requests:  DATA(0x01) SEEK(0x03) SYNC(0x04) QUIT(0x05)
  *            READ(0x06) ZERO(0x09) SIZE(0x0a) [implemented]
- *            AUTH(0x07) HELLO(0x08)          [reserved, spec only]
+ *            0x02 AUTH(0x07) HELLO(0x08)      [reserved, spec only]
  * Responses: READY(0x81) OK(0x82) PROG(0x83) ERR(0x84) DONE(0x85)
  *            READ_DATA(0x86) SIZE(0x89)      [implemented]
  *            AUTH_RESULT(0x87) HELLO(0x88)   [reserved]
  *
  * DATA payload:  size:u32 + content[size] + crc:u32 (CRC32-IEEE of content)
- * SKIP payload:  len:u64
  * SEEK payload:  offset:u64
  * SYNC/QUIT/SIZE: (no payload)
  * READ payload:  len:u64  (read len bytes from the current offset, advance it;
@@ -56,7 +55,7 @@
  */
 
 enum {
-    OP_DATA = 0x01, OP_SKIP = 0x02, OP_SEEK = 0x03, OP_SYNC = 0x04,
+    OP_DATA = 0x01, OP_SEEK = 0x03, OP_SYNC = 0x04,
     OP_QUIT = 0x05,
     OP_READ = 0x06, OP_AUTH = 0x07, OP_HELLO = 0x08, OP_ZERO = 0x09,
     OP_SIZE = 0x0a,
@@ -349,16 +348,6 @@ int main(int argc, char **argv)
                 else
                     ok_rec(OP_DATA, start, done);
             }
-        }
-
-        else if (op == OP_SKIP) {
-            if (plen != 8) { skip(plen); err_rec(ERR_NI, OP_SKIP, 0, cur); continue; }
-            unsigned char lf[8];
-            if (!rreadn(lf, 8)) break;
-            unsigned long long len = rd_u64(lf);
-            if (lseek(fd, cur + len, SEEK_SET) < 0)
-                err_rec(ERR_DEV, OP_SKIP, (unsigned)errno, cur);
-            else { ok_rec(OP_SKIP, cur, len); cur += len; }
         }
 
         else if (op == OP_ZERO) {

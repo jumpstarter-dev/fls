@@ -16,7 +16,7 @@ import tempfile
 import zlib
 
 MAGIC = b"FLSW"
-OP_DATA, OP_SKIP, OP_SEEK, OP_SYNC, OP_QUIT, OP_READ, OP_ZERO = 1, 2, 3, 4, 5, 6, 9
+OP_DATA, OP_SEEK, OP_SYNC, OP_QUIT, OP_READ, OP_ZERO = 1, 3, 4, 5, 6, 9
 R_READY, R_ACK, R_PROG, R_ERR, R_DONE, R_READ_DATA = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86
 OP_SIZE, R_SIZE = 0x0A, 0x89
 
@@ -68,7 +68,7 @@ def main():
     with open(blk, "wb") as f:
         f.truncate(1 << 20)
 
-    # SIZE between SKIP and ZERO must leave the logical and device offsets intact.
+    # SIZE between SEEK and ZERO must leave the logical and device offsets intact.
     content = bytes(range(16))
     crc = zlib.crc32(content) & 0xFFFFFFFF
     script = b""
@@ -77,7 +77,7 @@ def main():
                    + struct.pack("<I", crc))
     script += frame(OP_SEEK, struct.pack("<Q", 0))
     script += frame(OP_READ, struct.pack("<Q", len(content)))
-    script += frame(OP_SKIP, struct.pack("<Q", 8))
+    script += frame(OP_SEEK, struct.pack("<Q", 24))
     script += frame(OP_SIZE, b"")
     script += frame(OP_ZERO, struct.pack("<Q", 256))
     script += frame(OP_SIZE, b"")
@@ -106,7 +106,7 @@ def main():
     assert total == len(content) + 256, f"total {total} != {len(content) + 256}"
 
     ok_ops = [struct.unpack_from("<B", p)[0] for op, p in recs if op == R_ACK]
-    for want in (OP_SEEK, OP_DATA, OP_SKIP, OP_SYNC, OP_ZERO):
+    for want in (OP_SEEK, OP_DATA, OP_SYNC, OP_ZERO):
         assert want in ok_ops, f"no OK for op {want:#x}: {ok_ops}"
 
     # 5b. the READ_DATA record carries exactly the bytes we wrote
@@ -118,7 +118,7 @@ def main():
     assert zero_acks == [(OP_ZERO, 24, 256)], zero_acks
 
     # 6. the file bytes were written at offset 0, and ZERO zeroed 256 bytes
-    #    at offset 24 (after SKIP 8 from offset 16)
+    #    at offset 24 (after SEEK 24)
     with open(blk, "rb") as f:
         head = f.read(16)
         f.seek(24)
