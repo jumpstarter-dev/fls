@@ -1,6 +1,6 @@
 use std::io::{self, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{mpsc as std_mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::block_writer::WriterCommand;
@@ -266,77 +266,6 @@ struct Expected {
     op: u8,
     start: u64,
     bytes: u64,
-    charge: usize,
-}
-
-#[derive(Default)]
-struct FlowState {
-    bytes: usize,
-    commands: usize,
-    error: Option<io::Error>,
-}
-
-struct FlowControl {
-    state: Mutex<FlowState>,
-    ready: Condvar,
-    limit: usize,
-}
-
-impl FlowControl {
-    fn new(limit: usize) -> Self {
-        Self {
-            state: Mutex::new(FlowState::default()),
-            ready: Condvar::new(),
-            limit,
-        }
-    }
-
-    fn reserve(&self, bytes: usize) -> io::Result<()> {
-        if bytes > self.limit {
-            return Err(invalid("Frame exceeds SSH in-flight window"));
-        }
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if let Some(error) = &state.error {
-                return Err(io::Error::new(error.kind(), error.to_string()));
-            }
-            // Also bound metadata for tiny ZERO/SEEK requests.
-            if state.bytes <= self.limit - bytes && state.commands < 1024 {
-                state.bytes += bytes;
-                state.commands += 1;
-                return Ok(());
-            }
-            state = self.ready.wait(state).unwrap();
-        }
-    }
-
-    fn complete(&self, bytes: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.bytes -= bytes;
-        state.commands -= 1;
-        self.ready.notify_all();
-    }
-
-    fn fail(&self, error: &io::Error) {
-        let mut state = self.state.lock().unwrap();
-        if state.error.is_none() {
-            state.error = Some(io::Error::new(error.kind(), error.to_string()));
-        }
-        self.ready.notify_all();
-    }
-
-    fn wait_idle(&self) -> io::Result<()> {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if let Some(error) = &state.error {
-                return Err(io::Error::new(error.kind(), error.to_string()));
-            }
-            if state.commands == 0 {
-                return Ok(());
-            }
-            state = self.ready.wait(state).unwrap();
-        }
-    }
 }
 
 fn expect_ok<R: Read>(
@@ -380,7 +309,6 @@ fn expect_ok<R: Read>(
 fn read_acks(
     mut output: FrameReader<ChildStdout>,
     requests: std_mpsc::Receiver<Expected>,
-    flow: Arc<FlowControl>,
     child: Arc<Mutex<Child>>,
     progress: mpsc::UnboundedSender<u64>,
 ) -> io::Result<u64> {
@@ -395,7 +323,6 @@ fn read_acks(
                 if u64::from_le_bytes(payload[..].try_into().unwrap()) != total {
                     return Err(invalid("DONE total does not match acknowledged writes"));
                 }
-                flow.complete(expected.charge);
                 return Ok(total);
             }
             expect_ok(&mut output, &expected, &progress)?;
@@ -404,15 +331,13 @@ fn read_acks(
                     .checked_add(expected.bytes)
                     .ok_or_else(|| invalid("Written byte count overflow"))?;
             }
-            flow.complete(expected.charge);
         }
         Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "SSH writer closed without QUIT",
         ))
     })();
-    if let Err(ref error) = result {
-        flow.fail(error);
+    if result.is_err() {
         // Interrupt a sender blocked in write_all when the peer reports an error.
         let _ = child.lock().unwrap().kill();
     }
@@ -422,9 +347,8 @@ fn read_acks(
 struct Session {
     child: Arc<Mutex<Child>>,
     input: Option<ChildStdin>,
-    requests: Option<std_mpsc::Sender<Expected>>,
+    requests: Option<std_mpsc::SyncSender<Expected>>,
     reader: Option<std::thread::JoinHandle<io::Result<u64>>>,
-    flow: Arc<FlowControl>,
     cursor: u64,
     size: u64,
     pending: Vec<u8>,
@@ -439,13 +363,15 @@ impl Session {
     ) -> io::Result<Self> {
         let input = child.stdin.take().unwrap();
         let mut output = FrameReader::new(child.stdout.take().unwrap());
-        let (tx, rx) = std_mpsc::channel();
+        // ponytail: sync_channel bounds in-flight commands by slot count,
+        // not byte weight — a SEEK takes a slot same as 8 MiB DATA.
+        let depth = ((window / CHUNK_SIZE) * 3 / 2).max(2);
+        let (tx, rx) = std_mpsc::sync_channel(depth);
         let mut session = Self {
             child: Arc::new(Mutex::new(child)),
             input: Some(input),
             requests: Some(tx),
             reader: None,
-            flow: Arc::new(FlowControl::new(window)),
             cursor: 0,
             size: 0,
             pending: Vec::with_capacity(window.min(CHUNK_SIZE)),
@@ -472,39 +398,34 @@ impl Session {
         if advertised != session.size {
             return Err(invalid("READY and SIZE disagree about device capacity"));
         }
-        let flow = Arc::clone(&session.flow);
         let child = Arc::clone(&session.child);
         session.reader = Some(
             std::thread::Builder::new()
                 .name("fls-ssh-acks".into())
-                .spawn(move || read_acks(output, rx, flow, child, progress))?,
+                .spawn(move || read_acks(output, rx, child, progress))?,
         );
         Ok(session)
     }
 
     fn queue_frame(&mut self, op: u8, start: u64, bytes: u64, frame: &[u8]) -> io::Result<()> {
-        let charge = if op == OP_DATA { bytes as usize } else { 1 };
-        self.flow.reserve(charge)?;
-        self.requests
-            .as_ref()
-            .unwrap()
-            .send(Expected {
-                op,
-                start,
-                bytes,
-                charge,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "SSH response reader closed"))?;
-        self.input
-            .as_mut()
-            .unwrap()
-            .write_all(frame)
-            .map_err(|error| {
-                self.flow.fail(&error);
-                let state = self.flow.state.lock().unwrap();
-                let error = state.error.as_ref().unwrap();
-                io::Error::new(error.kind(), error.to_string())
-            })
+        if self.requests.as_ref().unwrap().send(Expected { op, start, bytes }).is_err() {
+            return Err(self.reader_error());
+        }
+        self.input.as_mut().unwrap().write_all(frame).map_err(|_| self.reader_error())
+    }
+
+    /// Join the reader thread and return its error.  The reader always has
+    /// the real cause (the remote ERR frame); the sender only sees a
+    /// secondary broken-pipe symptom.
+    fn reader_error(&mut self) -> io::Error {
+        self.input.take();
+        self.requests.take();
+        if let Some(handle) = self.reader.take() {
+            if let Ok(Err(e)) = handle.join() {
+                return e;
+            }
+        }
+        io::Error::new(io::ErrorKind::BrokenPipe, "SSH connection closed")
     }
 
     fn send(&mut self, op: u8, start: u64, bytes: u64, payload: &[u8]) -> io::Result<()> {
@@ -585,7 +506,6 @@ impl Session {
 
     fn finish(mut self) -> io::Result<u64> {
         self.flush_pending()?;
-        self.flow.wait_idle()?;
         self.send(OP_SYNC, self.cursor, 0, &[])?;
         self.send(OP_QUIT, self.cursor, 0, &[])?;
         self.input.take();
@@ -947,19 +867,17 @@ mod tests {
         session.write(b"ab").unwrap();
         session.write(b"cd").unwrap();
         assert_eq!(session.pending, b"abcd");
-        let mut head = [0; 4];
-        device.read_exact(&mut head).unwrap();
-        assert_eq!(head, [0; 4]);
         session.seek(8).unwrap();
-        session.flow.wait_idle().unwrap();
         assert!(session.pending.is_empty());
-        device.seek(io::SeekFrom::Start(0)).unwrap();
-        device.read_exact(&mut head).unwrap();
-        assert_eq!(&head, b"abcd");
         session.write(b"ef").unwrap();
         session.fill([1, 2, 3, 4], 4).unwrap();
         session.write(b"gh").unwrap();
         assert_eq!(session.finish().unwrap(), 16);
+        // Verify device contents after finish (all writes are ACKed).
+        device.seek(io::SeekFrom::Start(0)).unwrap();
+        let mut head = [0; 4];
+        device.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"abcd");
         device.seek(io::SeekFrom::Start(8)).unwrap();
         let mut tail = [0; 8];
         device.read_exact(&mut tail).unwrap();
@@ -1017,44 +935,6 @@ emit(0x85, struct.pack('<Q', offset))
         session.write(b"second").unwrap();
         session.flush_pending().unwrap();
         assert_eq!(session.finish().unwrap(), 11);
-    }
-
-    #[test]
-    fn in_flight_bytes_apply_backpressure_and_errors_wake_waiters() {
-        use std::time::Duration;
-        let flow = Arc::new(FlowControl::new(8));
-        flow.reserve(6).unwrap();
-        let (tx, rx) = std_mpsc::channel();
-        let waiter = Arc::clone(&flow);
-        let thread = std::thread::spawn(move || {
-            tx.send(waiter.reserve(3)).unwrap();
-        });
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_millis(50)),
-            Err(std_mpsc::RecvTimeoutError::Timeout)
-        ));
-        flow.complete(6);
-        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-        thread.join().unwrap();
-        flow.complete(3);
-        flow.reserve(8).unwrap();
-        let (tx, rx) = std_mpsc::channel();
-        let waiter = Arc::clone(&flow);
-        let thread = std::thread::spawn(move || {
-            tx.send(waiter.reserve(1)).unwrap();
-        });
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_millis(50)),
-            Err(std_mpsc::RecvTimeoutError::Timeout)
-        ));
-        flow.fail(&io::Error::other("remote failed"));
-        let error = rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.to_string(), "remote failed");
-        thread.join().unwrap();
-        assert!(flow.wait_idle().is_err());
     }
 
     #[test]
