@@ -22,7 +22,7 @@ mod stream_utils;
 
 // Public re-exports
 pub use fastboot::flash_from_fastboot;
-pub use from_url::flash_from_url;
+pub use from_url::flash_from;
 pub use oci::flash_from_oci;
 pub use options::{
     BlockFlashOptions, FastbootOptions, FlashOptions, HttpClientOptions, OciOptions,
@@ -36,12 +36,12 @@ mod tests {
     #[tokio::test]
     async fn test_url_extension_detection() {
         assert!(
-            flash_from_url("http://example.com/file.xz", BlockFlashOptions::default())
+            flash_from("http://example.com/file.xz", BlockFlashOptions::default())
                 .await
                 .is_err()
         ); // Will fail due to network, but we're testing the logic
         assert!(
-            flash_from_url("http://example.com/file.img", BlockFlashOptions::default())
+            flash_from("http://example.com/file.img", BlockFlashOptions::default())
                 .await
                 .is_err()
         );
