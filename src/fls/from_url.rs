@@ -162,7 +162,9 @@ async fn handle_detected_format(
 /// relative path `./a.img`, and `file:///home/a.img` is `/home/a.img`.
 /// Characters such as spaces, `%`, `?`, and `#` are treated literally.
 fn local_source_path(source: &str) -> Result<Option<PathBuf>, io::Error> {
-    if source.starts_with("http://") || source.starts_with("https://") {
+    if source.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
         return Ok(None);
     }
     let path = source.strip_prefix("file://").unwrap_or(source);
@@ -644,12 +646,9 @@ pub async fn flash_from(
     let debug = options.common.debug;
 
     let end = loop {
-        if writer_handle.is_finished() {
-            eprintln!();
-            eprintln!("Writer task has terminated, stopping input");
-            break FeedEnd::PipelineStopped;
-        }
-
+        // Gzip decoding and writing can finish before we observe source EOF.
+        // Read the source first; a finished writer is only premature if more
+        // input remains. The send below still watches for writer failure.
         let chunk = match source_feed.next_chunk(progress.bytes_received).await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break FeedEnd::Done,

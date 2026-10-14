@@ -4,7 +4,7 @@ mod common;
 use fls::{flash_from, BlockFlashOptions, FlashOptions};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Helper to create BlockFlashOptions with common test defaults
@@ -860,7 +860,7 @@ async fn test_https_with_insecure_flag() {
     let listener = TcpListener::bind(addr).await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     // Use IP address directly (certificate has IP in SAN)
-    let server_url = format!("https://{}/secure.img", local_addr);
+    let server_url = format!("hTtPs://{}/secure.img", local_addr);
 
     println!("  [Server] HTTPS server listening on {}", server_url);
 
@@ -1052,6 +1052,126 @@ async fn test_https_certificate_validation_fails() {
 }
 
 // --- CLI tests for local file sources ---
+
+#[tokio::test]
+async fn http_cli_accepts_case_insensitive_schemes() {
+    let server = MockServer::start().await;
+    let image = common::create_test_data(4096);
+    Mock::given(method("GET"))
+        .and(path("/CaseSensitive.img"))
+        .and(query_param("Token", "AbC"))
+        .and(header("X-Image-Token", "AbC"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(image.clone()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let dest = NamedTempFile::new().unwrap();
+    for scheme in ["HTTP", "hTtP"] {
+        let source = format!(
+            "{}://{}/CaseSensitive.img?Token=AbC",
+            scheme,
+            server.address()
+        );
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_fls"))
+            .args(["from-url", &source])
+            .arg(dest.path())
+            .args(["--header", "X-Image-Token: AbC", "--max-retries", "0"])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{scheme}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("Ignore certificates:"), "{stdout}");
+        assert!(stdout.contains("Custom headers:"), "{stdout}");
+        assert_eq!(std::fs::read(dest.path()).unwrap(), image);
+    }
+}
+
+#[test]
+fn gzip_cli_completion_waits_for_http_eof() {
+    // A full stdout pipe holds the final progress update while the gzip
+    // decoder and writer finish, making the premature-completion race repeatable.
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import gzip, http.server, os, pathlib, select, subprocess, sys, tempfile, threading, time
+
+data = b'valid-image' * 4096
+body = gzip.compress(data)
+send_body = threading.Event()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body) + truncated))
+        self.end_headers()
+        assert send_body.wait(10)
+        self.wfile.write(body)
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+with tempfile.TemporaryDirectory() as tmp:
+    dest = pathlib.Path(tmp) / 'output'
+    for truncated in (False, True):
+        send_body.clear()
+        r, w = os.pipe()
+        p = subprocess.Popen([sys.argv[1], 'from-url',
+            f'http://127.0.0.1:{server.server_port}/image.img.gz', str(dest),
+            '--progress-interval', '0', '--max-retries', '0'],
+            stdout=w, stderr=subprocess.PIPE)
+        try:
+            output = bytearray()
+            marker = f'Content length: {len(body) + truncated} bytes\n'.encode()
+            while not output.endswith(marker):
+                assert select.select([r], [], [], 10)[0], 'No HTTP headers received'
+                chunk = os.read(r, 1)
+                assert chunk, 'CLI exited before reading HTTP headers'
+                output.extend(chunk)
+            os.set_blocking(w, False)
+            try:
+                while True: os.write(w, b'x' * 4096)
+            except BlockingIOError:
+                pass
+            os.set_blocking(w, True)
+            send_body.set()
+            time.sleep(1)
+            def drain():
+                while chunk := os.read(r, 65536): output.extend(chunk)
+            reader = threading.Thread(target=drain, daemon=True)
+            reader.start()
+            _, stderr = p.communicate(timeout=10)
+            os.close(w)
+            w = None
+            reader.join(timeout=10)
+            assert not reader.is_alive()
+            assert dest.read_bytes() == data
+            assert p.returncode == int(truncated), stderr.decode()
+            expected = b'FLASH_FAILED' if truncated else b'FLASH_COMPLETED'
+            assert b'Result: ' + expected in output, stderr.decode()
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            if w is not None: os.close(w)
+            os.close(r)
+"#,
+        ])
+        .arg(env!("CARGO_BIN_EXE_fls"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 /// Deterministic 4 KiB blocks for the sparse fixture.
 fn sparse_blocks() -> (Vec<u8>, Vec<u8>) {

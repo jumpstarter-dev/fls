@@ -244,7 +244,9 @@ async fn main() {
                 }
             } else {
                 // HTTP/HTTPS URL or local file
-                let is_http = source.starts_with("http://") || source.starts_with("https://");
+                let is_http = source.split_once("://").is_some_and(|(scheme, _)| {
+                    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+                });
                 println!("Block flash command:");
                 println!("  Source: {}", source);
                 println!("  Device: {}", device);
