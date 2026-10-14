@@ -1,6 +1,6 @@
 # Makefile for fls - ARM64 static builds
 
-.PHONY: all build clean test arm64-static lint fmt clippy check help
+.PHONY: all build clean test arm64-static remote-wh remote-wh-native lint fmt clippy check help
 
 # Default target
 all: build
@@ -23,6 +23,14 @@ arm64-static:
 # Build for all targets (native + ARM64 static)
 all-targets:
 	./build.sh
+
+# Build the remote write head (fls/remote) for QNX aarch64
+remote-wh:
+	$(MAKE) -C remote
+
+# Build the remote write head for the host (native)
+remote-wh-native:
+	$(MAKE) -C remote native
 
 # Run tests
 test:
@@ -55,6 +63,7 @@ check:
 clean:
 	cargo clean
 	rm -f fls-*
+	$(MAKE) -C remote clean
 
 # Install dependencies for ARM64 cross-compilation
 install-deps:
@@ -72,6 +81,8 @@ help:
 	@echo "  build                    - Build for native target"
 	@echo "  arm64-static             - Build for ARM64 static (musl)"
 	@echo "  all-targets              - Build for native + ARM64 static"
+	@echo "  remote-wh                - Build the remote write head for QNX aarch64"
+	@echo "  remote-wh-native         - Build the remote write head for the host"
 	@echo ""
 	@echo "Testing and Quality:"
 	@echo "  test                     - Run tests"
