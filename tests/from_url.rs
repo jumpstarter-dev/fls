@@ -1154,6 +1154,11 @@ with tempfile.TemporaryDirectory() as tmp:
             assert p.returncode == int(truncated), stderr.decode()
             expected = b'FLASH_FAILED' if truncated else b'FLASH_COMPLETED'
             assert b'Result: ' + expected in output, stderr.decode()
+            if truncated:
+                # The real cause is the HTTP transfer error, not a
+                # misleading decompressor message.
+                assert b'Decompressor closed unexpectedly' not in stderr, stderr.decode()
+                assert b'Error: ' in stderr, stderr.decode()
         finally:
             if p.poll() is None:
                 p.kill()

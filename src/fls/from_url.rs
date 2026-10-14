@@ -217,31 +217,29 @@ fn local_file_stream(
     .boxed()
 }
 
-/// The decompressor thread has already exited (its input channel closed), so
-/// joining it directly is safe and short. Returns its originating error.
-fn decompressor_exited_error(
-    handle: std::thread::JoinHandle<Result<(), String>>,
-) -> Box<dyn std::error::Error> {
-    match handle.join() {
-        Ok(Ok(_)) => "Decompressor closed unexpectedly before input completed".into(),
-        Ok(Err(e)) => e.into(),
-        Err(_) => "Decompressor thread panicked".into(),
-    }
-}
-
-/// The buffer channel closed, so the pipeline stopped early. Report the real
-/// cause: the writer's error if it has one, otherwise the decompressor's.
-/// The writer always finishes (a dead decompressor closes its input channel,
-/// so the writer sees EOF and exits), so joining it cannot hang.
+/// The pipeline stopped early. Report the real cause: the writer's error if it
+/// has one, otherwise the decompressor's, and if both finished cleanly, the
+/// source error if there is one (e.g. a body shorter than its Content-Length,
+/// where the gzip member and the writer can both finish before the feed
+/// observes the truncated stream). The writer always finishes (a dead
+/// decompressor closes its input channel, so the writer sees EOF and exits),
+/// so joining it cannot hang; a finished writer implies the decompressor has
+/// already exited, so joining it cannot hang either.
 async fn pipeline_stopped_error(
     writer_handle: JoinHandle<io::Result<u64>>,
     decompressor_handle: std::thread::JoinHandle<Result<(), String>>,
+    source_error: Option<DownloadError>,
 ) -> Box<dyn std::error::Error> {
-    match await_writer_result(writer_handle).await {
-        // The writer finished cleanly, so the decompressor must have exited early.
-        Ok(_) => decompressor_exited_error(decompressor_handle),
+    if let Err(e) = await_writer_result(writer_handle).await {
         // The writer had an error (or panicked); that is the real cause.
-        Err(e) => e.into(),
+        return e.into();
+    }
+    match (decompressor_handle.join(), source_error) {
+        // Both tasks finished cleanly; a source error, if any, is the cause.
+        (Ok(Ok(_)), Some(e)) => e.into(),
+        (Ok(Ok(_)), None) => "Decompressor closed unexpectedly before input completed".into(),
+        (Ok(Err(e)), _) => e.into(),
+        (Err(_), _) => "Decompressor thread panicked".into(),
     }
 }
 
@@ -722,9 +720,13 @@ pub async fn flash_from(
     match end {
         FeedEnd::Done => {}
         FeedEnd::SourceFailed(e) if !writer_handle.is_finished() => return Err(e.into()),
-        // A source error after the writer stopped is a symptom; report the cause.
-        FeedEnd::SourceFailed(_) | FeedEnd::PipelineStopped => {
-            return Err(pipeline_stopped_error(writer_handle, decompressor_handle).await)
+        // If the writer or decompressor failed, their error is the cause; if
+        // both finished cleanly, the source error is.
+        FeedEnd::SourceFailed(e) => {
+            return Err(pipeline_stopped_error(writer_handle, decompressor_handle, Some(e)).await)
+        }
+        FeedEnd::PipelineStopped => {
+            return Err(pipeline_stopped_error(writer_handle, decompressor_handle, None).await)
         }
     }
 
