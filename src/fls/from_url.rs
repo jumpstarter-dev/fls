@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::block_writer::DeviceWriter;
 use crate::fls::byte_channel::byte_bounded_channel;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{get_compression_from_url, start_inprocess_decompressor};
@@ -42,7 +42,7 @@ use crate::fls::download_error::handle_download_retry;
 /// Execute a sequence of write commands on the block writer
 async fn execute_write_commands(
     commands: Vec<WriteCommand>,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<()> {
@@ -92,7 +92,7 @@ async fn execute_write_commands(
 async fn process_sparse_data(
     parser: &mut SparseParser,
     data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<()> {
@@ -107,7 +107,7 @@ async fn process_sparse_data(
 /// Write data to the block writer with error reporting
 async fn write_regular_data(
     data: Vec<u8>,
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
 ) -> io::Result<()> {
     writer.write(data).await.map_err(|e| {
@@ -121,7 +121,7 @@ async fn handle_detected_format(
     format: FileFormat,
     consumed_bytes: Vec<u8>,
     remaining_data: &[u8],
-    writer: &AsyncBlockWriter,
+    writer: &DeviceWriter,
     error_tx: &mpsc::UnboundedSender<String>,
     debug: bool,
 ) -> io::Result<Option<SparseParser>> {
@@ -187,13 +187,7 @@ pub async fn flash_from_url(
     );
 
     // Create block writer
-    let block_writer = AsyncBlockWriter::new(
-        options.common.device.clone(),
-        written_progress_tx,
-        options.common.debug,
-        options.common.o_direct,
-        options.common.write_buffer_size_mb,
-    )?;
+    let block_writer = DeviceWriter::new(&options.common, written_progress_tx)?;
 
     // Create byte-bounded download buffer
     let buffer_size_mb = options.common.buffer_size_mb;
@@ -218,12 +212,29 @@ pub async fn flash_from_url(
         options.common.xz_memlimit_mb,
     )?;
 
+    // Signals the feed loop when the writer task finishes, so a full input
+    // buffer cannot deadlock it (e.g. the SSH connection breaks mid-flash).
+    let (writer_done_tx, mut writer_done_rx) = tokio::sync::watch::channel(false);
+
     // Spawn background task to read decompressed data and write to block device
     let error_tx_clone = error_tx.clone();
     let debug = options.common.debug;
     let writer_handle = {
         let writer = block_writer;
+        let done_tx = writer_done_tx;
         tokio::spawn(async move {
+            // Fire `writer_done` however this task ends (success, error, or
+            // panic) so the feed loop's blocking buffer send can always unblock.
+            struct WriterDone(Option<tokio::sync::watch::Sender<bool>>);
+            impl Drop for WriterDone {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(true);
+                    }
+                }
+            }
+            let _done = WriterDone(Some(done_tx));
+
             let mut detector = FormatDetector::new();
             let mut parser: Option<SparseParser> = None;
             let mut format_determined = false;
@@ -368,14 +379,20 @@ pub async fn flash_from_url(
                         Ok(chunk) => {
                             let chunk_len = chunk.len() as u64;
 
-                            // Send to buffer - detect if it's blocking
+                            // Send to buffer - detect if it's blocking. Race the
+                            // send against the writer finishing: if the writer
+                            // stops (e.g. SSH breaks) while the buffer is full,
+                            // the send would otherwise block forever.
                             let send_start = std::time::Instant::now();
-                            if buffer_tx.send(chunk).await.is_err() {
-                                if writer_handle.is_finished() {
+                            let send_result = tokio::select! {
+                                result = buffer_tx.send(chunk) => result,
+                                _ = writer_done_rx.wait_for(|done| *done) => {
                                     eprintln!();
-                                    eprintln!("Writer task has terminated unexpectedly");
+                                    eprintln!("Writer task has terminated, stopping download");
                                     return Err(get_writer_error(writer_handle).await);
                                 }
+                            };
+                            if send_result.is_err() {
                                 connection_error =
                                     Some(DownloadError::Other("Buffer channel closed".to_string()));
                                 connection_broken = true;

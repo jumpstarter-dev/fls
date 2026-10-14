@@ -76,6 +76,7 @@ pub(crate) struct ProgressTracker {
     is_compressed: bool,
     // Whether to print on new lines instead of clearing and rewriting
     newline_progress: bool,
+    line_open: bool,
     // Whether to show memory statistics
     show_memory: bool,
 }
@@ -99,6 +100,7 @@ impl ProgressTracker {
             content_length: None,
             is_compressed: true,
             newline_progress,
+            line_open: false,
             show_memory,
         }
     }
@@ -213,6 +215,7 @@ impl ProgressTracker {
                     "\r\x1b[KDownload: {} | {}: {} | Written: {}{}",
                     download_status, progress_label, decompress_status, write_status, memory_suffix
                 );
+                self.line_open = true;
                 io::stdout().flush()?;
             }
             self.last_update = now;
@@ -252,17 +255,17 @@ impl ProgressTracker {
     ///
     /// This consolidates the common stats printing pattern used by both
     /// URL and OCI flash operations.
-    pub(crate) fn print_final_stats(&self) {
+    pub(crate) fn print_final_stats(&mut self) {
         self.print_stats(false);
     }
 
     /// Print final statistics including compression ratio (for URL flash)
-    pub(crate) fn print_final_stats_with_ratio(&self) {
+    pub(crate) fn print_final_stats_with_ratio(&mut self) {
         self.print_stats(true);
     }
 
     /// Internal helper to print stats with optional compression ratio
-    fn print_stats(&self, include_compression_ratio: bool) {
+    fn print_stats(&mut self, include_compression_ratio: bool) {
         let stats = self.final_stats();
         println!(
             "\nDownload complete: {:.2} MB in {} ({:.2} MB/s)",
@@ -270,6 +273,7 @@ impl ProgressTracker {
             stats.download_time_formatted(),
             stats.download_rate
         );
+        self.line_open = false;
         println!(
             "Decompression complete: {:.2} MB in {} ({:.2} MB/s)",
             stats.mb_decompressed,
@@ -289,5 +293,13 @@ impl ProgressTracker {
             );
         }
         println!("Total flash runtime: {}", stats.total_time_formatted());
+    }
+}
+
+impl Drop for ProgressTracker {
+    fn drop(&mut self) {
+        if self.line_open {
+            let _ = writeln!(io::stdout());
+        }
     }
 }
