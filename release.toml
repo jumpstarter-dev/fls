@@ -1,0 +1,11 @@
+# cargo-release config: `cargo release patch --execute`
+# bumps Cargo.toml/Cargo.lock, commits, tags and pushes.
+
+# Keep existing bare tag format (0.4.1), not cargo-release's default v0.4.1.
+tag-prefix = ""
+
+# Binaries are distributed via GitHub releases, not crates.io.
+publish = false
+
+# Only release from main.
+allow-branch = ["main"]

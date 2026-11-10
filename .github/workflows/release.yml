@@ -80,6 +80,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `fls --version` reports Cargo.toml's version, so it must match the tag.
+      - name: Verify tag matches Cargo.toml version
+        env:
+          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+        run: |
+          crate_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "${TAG#v}" != "$crate_version" ]; then
+            echo "::error::Tag '$TAG' does not match Cargo.toml version '$crate_version'. Bump Cargo.toml before tagging."
+            exit 1
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           name: flswh-aarch64-qnx7

@@ -21,7 +21,7 @@ fn parse_target_mapping(s: &str) -> Result<(String, String), String> {
 }
 
 #[derive(Parser)]
-#[command(name = "fls")]
+#[command(name = "fls", version)]
 #[command(about = "A small Rust utility for flashing devices")]
 struct Cli {
     #[command(subcommand)]
