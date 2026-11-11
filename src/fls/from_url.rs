@@ -1,13 +1,19 @@
-use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
+use futures_util::{stream, StreamExt};
 use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::fls::block_writer::DeviceWriter;
 use crate::fls::byte_channel::byte_bounded_channel;
 use crate::fls::compression::Compression;
-use crate::fls::decompress::{get_compression_from_url, start_inprocess_decompressor};
+use crate::fls::decompress::{
+    get_compression_from_path, get_compression_from_url, start_inprocess_decompressor,
+};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
@@ -23,17 +29,6 @@ async fn await_writer_result(handle: JoinHandle<io::Result<u64>>) -> io::Result<
     match handle.await {
         Ok(result) => result,
         Err(e) => Err(io::Error::other(format!("Writer task panicked: {}", e))),
-    }
-}
-
-/// Get error from a prematurely finished writer handle
-///
-/// Called when writer_handle.is_finished() returns true unexpectedly during download.
-/// Returns an appropriate error for the unexpected termination.
-async fn get_writer_error(handle: JoinHandle<io::Result<u64>>) -> Box<dyn std::error::Error> {
-    match await_writer_result(handle).await {
-        Ok(_) => "Writer closed unexpectedly before download completed".into(),
-        Err(e) => e.into(),
     }
 }
 
@@ -160,14 +155,332 @@ async fn handle_detected_format(
     }
 }
 
-pub async fn flash_from_url(
-    url: &str,
+/// Classify a flash source: `None` for HTTP/HTTPS URLs (handled by the
+/// download pipeline), `Some(path)` for local files (plain or `file://`-prefixed).
+///
+/// `file://` is a literal path prefix, not a URI: `file://./a.img` is the
+/// relative path `./a.img`, and `file:///home/a.img` is `/home/a.img`.
+/// Characters such as spaces, `%`, `?`, and `#` are treated literally.
+fn local_source_path(source: &str) -> Result<Option<PathBuf>, io::Error> {
+    if source.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        return Ok(None);
+    }
+    let path = source.strip_prefix("file://").unwrap_or(source);
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Empty source path",
+        ));
+    }
+    // Reject other explicit URL schemes (e.g. ftp://, oci://) when they lead
+    // the source, so paths that merely contain "://" later are still paths.
+    if let Some((scheme, _)) = path.split_once("://") {
+        if !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Unsupported source scheme '{scheme}://' (supported: http://, https://, file://, or a local path)"
+                ),
+            ));
+        }
+    }
+    Ok(Some(PathBuf::from(path)))
+}
+
+/// Stream a local source file in bounded 64 KiB reads.
+///
+/// A read error terminates the stream with that error; it is not retried.
+fn local_file_stream(
+    file: tokio::fs::File,
+    path: PathBuf,
+) -> BoxStream<'static, Result<bytes::Bytes, DownloadError>> {
+    stream::try_unfold((file, path), |(mut file, path)| async move {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let n = file.read(&mut buffer).await.map_err(|error| {
+            DownloadError::Other(format!(
+                "Failed to read source file '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buffer.truncate(n);
+        Ok(Some((bytes::Bytes::from(buffer), (file, path))))
+    })
+    .boxed()
+}
+
+/// The pipeline stopped early. Report the real cause: the writer's error if it
+/// has one, otherwise the decompressor's, and if both finished cleanly, the
+/// source error if there is one (e.g. a body shorter than its Content-Length,
+/// where the gzip member and the writer can both finish before the feed
+/// observes the truncated stream). The writer always finishes (a dead
+/// decompressor closes its input channel, so the writer sees EOF and exits),
+/// so joining it cannot hang; a finished writer implies the decompressor has
+/// already exited, so joining it cannot hang either.
+async fn pipeline_stopped_error(
+    writer_handle: JoinHandle<io::Result<u64>>,
+    decompressor_handle: std::thread::JoinHandle<Result<(), String>>,
+    source_error: Option<DownloadError>,
+) -> Box<dyn std::error::Error> {
+    if let Err(e) = await_writer_result(writer_handle).await {
+        // The writer had an error (or panicked); that is the real cause.
+        return e.into();
+    }
+    match (decompressor_handle.join(), source_error) {
+        // Both tasks finished cleanly; a source error, if any, is the cause.
+        (Ok(Ok(_)), Some(e)) => e.into(),
+        (Ok(Ok(_)), None) => "Decompressor closed unexpectedly before input completed".into(),
+        (Ok(Err(e)), _) => e.into(),
+        (Err(_), _) => "Decompressor thread panicked".into(),
+    }
+}
+
+/// Reject a local source that is the same file as a regular-file destination,
+/// to avoid truncating the source before it is read. Compares file identities
+/// (device + inode) rather than path strings, so equivalent paths (symlinks,
+/// relative vs absolute, hard links) are detected. A destination that does not
+/// yet exist cannot conflict, so it is allowed.
+fn reject_same_file(source_id: (u64, u64), dest: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dest_meta = match std::fs::metadata(dest) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // Destination does not exist yet; no conflict.
+    };
+    let dest_id = (dest_meta.dev(), dest_meta.ino());
+    if dest_id == source_id {
+        return Err(format!(
+            "Source and destination are the same file ('{dest}'); refusing to truncate the source"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A flash source: a local file stream or an HTTP/HTTPS download.
+///
+/// Both expose the same `next_chunk()` interface so the feed loop is a single
+/// path. The HTTP variant owns the 30s read timeout, `Range` resume, and retry
+/// logic, so retries are transparent to the caller. The local variant is a
+/// single pass with no timeout and no retry.
+enum SourceFeed {
+    Local {
+        stream: Option<InputStream>,
+        content_length: Option<u64>,
+    },
+    Http {
+        client: reqwest::Client,
+        source: String,
+        headers: Vec<(String, String)>,
+        max_retries: usize,
+        retry_delay_secs: u64,
+        debug: bool,
+        retry_count: usize,
+        stream: Option<InputStream>,
+        content_length: Option<u64>,
+    },
+}
+
+type InputStream = BoxStream<'static, Result<bytes::Bytes, DownloadError>>;
+
+impl SourceFeed {
+    /// Return the next chunk, or `None` at end of input.
+    ///
+    /// `bytes_received` is the total bytes fed so far; the HTTP variant uses it
+    /// as the `Range` resume offset when re-establishing a connection.
+    async fn next_chunk(
+        &mut self,
+        bytes_received: u64,
+    ) -> Result<Option<bytes::Bytes>, DownloadError> {
+        match self {
+            // Local: a single pass, no timeout, no retry.
+            SourceFeed::Local { stream, .. } => match stream.as_mut().unwrap().next().await {
+                Some(Ok(chunk)) => Ok(Some(chunk)),
+                Some(Err(e)) => Err(e),
+                None => Ok(None),
+            },
+            SourceFeed::Http {
+                client,
+                source,
+                headers,
+                max_retries,
+                retry_delay_secs,
+                debug,
+                retry_count,
+                stream,
+                content_length,
+            } => loop {
+                // Ensure a live connection, retrying on start/resume failure.
+                if stream.is_none() {
+                    let resume_from = (bytes_received > 0).then_some(bytes_received);
+                    match start_download(source, client, resume_from, headers, *debug).await {
+                        Ok(response) => {
+                            *content_length = if let Some(offset) = resume_from {
+                                response.content_length().map(|len| len + offset)
+                            } else {
+                                response.content_length()
+                            };
+                            *stream = Some(
+                                response
+                                    .bytes_stream()
+                                    .map(|result| result.map_err(DownloadError::from_reqwest))
+                                    .boxed(),
+                            );
+                        }
+                        Err(e) => {
+                            if !Self::retry(
+                                &e,
+                                retry_count,
+                                *max_retries,
+                                *retry_delay_secs,
+                                stream,
+                            )
+                            .await
+                            {
+                                return Err(e);
+                            }
+                            // The retry dropped the connection; re-establish it.
+                            continue;
+                        }
+                    }
+                }
+                // HTTP chunks wait at most 30s.
+                match tokio::time::timeout(Duration::from_secs(30), stream.as_mut().unwrap().next())
+                    .await
+                {
+                    Ok(Some(Ok(chunk))) => {
+                        *retry_count = 0; // Reset retry count on successful read
+                        return Ok(Some(chunk));
+                    }
+                    Ok(None) => return Ok(None), // Stream ended successfully
+                    Ok(Some(Err(e))) => {
+                        if !Self::retry(&e, retry_count, *max_retries, *retry_delay_secs, stream)
+                            .await
+                        {
+                            return Err(e);
+                        }
+                    }
+                    Err(_) => {
+                        let e = DownloadError::TimeoutError("Connection timeout (30s)".to_string());
+                        if !Self::retry(&e, retry_count, *max_retries, *retry_delay_secs, stream)
+                            .await
+                        {
+                            return Err(e);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// The content length for progress, if known.
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            SourceFeed::Local { content_length, .. } => *content_length,
+            SourceFeed::Http { content_length, .. } => *content_length,
+        }
+    }
+
+    /// Sleep for the retry delay and drop the connection so the next read
+    /// re-establishes it (resuming from `bytes_received`). Returns `false` when
+    /// the error is non-retryable or the retry budget is exhausted.
+    async fn retry(
+        error: &DownloadError,
+        retry_count: &mut usize,
+        max_retries: usize,
+        retry_delay_secs: u64,
+        stream: &mut Option<InputStream>,
+    ) -> bool {
+        match handle_download_retry(error, retry_count, max_retries, retry_delay_secs) {
+            Some(delay) => {
+                tokio::time::sleep(delay).await;
+                *stream = None;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// How the feed loop ended.
+enum FeedEnd {
+    /// The source reached end of input.
+    Done,
+    /// The source failed (a local read error, or a non-retryable/exhausted
+    /// download error).
+    SourceFailed(DownloadError),
+    /// The writer (or the buffer channel) stopped early.
+    PipelineStopped,
+}
+
+/// Flash a block device from a source.
+///
+/// The source is an HTTP/HTTPS URL, a `file://`-prefixed path, or a plain
+/// local path (relative or absolute). Local files stream in bounded chunks
+/// through the same decompression, sparse, and writer pipeline as downloads;
+/// local failures are reported without download retries.
+pub async fn flash_from(
+    source: &str,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let http_options: HttpClientOptions = (&options).into();
-    let client = setup_http_client(&http_options).await?;
+    // Classify the source: local file or HTTP/HTTPS download.
+    let local_path = local_source_path(source)?;
+    let is_local = local_path.is_some();
 
-    let compression = get_compression_from_url(url);
+    // Prepare the input before touching the destination: open and validate the
+    // local source, or create the HTTP client for downloads.
+    let (compression, mut source_feed, source_file_id) = if let Some(path) = local_path {
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| format!("Failed to open source file '{}': {e}", path.display()))?;
+        let metadata = file.metadata().await.map_err(|e| {
+            format!(
+                "Failed to read source file metadata '{}': {e}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!("Source '{}' is not a regular file", path.display()).into());
+        }
+        let file_size = metadata.len();
+        // File identity (device + inode) for the same-file guard below.
+        let source_file_id = (metadata.dev(), metadata.ino());
+        eprintln!("Reading source file: {}", path.display());
+        let compression = get_compression_from_path(&path);
+        (
+            compression,
+            SourceFeed::Local {
+                stream: Some(local_file_stream(file, path)),
+                content_length: Some(file_size),
+            },
+            Some(source_file_id),
+        )
+    } else {
+        let http_options: HttpClientOptions = (&options).into();
+        let client = setup_http_client(&http_options).await?;
+        (
+            get_compression_from_url(source),
+            SourceFeed::Http {
+                client,
+                source: source.to_string(),
+                headers: options.headers.clone(),
+                max_retries: options.max_retries,
+                retry_delay_secs: options.retry_delay_secs,
+                debug: options.common.debug,
+                retry_count: 0,
+                stream: None,
+                content_length: None,
+            },
+            None,
+        )
+    };
+
     if compression == Compression::Zstd {
         return Err("Zstd in-process decompression is not supported".into());
     }
@@ -181,6 +494,12 @@ pub async fn flash_from_url(
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, mut written_progress_rx) = mpsc::unbounded_channel::<u64>();
 
+    // Guard against truncating the source: if the local source is the same
+    // file as the destination, refuse before the destination is opened.
+    if let Some(source_file_id) = source_file_id {
+        reject_same_file(source_file_id, &options.common.device)?;
+    }
+
     println!(
         "Opening block device for writing: {}",
         options.common.device
@@ -189,14 +508,18 @@ pub async fn flash_from_url(
     // Create block writer
     let block_writer = DeviceWriter::new(&options.common, written_progress_tx)?;
 
-    // Create byte-bounded download buffer
+    // Create byte-bounded input buffer
     let buffer_size_mb = options.common.buffer_size_mb;
     let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
 
-    println!(
-        "Using download buffer: {} MB (byte-bounded)",
-        buffer_size_mb
-    );
+    if is_local {
+        println!("Using input buffer: {} MB (byte-bounded)", buffer_size_mb);
+    } else {
+        println!(
+            "Using download buffer: {} MB (byte-bounded)",
+            buffer_size_mb
+        );
+    }
 
     let (buffer_tx, buffer_rx) = byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, 4096);
 
@@ -309,196 +632,102 @@ pub async fn flash_from_url(
     // Spawn message processors
     let error_processor = tokio::spawn(process_error_messages(error_rx));
 
-    // Main download loop with retry logic
+    // Main input loop: a single path for both local and HTTP sources.
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_is_compressed(is_compressed);
+    if is_local {
+        progress.set_input_label("Read");
+    }
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
     let mut bytes_sent_to_decompressor: u64 = 0;
-    let mut retry_count = 0;
     let debug = options.common.debug;
 
-    loop {
-        if writer_handle.is_finished() {
-            eprintln!();
-            eprintln!("Writer task has terminated, stopping download");
-            return Err(get_writer_error(writer_handle).await);
-        }
-
-        // Resume from the HTTP download position, not the decompressor write position
-        // The buffer may contain data that's been downloaded but not yet written to decompressor
-        let resume_from = if progress.bytes_received > 0 {
-            Some(progress.bytes_received)
-        } else {
-            None
-        };
-
-        // Start or resume download
-        let response =
-            match start_download(url, &client, resume_from, &options.headers, debug).await {
-                Ok(r) => r,
-                Err(e) => {
-                    match handle_download_retry(
-                        &e,
-                        &mut retry_count,
-                        options.max_retries,
-                        options.retry_delay_secs,
-                    ) {
-                        Some(delay) => {
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        None => return Err(e.into()),
-                    }
-                }
-            };
-
-        let content_length = if let Some(offset) = resume_from {
-            // For resumed downloads, we need to add the offset to partial content length
-            response.content_length().map(|len| len + offset)
-        } else {
-            response.content_length()
+    let end = loop {
+        // Gzip decoding and writing can finish before we observe source EOF.
+        // Read the source first; a finished writer is only premature if more
+        // input remains. The send below still watches for writer failure.
+        let chunk = match source_feed.next_chunk(progress.bytes_received).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break FeedEnd::Done,
+            Err(e) => break FeedEnd::SourceFailed(e),
         };
 
         // Set content length in progress tracker (only on first attempt)
         if progress.content_length.is_none() {
-            progress.set_content_length(content_length);
+            progress.set_content_length(source_feed.content_length());
         }
 
-        let mut stream = response.bytes_stream();
+        let chunk_len = chunk.len() as u64;
 
-        // Download and buffer chunks for this connection
-        let mut connection_broken = false;
-        let mut connection_error: Option<DownloadError> = None;
+        // Send to buffer - detect if it's blocking. Race the send against the
+        // writer finishing: if the writer stops (e.g. SSH breaks) while the
+        // buffer is full, the send would otherwise block forever.
+        let send_start = std::time::Instant::now();
+        let send_result = tokio::select! {
+            result = buffer_tx.send(chunk) => result,
+            _ = writer_done_rx.wait_for(|done| *done) => break FeedEnd::PipelineStopped,
+        };
+        if send_result.is_err() {
+            break FeedEnd::PipelineStopped;
+        }
+        let send_duration = send_start.elapsed();
 
-        loop {
-            // Try to get next chunk with timeout
-            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-                Ok(Some(chunk_result)) => {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            let chunk_len = chunk.len() as u64;
-
-                            // Send to buffer - detect if it's blocking. Race the
-                            // send against the writer finishing: if the writer
-                            // stops (e.g. SSH breaks) while the buffer is full,
-                            // the send would otherwise block forever.
-                            let send_start = std::time::Instant::now();
-                            let send_result = tokio::select! {
-                                result = buffer_tx.send(chunk) => result,
-                                _ = writer_done_rx.wait_for(|done| *done) => {
-                                    eprintln!();
-                                    eprintln!("Writer task has terminated, stopping download");
-                                    return Err(get_writer_error(writer_handle).await);
-                                }
-                            };
-                            if send_result.is_err() {
-                                connection_error =
-                                    Some(DownloadError::Other("Buffer channel closed".to_string()));
-                                connection_broken = true;
-                                break;
-                            }
-                            let send_duration = send_start.elapsed();
-
-                            // If send took a long time, buffer was probably full
-                            if debug && send_duration > Duration::from_millis(100) {
-                                eprintln!("\n[DEBUG] Buffer send blocked for {:.2}s (buffer full, decompressor bottleneck)", send_duration.as_secs_f64());
-                            }
-
-                            // Update download progress
-                            progress.bytes_received += chunk_len;
-                            retry_count = 0; // Reset retry count on successful download
-
-                            // Track bytes actually written to decompressor
-                            while let Ok(written_len) = decompressor_written_progress_rx.try_recv()
-                            {
-                                bytes_sent_to_decompressor += written_len;
-                                progress.bytes_sent_to_decompressor += written_len;
-                            }
-
-                            // Debug: Show buffer lag (data downloaded but not yet written to decompressor)
-                            if debug && (progress.bytes_received % (50 * 1024 * 1024)) < chunk_len {
-                                let buffer_lag_mb =
-                                    (progress.bytes_received - bytes_sent_to_decompressor) as f64
-                                        / (1024.0 * 1024.0);
-                                eprintln!("[DEBUG] Buffer lag: {:.2} MB (downloaded but not yet sent to decompressor)", buffer_lag_mb);
-                            }
-
-                            // Update progress from other channels
-                            while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-                                progress.bytes_decompressed += byte_count;
-                            }
-
-                            while let Ok(written_bytes) = written_progress_rx.try_recv() {
-                                progress.bytes_written = written_bytes;
-                            }
-
-                            if let Err(e) =
-                                progress.update_progress(content_length, update_interval, false)
-                            {
-                                eprintln!();
-                                return Err(e);
-                            }
-                        }
-                        Err(e) => {
-                            connection_error = Some(DownloadError::from_reqwest(e));
-                            connection_broken = true;
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Stream ended successfully
-                    break;
-                }
-                Err(_) => {
-                    // Timeout
-                    connection_error = Some(DownloadError::TimeoutError(
-                        "Connection timeout (30s)".to_string(),
-                    ));
-                    connection_broken = true;
-                    break;
-                }
-            }
+        // If send took a long time, buffer was probably full
+        if debug && send_duration > Duration::from_millis(100) {
+            eprintln!(
+                "\n[DEBUG] Buffer send blocked for {:.2}s (buffer full, decompressor bottleneck)",
+                send_duration.as_secs_f64()
+            );
         }
 
-        // If connection broke, retry
-        if connection_broken {
-            if writer_handle.is_finished() {
-                eprintln!();
-                eprintln!("Connection interrupted and writer task has terminated");
-                return Err(get_writer_error(writer_handle).await);
-            }
+        // Update input progress
+        progress.bytes_received += chunk_len;
 
-            if let Some(e) = connection_error {
-                eprintln!("\nConnection interrupted: {}", e.format_error());
-                match handle_download_retry(
-                    &e,
-                    &mut retry_count,
-                    options.max_retries,
-                    options.retry_delay_secs,
-                ) {
-                    Some(delay) => {
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    None => return Err(e.into()),
-                }
-            } else {
-                // Unknown error
-                eprintln!("\nConnection interrupted with unknown error");
-                if retry_count >= options.max_retries {
-                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                    return Err("Download failed after max retries".into());
-                }
-                tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
-                retry_count += 1;
-                continue;
-            }
+        // Track bytes actually written to decompressor
+        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+            bytes_sent_to_decompressor += written_len;
+            progress.bytes_sent_to_decompressor += written_len;
         }
 
-        // Download completed successfully
-        break;
+        // Debug: Show buffer lag (data read but not yet written to decompressor)
+        if debug && (progress.bytes_received % (50 * 1024 * 1024)) < chunk_len {
+            let buffer_lag_mb =
+                (progress.bytes_received - bytes_sent_to_decompressor) as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[DEBUG] Buffer lag: {:.2} MB (read but not yet sent to decompressor)",
+                buffer_lag_mb
+            );
+        }
+
+        // Update progress from other channels
+        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+            progress.bytes_decompressed += byte_count;
+        }
+
+        while let Ok(written_bytes) = written_progress_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+        }
+
+        if let Err(e) =
+            progress.update_progress(source_feed.content_length(), update_interval, false)
+        {
+            eprintln!();
+            return Err(e);
+        }
+    };
+
+    match end {
+        FeedEnd::Done => {}
+        FeedEnd::SourceFailed(e) if !writer_handle.is_finished() => return Err(e.into()),
+        // If the writer or decompressor failed, their error is the cause; if
+        // both finished cleanly, the source error is.
+        FeedEnd::SourceFailed(e) => {
+            return Err(pipeline_stopped_error(writer_handle, decompressor_handle, Some(e)).await)
+        }
+        FeedEnd::PipelineStopped => {
+            return Err(pipeline_stopped_error(writer_handle, decompressor_handle, None).await)
+        }
     }
 
     // Capture the download rate and duration at completion
@@ -600,4 +829,49 @@ pub async fn flash_from_url(
     progress.print_final_stats_with_ratio();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_id(path: &std::path::Path) -> (u64, u64) {
+        let m = std::fs::metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn reject_same_file_detects_identical_and_allows_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.img");
+        let other = dir.path().join("other.img");
+        std::fs::write(&source, b"data").unwrap();
+        std::fs::write(&other, b"data").unwrap();
+        let source_id = file_id(&source);
+
+        // The same file is rejected.
+        assert!(reject_same_file(source_id, source.to_str().unwrap()).is_err());
+        // A different file is allowed.
+        assert!(reject_same_file(source_id, other.to_str().unwrap()).is_ok());
+        // A destination that does not exist yet is allowed (nothing to truncate).
+        assert!(reject_same_file(
+            source_id,
+            dir.path().join("does-not-exist").to_str().unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reject_same_file_detects_equivalent_paths_via_hard_link() {
+        // A hard link is a different path but the same file identity; a path
+        // string comparison would miss it, an identity comparison must not.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.img");
+        let link = dir.path().join("link.img");
+        std::fs::write(&source, b"data").unwrap();
+        std::fs::hard_link(&source, &link).unwrap();
+        let source_id = file_id(&source);
+
+        assert!(reject_same_file(source_id, link.to_str().unwrap()).is_err());
+    }
 }

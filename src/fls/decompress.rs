@@ -121,16 +121,30 @@ fn spawn_decompressor(
     Ok((process, cmd))
 }
 
-pub(crate) fn get_compression_from_url(url: &str) -> Compression {
-    let path = url.split('?').next().unwrap_or(url);
-    let path = path.split('#').next().unwrap_or(path);
-    let extension = path.rsplit('.').next().unwrap_or("").to_lowercase();
-    match extension.as_str() {
+fn compression_for_extension(extension: &str) -> Compression {
+    match extension.to_lowercase().as_str() {
         "gz" => Compression::Gzip,
         "xz" => Compression::Xz,
         "zst" | "zstd" => Compression::Zstd,
         _ => Compression::None,
     }
+}
+
+pub(crate) fn get_compression_from_url(url: &str) -> Compression {
+    let path = url.split('?').next().unwrap_or(url);
+    let path = path.split('#').next().unwrap_or(path);
+    compression_for_extension(path.rsplit('.').next().unwrap_or(""))
+}
+
+/// Determines the appropriate decompression based on a filesystem path extension.
+///
+/// The path is treated literally: no query/fragment stripping, no percent
+/// decoding, no `~` expansion.
+pub(crate) fn get_compression_from_path(path: &std::path::Path) -> Compression {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(compression_for_extension)
+        .unwrap_or(Compression::None)
 }
 
 type DecompressorResult = (

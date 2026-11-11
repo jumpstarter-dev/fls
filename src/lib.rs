@@ -5,6 +5,6 @@ pub mod fls;
 
 // Re-export the main public API
 pub use fls::{
-    flash_from_oci, flash_from_url, BlockFlashOptions, FlashOptions, OciOptions,
-    DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS,
+    flash_from, flash_from_oci, BlockFlashOptions, FlashOptions, OciOptions, DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_DELAY_SECS,
 };
